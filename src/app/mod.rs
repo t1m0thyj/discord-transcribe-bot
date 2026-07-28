@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use crate::config::AppConfig;
 use crate::gemini::ask_gemini;
 use crate::transcription::{
-    AsrEngine, Buffers, Denoisers, SessionSenders, SsrcMap,
+    AsrEngine, SessionSenders, SsrcMap, Streams,
 };
 
 mod commands;
@@ -27,6 +27,8 @@ pub(super) const FINALIZE_SETTLE_TIMEOUT: Duration = Duration::from_millis(900);
 pub(super) const FINALIZE_SETTLE_PASSES: usize = 4;
 pub(super) const STARTUP_RECEIVE_WATCHDOG_DELAY: Duration = Duration::from_secs(10);
 pub(super) const STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
+pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(30);
+pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Utterance {
@@ -41,6 +43,7 @@ pub struct CallSession {
     pub voice_channel: ChannelId,
     pub text_channel: ChannelId,
     pub transcript: Vec<Utterance>,
+    pub transcript_jsonl_path: std::path::PathBuf,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub started_mono: Instant,
 }
@@ -63,13 +66,13 @@ pub struct AppState {
     pub asr: Arc<AsrEngine>,
     pub final_asr: Option<Arc<AsrEngine>>,
     pub ssrc_to_user: Arc<SsrcMap>,
-    pub buffers: Arc<Buffers>,
-    pub denoisers: Arc<Denoisers>,
+    pub streams: Arc<Streams>,
     pub utterance_senders: SessionSenders,
     pub transcription_inflight: DashMap<GuildId, Arc<AtomicUsize>>,
     pub transcript_pending_commits: DashMap<GuildId, Arc<AtomicUsize>>,
     pub decoded_audio_activity: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub decode_error_activity: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub decode_failure_activity: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub unmapped_ssrc_activity: DashMap<GuildId, Arc<AtomicUsize>>,
     pub transcription_started_notified: DashMap<GuildId, Arc<AtomicBool>>,
 }
 
@@ -96,13 +99,13 @@ impl AppState {
             asr,
             final_asr,
             ssrc_to_user: Arc::new(DashMap::new()),
-            buffers: Arc::new(DashMap::new()),
-            denoisers: Arc::new(DashMap::new()),
+            streams: Arc::new(DashMap::new()),
             utterance_senders: DashMap::new(),
             transcription_inflight: DashMap::new(),
             transcript_pending_commits: DashMap::new(),
             decoded_audio_activity: DashMap::new(),
-            decode_error_activity: DashMap::new(),
+            decode_failure_activity: DashMap::new(),
+            unmapped_ssrc_activity: DashMap::new(),
             transcription_started_notified: DashMap::new(),
         })
     }

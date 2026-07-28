@@ -11,16 +11,17 @@ use serenity::all::{
     Channel, ChannelId, ChannelType, CreateAttachment, CreateMessage, GuildId, MessageId, UserId,
     VoiceState,
 };
+use serde::Deserialize;
 use serenity::prelude::Context;
 use songbird::events::{CoreEvent, Event};
 use tokio::sync::{RwLock, mpsc};
 
 use super::{
     AppState, CallSession, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT,
-    STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS, STARTUP_RECEIVE_WATCHDOG_DELAY, ThreadContext,
-    Utterance,
+    STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS, STARTUP_RECEIVE_WATCHDOG_DELAY,
+    STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
 };
-use crate::audio::{SpeakingUpdateHandler, VoiceTickHandler};
+use crate::audio::{ClientDisconnectHandler, SpeakingUpdateHandler, VoiceTickHandler};
 use crate::transcription::{make_revision_id, transcribe_mono_pcm};
 
 pub struct VoiceHandlerAttachContext {
@@ -33,7 +34,8 @@ pub struct VoiceHandlerAttachContext {
     pub inflight: Arc<AtomicUsize>,
     pub pending_commits: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
-    pub decode_error_activity: Arc<AtomicUsize>,
+    pub decode_failure_activity: Arc<AtomicUsize>,
+    pub unmapped_ssrc_activity: Arc<AtomicUsize>,
     pub started_notified: Arc<AtomicBool>,
 }
 
@@ -56,6 +58,26 @@ pub async fn finalize_call_for_guild(
         .clone();
     let _ = manager.remove(guild_id).await;
 
+    for key in state
+        .ssrc_to_user
+        .iter()
+        .map(|e| *e.key())
+        .filter(|(g, _)| *g == guild_id)
+        .collect::<Vec<_>>()
+    {
+        state.ssrc_to_user.remove(&key);
+    }
+
+    for key in state
+        .streams
+        .iter()
+        .map(|e| *e.key())
+        .filter(|(g, _)| *g == guild_id)
+        .collect::<Vec<_>>()
+    {
+        state.streams.remove(&key);
+    }
+
     settle_and_flush_guild_audio(state, guild_id, &session_lock).await;
     wait_for_transcription_drain(state, guild_id).await;
     wait_for_transcript_commit_drain(state, guild_id).await;
@@ -63,7 +85,15 @@ pub async fn finalize_call_for_guild(
     state.utterance_senders.remove(&guild_id);
 
     let session = session_lock.read().await;
-    let transcript = session.transcript.clone();
+    let mut transcript = load_persisted_transcript(
+        &session.transcript_jsonl_path,
+        session.started_mono,
+    );
+    if transcript.is_empty() {
+        transcript = session.transcript.clone();
+    } else {
+        upsert_utterances(&mut transcript, session.transcript.clone());
+    }
 
     let transcript_text = format_transcript(ctx, &transcript, session.started_at).await;
     let filename = format!(
@@ -121,10 +151,42 @@ pub async fn finalize_call_for_guild(
     state.transcription_inflight.remove(&guild_id);
     state.transcript_pending_commits.remove(&guild_id);
     state.decoded_audio_activity.remove(&guild_id);
-    state.decode_error_activity.remove(&guild_id);
+    state.decode_failure_activity.remove(&guild_id);
+    state.unmapped_ssrc_activity.remove(&guild_id);
     state.transcription_started_notified.remove(&guild_id);
 
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct PersistedUtterance {
+    revision_id: u64,
+    user_id: u64,
+    start_offset_ms: u64,
+    is_final: bool,
+    text: String,
+}
+
+fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> Vec<Utterance> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let Ok(item) = serde_json::from_str::<PersistedUtterance>(line) else {
+            continue;
+        };
+        upsert_utterances(&mut out, vec![Utterance {
+            user_id: UserId::new(item.user_id),
+            start_ts: started_mono + Duration::from_millis(item.start_offset_ms),
+            revision_id: item.revision_id,
+            is_final: item.is_final,
+            text: item.text,
+        }]);
+    }
+
+    out
 }
 
 pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttachContext) {
@@ -138,7 +200,8 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
         inflight,
         pending_commits,
         decode_activity,
-        decode_error_activity,
+        decode_failure_activity,
+        unmapped_ssrc_activity,
         started_notified,
     } = ctx;
 
@@ -146,6 +209,13 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
     call.add_global_event(
         Event::Core(CoreEvent::SpeakingStateUpdate),
         SpeakingUpdateHandler {
+            guild_id,
+            ssrc_to_user: Arc::clone(&state.ssrc_to_user),
+        },
+    );
+    call.add_global_event(
+        Event::Core(CoreEvent::ClientDisconnect),
+        ClientDisconnectHandler {
             guild_id,
             ssrc_to_user: Arc::clone(&state.ssrc_to_user),
         },
@@ -159,14 +229,14 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
             voice_channel,
             guild_id,
             ssrc_to_user: Arc::clone(&state.ssrc_to_user),
-            buffers: Arc::clone(&state.buffers),
-            denoisers: Arc::clone(&state.denoisers),
+            streams: Arc::clone(&state.streams),
             enable_denoiser: state.enable_denoiser,
             utterance_tx,
             transcription_inflight: inflight,
             transcript_pending_commits: pending_commits,
             decode_activity,
-            decode_error_activity,
+            decode_failure_activity,
+            unmapped_ssrc_activity,
             asr: Arc::clone(&state.asr),
             asr_finalize: state.final_asr.as_ref().map(Arc::clone),
             live_transcript_debug: state.live_transcript_debug,
@@ -229,15 +299,21 @@ pub async fn startup_receive_watchdog(
         return;
     }
 
-    let decode_errors = state
-        .decode_error_activity
+    let decode_failures = state
+        .decode_failure_activity
         .get(&guild_id)
         .map(|v| v.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let unmapped_ssrc = state
+        .unmapped_ssrc_activity
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let receive_errors = decode_failures.saturating_add(unmapped_ssrc);
     // First recovery attempt must be justified by explicit decode/mapping failures.
     // After recovery has started, continue bounded retries even if fresh decode errors
     // are not observed, since broken receive can produce zero packets/errors.
-    if decode_errors == 0 && attempt == 0 {
+    if receive_errors == 0 && attempt == 0 {
         tracing::debug!(
             guild = %guild_id,
             attempt,
@@ -283,7 +359,8 @@ pub async fn startup_receive_watchdog(
     tracing::warn!(
         guild = %guild_id,
         attempt,
-        decode_errors,
+        decode_failures,
+        unmapped_ssrc,
         "decode/mapping failures observed without usable audio after join; reinitializing voice receive"
     );
 
@@ -324,14 +401,13 @@ pub async fn startup_receive_watchdog(
     }
 
     let user_keys: HashSet<(GuildId, UserId)> = state
-        .buffers
+        .streams
         .iter()
         .map(|e| *e.key())
         .filter(|(g, _)| *g == guild_id)
         .collect();
     for key in user_keys.iter() {
-        state.buffers.remove(key);
-        state.denoisers.remove(key);
+        state.streams.remove(key);
     }
 
     let Ok(call_lock) = manager.join(guild_id, voice_channel).await else {
@@ -396,15 +472,28 @@ pub async fn startup_receive_watchdog(
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
     };
-    let Some(decode_error_activity) = state
-        .decode_error_activity
+    let Some(decode_failure_activity) = state
+        .decode_failure_activity
         .get(&guild_id)
         .map(|v| Arc::clone(v.value()))
     else {
         tracing::warn!(
             guild = %guild_id,
             attempt,
-            "startup recovery retrying: missing decode error state"
+            "startup recovery retrying: missing decode-failure counter state"
+        );
+        schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
+        return;
+    };
+    let Some(unmapped_ssrc_activity) = state
+        .unmapped_ssrc_activity
+        .get(&guild_id)
+        .map(|v| Arc::clone(v.value()))
+    else {
+        tracing::warn!(
+            guild = %guild_id,
+            attempt,
+            "startup recovery retrying: missing unmapped-ssrc counter state"
         );
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
@@ -423,7 +512,8 @@ pub async fn startup_receive_watchdog(
         return;
     };
     decode_activity.store(0, Ordering::SeqCst);
-    decode_error_activity.store(0, Ordering::SeqCst);
+    decode_failure_activity.store(0, Ordering::SeqCst);
+    unmapped_ssrc_activity.store(0, Ordering::SeqCst);
 
     attach_voice_handlers(
         &state,
@@ -437,7 +527,8 @@ pub async fn startup_receive_watchdog(
             inflight,
             pending_commits,
             decode_activity,
-            decode_error_activity,
+            decode_failure_activity,
+            unmapped_ssrc_activity,
             started_notified,
         },
     )
@@ -450,6 +541,103 @@ pub async fn startup_receive_watchdog(
     );
 
     schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
+}
+
+pub async fn steady_state_receive_watchdog(
+    ctx: Context,
+    state: Arc<AppState>,
+    guild_id: GuildId,
+    voice_channel: ChannelId,
+    text_channel: ChannelId,
+) {
+    let mut last_decode_activity = 0usize;
+    let mut last_progress = Instant::now();
+
+    loop {
+        tokio::time::sleep(STEADY_STATE_WATCHDOG_CADENCE).await;
+
+        if !state.active_calls.contains_key(&guild_id) {
+            tracing::debug!(
+                guild = %guild_id,
+                "steady-state watchdog exiting: no active call session"
+            );
+            return;
+        }
+
+        let non_bot_present = match ctx.cache.guild(guild_id) {
+            Some(guild) => {
+                let bot_id = ctx.cache.current_user().id;
+                guild
+                    .voice_states
+                    .iter()
+                    .any(|(uid, vs)| vs.channel_id == Some(voice_channel) && *uid != bot_id)
+            }
+            None => false,
+        };
+
+        if !non_bot_present {
+            last_progress = Instant::now();
+            continue;
+        }
+
+        let decode_activity = state
+            .decoded_audio_activity
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+
+        if decode_activity > last_decode_activity {
+            last_decode_activity = decode_activity;
+            last_progress = Instant::now();
+            continue;
+        }
+
+        if last_progress.elapsed() < STEADY_STATE_NO_PROGRESS_TIMEOUT {
+            continue;
+        }
+
+        let decode_failures = state
+            .decode_failure_activity
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let unmapped_ssrc = state
+            .unmapped_ssrc_activity
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+
+        tracing::warn!(
+            guild = %guild_id,
+            decode_activity,
+            decode_failures,
+            unmapped_ssrc,
+            "steady-state watchdog detected stalled receive path; forcing startup-style recovery"
+        );
+        let _ = text_channel
+            .say(
+                &ctx.http,
+                "No decoded audio has arrived for over 60s while users are still in voice; reinitializing voice receive.",
+            )
+            .await;
+
+        startup_receive_watchdog(
+            ctx.clone(),
+            Arc::clone(&state),
+            guild_id,
+            voice_channel,
+            text_channel,
+            1,
+        )
+        .await;
+
+        last_progress = Instant::now();
+        last_decode_activity = state
+            .decoded_audio_activity
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+    }
 }
 
 async fn settle_and_flush_guild_audio(
@@ -477,9 +665,9 @@ async fn settle_and_flush_guild_audio(
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
         let buffered_audio = state
-            .buffers
+            .streams
             .iter()
-            .any(|e| e.key().0 == guild_id && !e.value().pcm.is_empty());
+            .any(|e| e.key().0 == guild_id && !e.value().buffer.pcm.is_empty());
 
         if inflight == 0 && pending_commits == 0 && !buffered_audio {
             break;
@@ -589,7 +777,7 @@ pub(super) async fn flush_pending_buffers_for_export(
     guild_id: GuildId,
 ) -> Vec<Utterance> {
     let user_keys: Vec<(GuildId, UserId)> = state
-        .buffers
+        .streams
         .iter()
         .map(|e| *e.key())
         .filter(|(g, _)| *g == guild_id)
@@ -602,10 +790,10 @@ pub(super) async fn flush_pending_buffers_for_export(
         let mut pcm = Vec::new();
         let mut revision_seq = None;
 
-        if let Some(mut entry) = state.buffers.get_mut(&user_key) {
-            if let Some(mut denoiser) = state.denoisers.get_mut(&user_key) {
-                entry.pcm.extend(denoiser.flush_pending());
-            }
+        if let Some(mut stream) = state.streams.get_mut(&user_key) {
+            let flushed = stream.denoiser.flush_pending();
+            let entry = &mut stream.buffer;
+            entry.pcm.extend(flushed);
 
             if entry.pcm.is_empty() {
                 continue;
@@ -643,14 +831,46 @@ pub(super) async fn flush_pending_buffers_for_export(
         }
     }
 
-    for user_key in state
-        .denoisers
+    out
+}
+
+pub(super) async fn snapshot_pending_buffers_for_interactive(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+) -> Vec<Utterance> {
+    let user_keys: Vec<(GuildId, UserId)> = state
+        .streams
         .iter()
         .map(|e| *e.key())
         .filter(|(g, _)| *g == guild_id)
-        .collect::<Vec<_>>()
-    {
-        state.denoisers.remove(&user_key);
+        .collect();
+    let mut out = Vec::new();
+
+    for user_key in user_keys {
+        let user_id = user_key.1;
+        let (start_ts, revision_seq, pcm) = if let Some(stream) = state.streams.get(&user_key) {
+            let entry = &stream.buffer;
+            if entry.pcm.is_empty() {
+                continue;
+            }
+            (
+                entry.utterance_start.unwrap_or_else(Instant::now),
+                entry.current_revision_seq.unwrap_or(entry.next_revision_seq),
+                entry.pcm.clone(),
+            )
+        } else {
+            continue;
+        };
+
+        if let Some(text) = transcribe_finalized_mono_pcm(state, pcm).await {
+            out.push(Utterance {
+                user_id,
+                start_ts,
+                revision_id: make_revision_id(user_id, revision_seq),
+                is_final: false,
+                text,
+            });
+        }
     }
 
     out

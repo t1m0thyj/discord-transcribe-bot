@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 
 use crate::app::Utterance;
 use crate::transcription::{
-    make_revision_id, transcribe_mono_pcm, AsrEngine, Buffers, Denoisers,
-    SILENCE_TICKS_THRESHOLD, SsrcMap, UserDenoiseState,
+    make_revision_id, transcribe_mono_pcm, AsrEngine, SILENCE_TICKS_THRESHOLD,
+    SsrcMap, Streams,
 };
 
 const FINALIZE_STABLE_PREVIEW_STREAK: u32 = 2;
@@ -34,6 +34,38 @@ impl VoiceEventHandler for SpeakingUpdateHandler {
     }
 }
 
+pub struct ClientDisconnectHandler {
+    pub guild_id: GuildId,
+    pub ssrc_to_user: Arc<SsrcMap>,
+}
+
+#[serenity::async_trait]
+impl VoiceEventHandler for ClientDisconnectHandler {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let EventContext::ClientDisconnect(disconnect) = ctx else {
+            return None;
+        };
+
+        let keys: Vec<(GuildId, u32)> = self
+            .ssrc_to_user
+            .iter()
+            .filter_map(|entry| {
+                if entry.key().0 == self.guild_id && *entry.value() == UserId::new(disconnect.user_id.0) {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in keys {
+            self.ssrc_to_user.remove(&key);
+        }
+
+        None
+    }
+}
+
 pub struct VoiceTickHandler {
     pub http: Arc<Http>,
     pub text_channel: serenity::all::ChannelId,
@@ -41,14 +73,14 @@ pub struct VoiceTickHandler {
     pub started_notified: Arc<AtomicBool>,
     pub guild_id: GuildId,
     pub ssrc_to_user: Arc<SsrcMap>,
-    pub buffers: Arc<Buffers>,
-    pub denoisers: Arc<Denoisers>,
+    pub streams: Arc<Streams>,
     pub enable_denoiser: bool,
     pub utterance_tx: mpsc::Sender<Utterance>,
     pub transcription_inflight: Arc<AtomicUsize>,
     pub transcript_pending_commits: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
-    pub decode_error_activity: Arc<AtomicUsize>,
+    pub decode_failure_activity: Arc<AtomicUsize>,
+    pub unmapped_ssrc_activity: Arc<AtomicUsize>,
     pub asr: Arc<AsrEngine>,
     pub asr_finalize: Option<Arc<AsrEngine>>,
     pub live_transcript_debug: bool,
@@ -72,7 +104,7 @@ impl VoiceEventHandler for VoiceTickHandler {
 
         for (ssrc, data) in &tick.speaking {
             if data.decoded_voice.is_none() && data.packet.is_some() {
-                self.decode_error_activity.fetch_add(1, Ordering::SeqCst);
+                self.decode_failure_activity.fetch_add(1, Ordering::SeqCst);
             }
 
             let Some(decoded) = &data.decoded_voice else {
@@ -86,7 +118,7 @@ impl VoiceEventHandler for VoiceTickHandler {
             else {
                 // Decoded audio without an SSRC mapping is not usable yet.
                 // Count it as startup receive failure signal so watchdog can recover.
-                self.decode_error_activity.fetch_add(1, Ordering::SeqCst);
+                self.unmapped_ssrc_activity.fetch_add(1, Ordering::SeqCst);
                 continue;
             };
 
@@ -94,12 +126,10 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             let user_key = (self.guild_id, user_id);
 
-            let mut denoiser = self
-                .denoisers
-                .entry(user_key)
-                .or_insert_with(UserDenoiseState::new);
-            let processed = denoiser.push_stereo_pcm(decoded, self.enable_denoiser);
-            drop(denoiser);
+            let mut stream = self.streams.entry(user_key).or_default();
+            let processed = stream
+                .denoiser
+                .push_stereo_pcm(decoded, self.enable_denoiser);
             if processed.speech_active {
                 currently_speaking.insert(user_id);
             }
@@ -124,7 +154,7 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             let cleaned = processed.pcm_16k;
 
-            let mut entry = self.buffers.entry(user_key).or_default();
+            let entry = &mut stream.buffer;
             if entry.utterance_start.is_none() {
                 entry.utterance_start = Some(Instant::now());
                 entry.current_revision_seq = Some(entry.next_revision_seq);
@@ -278,7 +308,7 @@ impl VoiceEventHandler for VoiceTickHandler {
             if let Some((start_ts, revision_seq, pcm)) = maybe_preview {
                 let tx = self.utterance_tx.clone();
                 let asr = Arc::clone(&self.asr);
-                let buffers = Arc::clone(&self.buffers);
+                let streams = Arc::clone(&self.streams);
                 let inflight = Arc::clone(&self.transcription_inflight);
                 let pending_commits = Arc::clone(&self.transcript_pending_commits);
                 let live_transcript_debug = self.live_transcript_debug;
@@ -295,9 +325,9 @@ impl VoiceEventHandler for VoiceTickHandler {
 
                     let _guard = InflightTaskGuard { counter: inflight };
 
-                    let still_current = buffers
+                    let still_current = streams
                         .get(&user_key)
-                        .map(|entry| entry.current_revision_seq == Some(revision_seq))
+                        .map(|entry| entry.buffer.current_revision_seq == Some(revision_seq))
                         .unwrap_or(false);
                     if !still_current {
                         return;
@@ -305,7 +335,7 @@ impl VoiceEventHandler for VoiceTickHandler {
 
                     if let Some(text) = transcribe_utterance_blocking(&asr, &pcm).await {
                         let Some(refined) = refine_provisional_for_emission(
-                            &buffers,
+                            &streams,
                             user_key,
                             revision_seq,
                             text,
@@ -343,7 +373,7 @@ impl VoiceEventHandler for VoiceTickHandler {
         }
 
         let tracked_users: Vec<(GuildId, UserId)> =
-            self.buffers.iter().map(|e| *e.key()).collect();
+            self.streams.iter().map(|e| *e.key()).collect();
         for user_key in tracked_users {
             if user_key.0 != self.guild_id {
                 continue;
@@ -354,7 +384,13 @@ impl VoiceEventHandler for VoiceTickHandler {
             }
 
             let mut maybe_job = None;
-            if let Some(mut entry) = self.buffers.get_mut(&user_key) {
+            if let Some(mut stream) = self.streams.get_mut(&user_key) {
+                let flushed = if self.enable_denoiser {
+                    stream.denoiser.flush_pending()
+                } else {
+                    Vec::new()
+                };
+                let entry = &mut stream.buffer;
                 entry.silent_ticks = entry.silent_ticks.saturating_add(1);
                 if entry.silent_ticks >= SILENCE_TICKS_THRESHOLD && !entry.pcm.is_empty() {
                     let needs_more_context = entry.last_preview_text.is_some()
@@ -365,11 +401,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                         continue;
                     }
 
-                    if self.enable_denoiser {
-                        if let Some(mut denoiser) = self.denoisers.get_mut(&user_key) {
-                            entry.pcm.extend(denoiser.flush_pending());
-                        }
-                    }
+                    entry.pcm.extend(flushed);
                     let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
                     let revision_seq = entry.current_revision_seq.take().unwrap_or_else(|| {
                         let seq = entry.next_revision_seq;
@@ -469,12 +501,13 @@ impl VoiceEventHandler for VoiceTickHandler {
 }
 
 fn refine_provisional_for_emission(
-    buffers: &Arc<Buffers>,
+    streams: &Arc<Streams>,
     user_key: (GuildId, UserId),
     revision_seq: u64,
     new_text: String,
 ) -> Option<RefinedEmission> {
-    let mut entry = buffers.get_mut(&user_key)?;
+    let mut stream = streams.get_mut(&user_key)?;
+    let entry = &mut stream.buffer;
     if entry.current_revision_seq != Some(revision_seq) {
         return None;
     }

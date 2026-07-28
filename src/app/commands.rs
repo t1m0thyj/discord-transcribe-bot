@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -80,15 +82,25 @@ pub(super) async fn handle_status(
         .get(&guild_id)
         .map(|v| v.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let decode_failures = state
+        .decode_failure_activity
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let unmapped_ssrc = state
+        .unmapped_ssrc_activity
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
     let mapped_ssrc = state
         .ssrc_to_user
         .iter()
         .filter(|e| e.key().0 == guild_id)
         .count();
     let buffered_users = state
-        .buffers
+        .streams
         .iter()
-        .filter(|e| e.key().0 == guild_id && !e.value().pcm.is_empty())
+        .filter(|e| e.key().0 == guild_id && !e.value().buffer.pcm.is_empty())
         .count();
 
     let participants = ctx
@@ -108,11 +120,13 @@ pub(super) async fn handle_status(
     let ss = elapsed.as_secs() % 60;
 
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
+        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
         voice_channel.get(),
         text_channel.get(),
         participants,
         decoded_frames,
+        decode_failures,
+        unmapped_ssrc,
         if started_notified { "yes" } else { "no" },
         mapped_ssrc,
         buffered_users,
@@ -162,22 +176,21 @@ pub(super) async fn handle_ask(
         super::session::wait_for_capture_quiesce_with_timeout(state, guild_id, INTERACTIVE_DRAIN_TIMEOUT)
             .await;
 
-    let pending = super::session::flush_pending_buffers_for_export(state, guild_id).await;
-    if !pending.is_empty() {
-        let mut session = session_lock.write().await;
-        super::session::upsert_utterances(&mut session.transcript, pending);
-    }
+    let (mut snapshot, started_at) = {
+        let session = session_lock.read().await;
+        (session.transcript.clone(), session.started_at)
+    };
+    let pending = super::session::snapshot_pending_buffers_for_interactive(state, guild_id).await;
+    super::session::upsert_utterances(&mut snapshot, pending);
 
-    let session = session_lock.read().await;
-    if session.transcript.is_empty() {
+    if snapshot.is_empty() {
         return Ok(
             "No transcribed utterances yet. Try /ask again after someone speaks and pauses briefly."
                 .to_string(),
         );
     }
 
-    let transcript = super::session::format_transcript(ctx, &session.transcript, session.started_at).await;
-    drop(session);
+    let transcript = super::session::format_transcript(ctx, &snapshot, started_at).await;
 
     let answer = crate::gemini::ask_gemini(
         &state.gemini_key,
@@ -228,24 +241,22 @@ pub(super) async fn handle_log(
         super::session::wait_for_capture_quiesce_with_timeout(state, guild_id, INTERACTIVE_DRAIN_TIMEOUT)
             .await;
 
-    let pending = super::session::flush_pending_buffers_for_export(state, guild_id).await;
-    if !pending.is_empty() {
-        let mut session = session_lock.write().await;
-        super::session::upsert_utterances(&mut session.transcript, pending);
-    }
+    let (mut snapshot, started_at) = {
+        let session = session_lock.read().await;
+        (session.transcript.clone(), session.started_at)
+    };
+    let pending = super::session::snapshot_pending_buffers_for_interactive(state, guild_id).await;
+    super::session::upsert_utterances(&mut snapshot, pending);
 
-    let session = session_lock.read().await;
-    if session.transcript.is_empty() {
+    if snapshot.is_empty() {
         return Ok("No transcribed utterances yet.".to_string());
     }
 
-    let start = session
-        .transcript
+    let start = snapshot
         .len()
         .saturating_sub(requested_utterances);
     let mut transcript =
-        super::session::format_transcript(ctx, &session.transcript[start..], session.started_at).await;
-    drop(session);
+        super::session::format_transcript(ctx, &snapshot[start..], started_at).await;
 
     if transcript.chars().count() > LOG_MAX_DISCORD_CHARS {
         let keep = LOG_MAX_DISCORD_CHARS.saturating_sub(48);
@@ -505,6 +516,23 @@ pub(super) async fn start_call_session(
         .context("failed to join voice channel")?;
 
     let (utterance_tx, utterance_rx) = mpsc::channel::<Utterance>(1024);
+
+    let session_started_at = Utc::now();
+    let local_dir = PathBuf::from("transcripts");
+    fs::create_dir_all(&local_dir)
+        .context("failed to create local transcript directory")?;
+    let transcript_jsonl_path = local_dir.join(format!(
+        "transcript-{}-{}.jsonl",
+        guild_id.get(),
+        session_started_at.format("%Y%m%d-%H%M%S")
+    ));
+    fs::File::create(&transcript_jsonl_path).with_context(|| {
+        format!(
+            "failed to create transcript journal file {}",
+            transcript_jsonl_path.display()
+        )
+    })?;
+
     state
         .utterance_senders
         .insert(guild_id, utterance_tx.clone());
@@ -518,10 +546,14 @@ pub(super) async fn start_call_session(
     state
         .decoded_audio_activity
         .insert(guild_id, Arc::clone(&decode_activity));
-    let decode_error_activity = Arc::new(AtomicUsize::new(0));
+    let decode_failure_activity = Arc::new(AtomicUsize::new(0));
     state
-        .decode_error_activity
-        .insert(guild_id, Arc::clone(&decode_error_activity));
+        .decode_failure_activity
+        .insert(guild_id, Arc::clone(&decode_failure_activity));
+    let unmapped_ssrc_activity = Arc::new(AtomicUsize::new(0));
+    state
+        .unmapped_ssrc_activity
+        .insert(guild_id, Arc::clone(&unmapped_ssrc_activity));
     let started_notified = Arc::new(AtomicBool::new(false));
     state
         .transcription_started_notified
@@ -531,7 +563,8 @@ pub(super) async fn start_call_session(
         voice_channel,
         text_channel,
         transcript: Vec::new(),
-        started_at: Utc::now(),
+        transcript_jsonl_path: transcript_jsonl_path.clone(),
+        started_at: session_started_at,
         started_mono: Instant::now(),
     }));
     state.active_calls.insert(guild_id, session.clone());
@@ -540,6 +573,7 @@ pub(super) async fn start_call_session(
         session,
         utterance_rx,
         Arc::clone(&pending_commits),
+        transcript_jsonl_path,
     ));
 
     super::session::attach_voice_handlers(
@@ -554,7 +588,8 @@ pub(super) async fn start_call_session(
             inflight,
             pending_commits,
             decode_activity,
-            decode_error_activity,
+            decode_failure_activity,
+            unmapped_ssrc_activity,
             started_notified,
         },
     )
@@ -567,6 +602,14 @@ pub(super) async fn start_call_session(
         voice_channel,
         text_channel,
         0,
+    ));
+
+    tokio::spawn(super::session::steady_state_receive_watchdog(
+        ctx.clone(),
+        Arc::clone(state),
+        guild_id,
+        voice_channel,
+        text_channel,
     ));
 
     Ok(())

@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -8,6 +10,7 @@ use anyhow::Context as _;
 use dashmap::DashMap;
 use earshot::Detector;
 use nnnoiseless::DenoiseState;
+use rubato::{FftFixedInOut, Resampler};
 use serenity::all::{GuildId, UserId};
 use sherpa_onnx::{
     OfflineMoonshineModelConfig, OfflineNemoEncDecCtcModelConfig, OfflineParaformerModelConfig,
@@ -18,6 +21,7 @@ use sherpa_onnx::{
 };
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::Semaphore;
+use serde::Serialize;
 
 use crate::app::{CallSession, Utterance};
 
@@ -26,7 +30,8 @@ pub const REORDER_WINDOW: Duration = Duration::from_millis(1500);
 pub const RNNOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 const EARSHOT_FRAME_SIZE: usize = 256;
 const EARSHOT_VAD_THRESHOLD: f32 = 0.5;
-const VAD_HANGOVER_FRAMES: u8 = 8;
+const VAD_HANGOVER_FRAMES: u8 = 16;
+const VAD_PREROLL_SAMPLES_16K: usize = 4_800;
 const AGC_TARGET_RMS: f32 = 0.06;
 const AGC_MIN_GAIN: f32 = 0.6;
 const AGC_MAX_GAIN: f32 = 3.0;
@@ -423,8 +428,9 @@ pub struct UserDenoiseState {
     hp_prev_y: f32,
     noise_rms_ema: f32,
     last_snr_db: f32,
-    resample_accum: f32,
-    resample_phase: u8,
+    resampler_48k_to_16k: FftFixedInOut<f32>,
+    resample_pending_48k: Vec<f32>,
+    preroll_16k: VecDeque<f32>,
     vad_hangover_frames: u8,
     was_speech_last_tick: bool,
 }
@@ -447,8 +453,10 @@ impl UserDenoiseState {
             hp_prev_y: 0.0,
             noise_rms_ema: 0.002,
             last_snr_db: 0.0,
-            resample_accum: 0.0,
-            resample_phase: 0,
+            resampler_48k_to_16k: FftFixedInOut::new(48_000, 16_000, 960, 1)
+                .expect("valid fixed 48k->16k resampler config"),
+            resample_pending_48k: Vec::new(),
+            preroll_16k: VecDeque::with_capacity(VAD_PREROLL_SAMPLES_16K),
             vad_hangover_frames: 0,
             was_speech_last_tick: false,
         }
@@ -479,11 +487,26 @@ impl UserDenoiseState {
         self.apply_agc(&mut cleaned_48k, cleaned_rms);
 
         let pcm_16k = self.resample_48k_to_16k_stream(&cleaned_48k);
+        let was_speech_last_tick = self.was_speech_last_tick;
         let speech_active = self.passes_vad_earshot(&pcm_16k);
+        let mut emitted_pcm_16k = pcm_16k;
+
+        if speech_active {
+            if !was_speech_last_tick && !self.preroll_16k.is_empty() {
+                let mut with_preroll = Vec::with_capacity(self.preroll_16k.len() + emitted_pcm_16k.len());
+                with_preroll.extend(self.preroll_16k.iter().copied());
+                with_preroll.extend(emitted_pcm_16k);
+                emitted_pcm_16k = with_preroll;
+            }
+            self.preroll_16k.clear();
+        } else {
+            self.push_preroll_16k(&emitted_pcm_16k);
+        }
+
         self.was_speech_last_tick = speech_active;
 
         ProcessedSpeechChunk {
-            pcm_16k,
+            pcm_16k: emitted_pcm_16k,
             speech_active,
         }
     }
@@ -524,30 +547,34 @@ impl UserDenoiseState {
         }
 
         let mut evaluated_any = false;
-        let mut voiced = false;
+        let mut speech_active = false;
         while self.vad_pending_16k.len() >= EARSHOT_FRAME_SIZE {
             let frame: Vec<f32> = self.vad_pending_16k.drain(..EARSHOT_FRAME_SIZE).collect();
             let score = self.vad.predict_f32(&frame);
             evaluated_any = true;
             if score >= EARSHOT_VAD_THRESHOLD {
-                voiced = true;
+                self.vad_hangover_frames = VAD_HANGOVER_FRAMES;
+                speech_active = true;
+            } else if self.vad_hangover_frames > 0 {
+                self.vad_hangover_frames -= 1;
+                speech_active = true;
             }
-        }
-
-        if voiced {
-            self.vad_hangover_frames = VAD_HANGOVER_FRAMES;
-            return true;
         }
 
         if evaluated_any {
-            if self.vad_hangover_frames > 0 {
-                self.vad_hangover_frames -= 1;
-                return true;
-            }
-            return false;
+            return speech_active;
         }
 
         self.vad_hangover_frames > 0
+    }
+
+    fn push_preroll_16k(&mut self, samples: &[f32]) {
+        for sample in samples {
+            if self.preroll_16k.len() == VAD_PREROLL_SAMPLES_16K {
+                self.preroll_16k.pop_front();
+            }
+            self.preroll_16k.push_back(*sample);
+        }
     }
 
     fn apply_agc(&mut self, samples: &mut [f32], rms: f32) {
@@ -582,16 +609,33 @@ impl UserDenoiseState {
             return Vec::new();
         }
 
-        let mut out = Vec::with_capacity(input.len() / 3 + 1);
-        for &sample in input {
-            self.resample_accum += sample;
-            self.resample_phase = self.resample_phase.wrapping_add(1);
-            if self.resample_phase == 3 {
-                out.push(self.resample_accum / 3.0);
-                self.resample_phase = 0;
-                self.resample_accum = 0.0;
+        self.resample_pending_48k.extend_from_slice(input);
+
+        let in_frames = self.resampler_48k_to_16k.input_frames_next();
+        let out_frames = self.resampler_48k_to_16k.output_frames_next();
+
+        let mut out = Vec::with_capacity(
+            (self.resample_pending_48k.len() / in_frames)
+                .saturating_mul(out_frames),
+        );
+
+        while self.resample_pending_48k.len() >= in_frames {
+            let in_chunk: Vec<f32> = self.resample_pending_48k.drain(..in_frames).collect();
+            let mut out_chunk = vec![0.0f32; out_frames];
+            if self
+                .resampler_48k_to_16k
+                .process_into_buffer(
+                    &[in_chunk.as_slice()],
+                    &mut [out_chunk.as_mut_slice()],
+                    None,
+                )
+                .is_err()
+            {
+                continue;
             }
+            out.extend_from_slice(&out_chunk);
         }
+
         out
     }
 
@@ -633,6 +677,12 @@ pub struct UserAudioBuffer {
     pub last_preview_text: Option<String>,
     pub frozen_prefix_words: usize,
     pub stable_preview_streak: u32,
+}
+
+#[derive(Default)]
+pub struct UserStreamState {
+    pub denoiser: UserDenoiseState,
+    pub buffer: UserAudioBuffer,
 }
 
 pub fn make_revision_id(user_id: UserId, revision_seq: u64) -> u64 {
@@ -695,12 +745,13 @@ fn compute_rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
-pub type Denoisers = DashMap<(GuildId, UserId), UserDenoiseState>;
+pub type Streams = DashMap<(GuildId, UserId), UserStreamState>;
 
 pub async fn transcript_writer_loop(
     session: Arc<RwLock<CallSession>>,
     mut rx: mpsc::Receiver<Utterance>,
     pending_commits: Arc<AtomicUsize>,
+    transcript_jsonl_path: PathBuf,
 ) {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
@@ -738,10 +789,30 @@ pub async fn transcript_writer_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut revision_index = std::collections::HashMap::<u64, usize>::new();
 
+    #[derive(Serialize)]
+    struct PersistedUtterance {
+        revision_id: u64,
+        user_id: u64,
+        start_offset_ms: u64,
+        is_final: bool,
+        text: String,
+    }
+
+    fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) {
+        let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(path) else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(item) else {
+            return;
+        };
+        let _ = writeln!(file, "{line}");
+    }
+
     async fn apply_revision(
         session: &Arc<RwLock<CallSession>>,
         revision_index: &mut std::collections::HashMap<u64, usize>,
         pending_commits: &Arc<AtomicUsize>,
+        transcript_jsonl_path: &Path,
         utterance: Utterance,
     ) {
         let mut lock = session.write().await;
@@ -758,17 +829,45 @@ pub async fn transcript_writer_loop(
                 pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
                 return;
             }
+            let start_offset_ms = utterance
+                .start_ts
+                .saturating_duration_since(lock.started_mono)
+                .as_millis() as u64;
             lock.transcript[existing_idx] = utterance;
+            let persisted = PersistedUtterance {
+                revision_id: lock.transcript[existing_idx].revision_id,
+                user_id: lock.transcript[existing_idx].user_id.get(),
+                start_offset_ms,
+                is_final: lock.transcript[existing_idx].is_final,
+                text: lock.transcript[existing_idx].text.clone(),
+            };
+            drop(lock);
+            append_persisted_utterance(transcript_jsonl_path, &persisted);
             pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
             return;
         }
 
+        let start_offset_ms = utterance
+            .start_ts
+            .saturating_duration_since(lock.started_mono)
+            .as_millis() as u64;
         lock.transcript.push(utterance.clone());
         lock.transcript.sort_by_key(|u| u.start_ts);
         revision_index.clear();
         for (idx, u) in lock.transcript.iter().enumerate() {
             revision_index.insert(u.revision_id, idx);
         }
+
+        let persisted = PersistedUtterance {
+            revision_id: utterance.revision_id,
+            user_id: utterance.user_id.get(),
+            start_offset_ms,
+            is_final: utterance.is_final,
+            text: utterance.text,
+        };
+
+        drop(lock);
+        append_persisted_utterance(transcript_jsonl_path, &persisted);
 
         pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
     }
@@ -794,17 +893,29 @@ pub async fn transcript_writer_loop(
             }
 
             if let Some(item) = heap.pop() {
-                apply_revision(&session, &mut revision_index, &pending_commits, item.utterance)
+                apply_revision(
+                    &session,
+                    &mut revision_index,
+                    &pending_commits,
+                    &transcript_jsonl_path,
+                    item.utterance,
+                )
                     .await;
             }
         }
     }
 
     while let Some(item) = heap.pop() {
-        apply_revision(&session, &mut revision_index, &pending_commits, item.utterance).await;
+        apply_revision(
+            &session,
+            &mut revision_index,
+            &pending_commits,
+            &transcript_jsonl_path,
+            item.utterance,
+        )
+        .await;
     }
 }
 
-pub type Buffers = DashMap<(GuildId, UserId), UserAudioBuffer>;
 pub type SsrcMap = DashMap<(GuildId, u32), UserId>;
 pub type SessionSenders = DashMap<GuildId, mpsc::Sender<Utterance>>;
