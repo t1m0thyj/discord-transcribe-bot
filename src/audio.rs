@@ -52,7 +52,6 @@ pub struct VoiceTickHandler {
     pub asr: Arc<AsrEngine>,
     pub asr_finalize: Option<Arc<AsrEngine>>,
     pub live_transcript_debug: bool,
-    pub provisional_step_ms: u64,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
 }
@@ -65,9 +64,10 @@ impl VoiceEventHandler for VoiceTickHandler {
         };
 
         let mut currently_speaking = std::collections::HashSet::<UserId>::new();
-        let step_samples = ((self.provisional_step_ms as usize) * 16).max(1_600);
-        let start_samples = step_samples.saturating_mul(2);
-        let max_ingest_samples = ((self.rolling_ingest_max_ms as usize) * 16).max(start_samples);
+        let first_preview_samples = 8_000; // 0.5s at 16 kHz
+        let max_preview_samples = 128_000; // 8s at 16 kHz
+        let max_ingest_samples =
+            ((self.rolling_ingest_max_ms as usize) * 16).max(first_preview_samples);
         let base_keep_context_samples = (self.rolling_ingest_context_ms as usize) * 16;
 
         for (ssrc, data) in &tick.speaking {
@@ -99,6 +99,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 .entry(user_key)
                 .or_insert_with(UserDenoiseState::new);
             let processed = denoiser.push_stereo_pcm(decoded, self.enable_denoiser);
+            drop(denoiser);
             if processed.speech_active {
                 currently_speaking.insert(user_id);
             }
@@ -170,13 +171,17 @@ impl VoiceEventHandler for VoiceTickHandler {
                 }
             }
 
-            let maybe_preview = if entry.pcm.len() >= start_samples
-                && entry.pcm.len()
-                    >= entry
-                        .last_preview_samples
-                        .saturating_add(step_samples)
-            {
-                entry.last_preview_samples = entry.pcm.len();
+            let next_preview_samples = if entry.last_preview_samples == 0 {
+                first_preview_samples
+            } else {
+                entry
+                    .last_preview_samples
+                    .saturating_mul(2)
+                    .min(max_preview_samples)
+            };
+
+            let maybe_preview = if entry.pcm.len() >= next_preview_samples {
+                entry.last_preview_samples = next_preview_samples;
                 let start_ts = entry.utterance_start.unwrap_or_else(Instant::now);
                 let revision_seq = entry.current_revision_seq.unwrap_or(0);
                 Some((start_ts, revision_seq, entry.pcm.clone()))
@@ -240,7 +245,7 @@ impl VoiceEventHandler for VoiceTickHandler {
 
                         if let Some(final_asr) = asr_finalize {
                             if let Some(refined_text) = transcribe_utterance_blocking(&final_asr, &pcm).await {
-                                if !texts_equivalent(&text, &refined_text) {
+                                if should_apply_refinement(&text, &refined_text) {
                                     if live_transcript_debug {
                                         tracing::debug!(
                                             user = %user_id,
@@ -289,6 +294,14 @@ impl VoiceEventHandler for VoiceTickHandler {
                     }
 
                     let _guard = InflightTaskGuard { counter: inflight };
+
+                    let still_current = buffers
+                        .get(&user_key)
+                        .map(|entry| entry.current_revision_seq == Some(revision_seq))
+                        .unwrap_or(false);
+                    if !still_current {
+                        return;
+                    }
 
                     if let Some(text) = transcribe_utterance_blocking(&asr, &pcm).await {
                         let Some(refined) = refine_provisional_for_emission(
@@ -417,7 +430,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                         {
                             if let Some(final_asr) = asr_finalize {
                                 if let Some(refined_text) = transcribe_utterance_blocking(&final_asr, &pcm).await {
-                                    if !texts_equivalent(&text, &refined_text) {
+                                    if should_apply_refinement(&text, &refined_text) {
                                         if live_transcript_debug {
                                             tracing::debug!(
                                                 user = %user_id,
@@ -588,4 +601,51 @@ fn texts_equivalent(a: &str, b: &str) -> bool {
         .collect::<Vec<_>>()
         .join(" ")
         .eq_ignore_ascii_case(&b.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn should_apply_refinement(pass1: &str, pass2: &str) -> bool {
+    if texts_equivalent(pass1, pass2) {
+        return false;
+    }
+
+    let w1 = pass1.split_whitespace().count().max(1);
+    let w2 = pass2.split_whitespace().count();
+    if w2 == 0 {
+        return false;
+    }
+
+    let ratio = w2 as f32 / w1 as f32;
+    if !(0.4..=2.5).contains(&ratio) {
+        return false;
+    }
+
+    if has_repeated_ngram(pass2, 3, 3) {
+        return false;
+    }
+
+    true
+}
+
+fn has_repeated_ngram(text: &str, n: usize, min_consecutive_repeats: usize) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < n.saturating_mul(min_consecutive_repeats) || n == 0 {
+        return false;
+    }
+
+    let mut i = 0usize;
+    while i + n <= words.len() {
+        let candidate = &words[i..i + n];
+        let mut repeats = 1usize;
+        let mut j = i + n;
+        while j + n <= words.len() && words[j..j + n].eq(candidate) {
+            repeats += 1;
+            if repeats >= min_consecutive_repeats {
+                return true;
+            }
+            j += n;
+        }
+        i += 1;
+    }
+
+    false
 }

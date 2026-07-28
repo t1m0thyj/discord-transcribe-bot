@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -69,6 +71,17 @@ pub async fn finalize_call_for_guild(
         guild_id.get(),
         session.started_at.format("%Y%m%d-%H%M%S")
     );
+
+    let local_dir = PathBuf::from("transcripts");
+    fs::create_dir_all(&local_dir)
+        .context("failed to create local transcript directory")?;
+    let local_path = local_dir.join(&filename);
+    fs::write(&local_path, &transcript_text).with_context(|| {
+        format!(
+            "failed to write local transcript file {}",
+            local_path.display()
+        )
+    })?;
 
     let attachment =
         CreateAttachment::bytes(transcript_text.clone().into_bytes(), filename.clone());
@@ -157,7 +170,6 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
             asr: Arc::clone(&state.asr),
             asr_finalize: state.final_asr.as_ref().map(Arc::clone),
             live_transcript_debug: state.live_transcript_debug,
-            provisional_step_ms: state.provisional_step_ms,
             rolling_ingest_max_ms: state.rolling_ingest_max_ms,
             rolling_ingest_context_ms: state.rolling_ingest_context_ms,
         },
@@ -484,8 +496,18 @@ async fn wait_for_transcription_drain(state: &Arc<AppState>, guild_id: GuildId) 
         return;
     };
 
-    while counter.load(Ordering::SeqCst) > 0 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        while counter.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+
+    if drained.is_err() {
+        tracing::warn!(
+            guild = %guild_id,
+            "timed out waiting for transcription drain; continuing finalize with partial state"
+        );
     }
 }
 
@@ -529,8 +551,18 @@ async fn wait_for_transcript_commit_drain(state: &Arc<AppState>, guild_id: Guild
         return;
     };
 
-    while counter.load(Ordering::SeqCst) > 0 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        while counter.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+
+    if drained.is_err() {
+        tracing::warn!(
+            guild = %guild_id,
+            "timed out waiting for transcript commit drain; continuing finalize with partial state"
+        );
     }
 }
 

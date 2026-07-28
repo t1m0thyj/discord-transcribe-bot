@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -17,6 +17,7 @@ use sherpa_onnx::{
     OfflineZipformerCtcModelConfig,
 };
 use tokio::sync::{mpsc, RwLock};
+use tokio::sync::Semaphore;
 
 use crate::app::{CallSession, Utterance};
 
@@ -425,6 +426,7 @@ pub struct UserDenoiseState {
     resample_accum: f32,
     resample_phase: u8,
     vad_hangover_frames: u8,
+    was_speech_last_tick: bool,
 }
 
 pub struct ProcessedSpeechChunk {
@@ -448,6 +450,7 @@ impl UserDenoiseState {
             resample_accum: 0.0,
             resample_phase: 0,
             vad_hangover_frames: 0,
+            was_speech_last_tick: false,
         }
     }
 
@@ -477,6 +480,7 @@ impl UserDenoiseState {
 
         let pcm_16k = self.resample_48k_to_16k_stream(&cleaned_48k);
         let speech_active = self.passes_vad_earshot(&pcm_16k);
+        self.was_speech_last_tick = speech_active;
 
         ProcessedSpeechChunk {
             pcm_16k,
@@ -547,8 +551,15 @@ impl UserDenoiseState {
     }
 
     fn apply_agc(&mut self, samples: &mut [f32], rms: f32) {
+        if !self.was_speech_last_tick {
+            for sample in samples {
+                *sample = (*sample * self.agc_gain).clamp(-0.98, 0.98);
+            }
+            return;
+        }
+
         let desired_gain = (AGC_TARGET_RMS / rms.max(1e-4)).clamp(AGC_MIN_GAIN, AGC_MAX_GAIN);
-        let smoothing = if desired_gain > self.agc_gain { 0.12 } else { 0.03 };
+        let smoothing = if desired_gain < self.agc_gain { 0.35 } else { 0.02 };
         self.agc_gain = self.agc_gain * (1.0 - smoothing) + desired_gain * smoothing;
 
         for sample in samples {
@@ -655,15 +666,24 @@ pub async fn transcribe_mono_pcm(
         return None;
     }
 
+    // Bound concurrent ASR decode work to keep CPU usage stable on small devices.
+    let permit = asr_decode_semaphore().acquire_owned().await.ok()?;
+
     let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
         .await
         .ok()?;
+    drop(permit);
 
     if text.trim().is_empty() {
         None
     } else {
         Some(text)
     }
+}
+
+fn asr_decode_semaphore() -> Arc<Semaphore> {
+    static ASR_DECODE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(ASR_DECODE_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
 fn compute_rms(samples: &[f32]) -> f32 {

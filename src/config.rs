@@ -9,7 +9,6 @@ pub struct AppConfig {
     pub final_asr_model_dir: Option<String>,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
-    pub provisional_step_ms: u64,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
     pub autojoin_suffix: String,
@@ -38,13 +37,6 @@ impl AppConfig {
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(true);
 
-        // One-knob provisional update cadence.
-        let provisional_step_ms = env::var("PROVISIONAL_CADENCE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v >= 100)
-            .unwrap_or(250);
-
         // Keep in-memory audio bounded for long uninterrupted speech.
         let rolling_ingest_max_ms = env::var("ROLLING_INGEST_MAX_MS")
             .ok()
@@ -72,7 +64,6 @@ impl AppConfig {
             final_asr_model_dir,
             live_transcript_debug,
             enable_denoiser,
-            provisional_step_ms,
             rolling_ingest_max_ms,
             rolling_ingest_context_ms,
             autojoin_suffix,

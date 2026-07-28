@@ -7,7 +7,6 @@ Short, current design summary for the Discord live transcription bot.
 - Rust + tokio
 - serenity + songbird receive mode
 - sherpa-onnx local ASR
-- rubato resampling (48 kHz to 16 kHz mono)
 - optional nnnoiseless denoise
 - Gemini via reqwest for Q&A
 
@@ -15,7 +14,7 @@ Short, current design summary for the Discord live transcription bot.
 
 1. /join starts a guild-scoped call session.
 2. Voice events populate guild-scoped speaker maps and per-user audio buffers.
-3. Audio pipeline performs downmix, optional denoise, periodic provisional ASR, and final ASR on silence.
+3. Audio pipeline performs downmix, high-pass filter, SNR-gated optional denoise, AGC, simple 48 kHz to 16 kHz decimation, and earshot VAD gating before periodic provisional ASR and final ASR on silence.
 4. Rolling ingest bounds memory for long speech: old chunk is finalized, recent context tail is retained.
 5. Utterance revisions are queued and merged by a transcript writer with a small reorder window.
 6. /ask and /log wait for brief quiescence, flush pending guild buffers, then read current transcript.
@@ -67,7 +66,6 @@ Suffix-based auto-join is implemented: channels ending with the configured marke
 - ASR_MODEL_FAMILY (optional)
 - LIVE_TRANSCRIPT_DEBUG
 - ENABLE_DENOISER
-- PROVISIONAL_CADENCE_MS
 - ROLLING_INGEST_MAX_MS
 - ROLLING_INGEST_CONTEXT_MS
 - AUTOJOIN_SUFFIX (optional; default `[Transcribe]`)

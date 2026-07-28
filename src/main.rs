@@ -58,8 +58,17 @@ impl EventHandler for Handler {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(2)
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
