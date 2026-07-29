@@ -36,6 +36,7 @@ const AGC_TARGET_RMS: f32 = 0.06;
 const AGC_MIN_GAIN: f32 = 0.6;
 const AGC_MAX_GAIN: f32 = 3.0;
 const DENOISER_BYPASS_SNR_DB: f32 = 18.0;
+const DENOISER_BYPASS_HYSTERESIS_DB: f32 = 3.0;
 const HIGHPASS_ALPHA_48K: f32 = 0.991;
 
 pub struct AsrEngine {
@@ -433,6 +434,7 @@ pub struct UserDenoiseState {
     preroll_16k: VecDeque<f32>,
     vad_hangover_frames: u8,
     was_speech_last_tick: bool,
+    denoiser_active: bool,
 }
 
 pub struct ProcessedSpeechChunk {
@@ -459,6 +461,7 @@ impl UserDenoiseState {
             preroll_16k: VecDeque::with_capacity(VAD_PREROLL_SAMPLES_16K),
             vad_hangover_frames: 0,
             was_speech_last_tick: false,
+            denoiser_active: true,
         }
     }
 
@@ -475,12 +478,13 @@ impl UserDenoiseState {
 
         let rms = compute_rms(&mono);
         self.update_noise_and_snr(rms);
-        let use_denoiser = enable_denoiser && self.last_snr_db < DENOISER_BYPASS_SNR_DB;
+        let use_denoiser = self.select_denoiser_mode(enable_denoiser);
         let mut cleaned_48k = if use_denoiser {
             self.push_mono_pcm(&mono)
         } else {
-            self.pending.clear();
-            mono
+            let mut passthrough = self.drain_pending_passthrough();
+            passthrough.extend_from_slice(&mono);
+            passthrough
         };
 
         let cleaned_rms = compute_rms(&cleaned_48k);
@@ -532,6 +536,29 @@ impl UserDenoiseState {
         frame.resize(RNNOISE_FRAME_SIZE, 0.0);
         let cleaned = self.denoise_frame(&frame);
         self.resample_48k_to_16k_stream(&cleaned)
+    }
+
+    fn drain_pending_passthrough(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn select_denoiser_mode(&mut self, enable_denoiser: bool) -> bool {
+        if !enable_denoiser {
+            self.denoiser_active = false;
+            return false;
+        }
+
+        if self.was_speech_last_tick {
+            return self.denoiser_active;
+        }
+
+        if self.last_snr_db >= DENOISER_BYPASS_SNR_DB + DENOISER_BYPASS_HYSTERESIS_DB {
+            self.denoiser_active = false;
+        } else if self.last_snr_db <= DENOISER_BYPASS_SNR_DB - DENOISER_BYPASS_HYSTERESIS_DB {
+            self.denoiser_active = true;
+        }
+
+        self.denoiser_active
     }
 
     fn update_noise_and_snr(&mut self, rms: f32) {
@@ -731,6 +758,36 @@ pub async fn transcribe_mono_pcm(
     }
 }
 
+pub async fn transcribe_mono_pcm_with_gate<F>(
+    asr: Arc<AsrEngine>,
+    pcm_mono: Vec<f32>,
+    should_decode: F,
+) -> Option<String>
+where
+    F: FnOnce() -> bool,
+{
+    if pcm_mono.len() < 1600 {
+        return None;
+    }
+
+    let permit = asr_decode_semaphore().acquire_owned().await.ok()?;
+    if !should_decode() {
+        drop(permit);
+        return None;
+    }
+
+    let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
+        .await
+        .ok()?;
+    drop(permit);
+
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn asr_decode_semaphore() -> Arc<Semaphore> {
     static ASR_DECODE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     Arc::clone(ASR_DECODE_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
@@ -743,6 +800,101 @@ fn compute_rms(samples: &[f32]) -> f32 {
 
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
+}
+
+pub fn should_apply_refinement(pass1: &str, pass2: &str) -> bool {
+    if texts_equivalent(pass1, pass2) {
+        return false;
+    }
+
+    let w1 = pass1.split_whitespace().count().max(1);
+    let w2 = pass2.split_whitespace().count();
+    if w2 == 0 {
+        return false;
+    }
+
+    let ratio = w2 as f32 / w1 as f32;
+    if !(0.4..=2.5).contains(&ratio) {
+        return false;
+    }
+
+    if has_repeated_ngram(pass2, 3, 3) {
+        return false;
+    }
+
+    true
+}
+
+fn texts_equivalent(a: &str, b: &str) -> bool {
+    a.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .eq_ignore_ascii_case(&b.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn has_repeated_ngram(text: &str, n: usize, min_consecutive_repeats: usize) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < n.saturating_mul(min_consecutive_repeats) || n == 0 {
+        return false;
+    }
+
+    let mut i = 0usize;
+    while i + n <= words.len() {
+        let candidate = &words[i..i + n];
+        let mut repeats = 1usize;
+        let mut j = i + n;
+        while j + n <= words.len() && words[j..j + n].eq(candidate) {
+            repeats += 1;
+            if repeats >= min_consecutive_repeats {
+                return true;
+            }
+            j += n;
+        }
+        i += 1;
+    }
+
+    false
+}
+
+fn trim_overlap_from_previous_final(transcript: &[Utterance], utterance: &mut Utterance) {
+    if !utterance.is_final {
+        return;
+    }
+
+    let Some(prev) = transcript
+        .iter()
+        .rev()
+        .find(|u| u.user_id == utterance.user_id && u.is_final && u.start_ts <= utterance.start_ts)
+    else {
+        return;
+    };
+
+    let prev_words: Vec<&str> = prev.text.split_whitespace().collect();
+    let curr_words: Vec<&str> = utterance.text.split_whitespace().collect();
+    if prev_words.is_empty() || curr_words.is_empty() {
+        return;
+    }
+
+    let max_overlap = prev_words.len().min(curr_words.len()).min(24);
+    let mut overlap = 0usize;
+    for k in (4..=max_overlap).rev() {
+        let prev_tail = &prev_words[prev_words.len() - k..];
+        let curr_head = &curr_words[..k];
+        if prev_tail
+            .iter()
+            .zip(curr_head.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            overlap = k;
+            break;
+        }
+    }
+
+    if overlap == 0 || overlap >= curr_words.len() {
+        return;
+    }
+
+    utterance.text = curr_words[overlap..].join(" ");
 }
 
 pub type Streams = DashMap<(GuildId, UserId), UserStreamState>;
@@ -813,7 +965,7 @@ pub async fn transcript_writer_loop(
         revision_index: &mut std::collections::HashMap<u64, usize>,
         pending_commits: &Arc<AtomicUsize>,
         transcript_jsonl_path: &Path,
-        utterance: Utterance,
+        mut utterance: Utterance,
     ) {
         let mut lock = session.write().await;
 
@@ -846,6 +998,8 @@ pub async fn transcript_writer_loop(
             pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
             return;
         }
+
+        trim_overlap_from_previous_final(&lock.transcript, &mut utterance);
 
         let start_offset_ms = utterance
             .start_ts

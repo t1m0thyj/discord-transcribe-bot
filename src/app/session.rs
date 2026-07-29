@@ -22,7 +22,7 @@ use super::{
     STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
 };
 use crate::audio::{ClientDisconnectHandler, SpeakingUpdateHandler, VoiceTickHandler};
-use crate::transcription::{make_revision_id, transcribe_mono_pcm};
+use crate::transcription::{make_revision_id, should_apply_refinement, transcribe_mono_pcm};
 
 pub struct VoiceHandlerAttachContext {
     pub http: Arc<serenity::http::Http>,
@@ -877,13 +877,17 @@ pub(super) async fn snapshot_pending_buffers_for_interactive(
 }
 
 async fn transcribe_finalized_mono_pcm(state: &Arc<AppState>, pcm: Vec<f32>) -> Option<String> {
+    let pass1 = transcribe_mono_pcm(Arc::clone(&state.asr), pcm.clone()).await?;
+
     if let Some(final_asr) = state.final_asr.as_ref() {
-        if let Some(text) = transcribe_mono_pcm(Arc::clone(final_asr), pcm.clone()).await {
-            return Some(text);
+        if let Some(pass2) = transcribe_mono_pcm(Arc::clone(final_asr), pcm).await {
+            if should_apply_refinement(&pass1, &pass2) {
+                return Some(pass2);
+            }
         }
     }
 
-    transcribe_mono_pcm(Arc::clone(&state.asr), pcm).await
+    Some(pass1)
 }
 
 async fn ensure_thread_context_loaded(

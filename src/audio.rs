@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 
 use crate::app::Utterance;
 use crate::transcription::{
-    make_revision_id, transcribe_mono_pcm, AsrEngine, SILENCE_TICKS_THRESHOLD,
+    make_revision_id, should_apply_refinement, transcribe_mono_pcm, transcribe_mono_pcm_with_gate, AsrEngine,
+    SILENCE_TICKS_THRESHOLD,
     SsrcMap, Streams,
 };
 
@@ -173,7 +174,11 @@ impl VoiceEventHandler for VoiceTickHandler {
                 let keep = base_keep_context_samples
                     .min(max_keep_without_starving)
                     .min(entry.pcm.len());
-                let split_at = entry.pcm.len().saturating_sub(keep);
+                let split_at = choose_rollover_split_index(
+                    &entry.pcm,
+                    keep,
+                    max_keep_without_starving,
+                );
                 if split_at >= 1_600 {
                     let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
                     let revision_seq = entry.current_revision_seq.take().unwrap_or_else(|| {
@@ -333,7 +338,15 @@ impl VoiceEventHandler for VoiceTickHandler {
                         return;
                     }
 
-                    if let Some(text) = transcribe_utterance_blocking(&asr, &pcm).await {
+                    if let Some(text) = transcribe_utterance_blocking_if_current(
+                        &asr,
+                        &pcm,
+                        Arc::clone(&streams),
+                        user_key,
+                        revision_seq,
+                    )
+                    .await
+                    {
                         let Some(refined) = refine_provisional_for_emission(
                             &streams,
                             user_key,
@@ -385,37 +398,45 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             let mut maybe_job = None;
             if let Some(mut stream) = self.streams.get_mut(&user_key) {
+                let should_finalize = {
+                    let entry = &mut stream.buffer;
+                    entry.silent_ticks = entry.silent_ticks.saturating_add(1);
+                    if entry.silent_ticks >= SILENCE_TICKS_THRESHOLD && !entry.pcm.is_empty() {
+                        let needs_more_context = entry.last_preview_text.is_some()
+                            && entry.stable_preview_streak < FINALIZE_STABLE_PREVIEW_STREAK;
+                        let max_silence_wait = SILENCE_TICKS_THRESHOLD
+                            .saturating_add(FINALIZE_UNSTABLE_EXTRA_TICKS);
+                        !(needs_more_context && entry.silent_ticks < max_silence_wait)
+                    } else {
+                        false
+                    }
+                };
+
+                if !should_finalize {
+                    continue;
+                }
+
                 let flushed = if self.enable_denoiser {
                     stream.denoiser.flush_pending()
                 } else {
                     Vec::new()
                 };
-                let entry = &mut stream.buffer;
-                entry.silent_ticks = entry.silent_ticks.saturating_add(1);
-                if entry.silent_ticks >= SILENCE_TICKS_THRESHOLD && !entry.pcm.is_empty() {
-                    let needs_more_context = entry.last_preview_text.is_some()
-                        && entry.stable_preview_streak < FINALIZE_STABLE_PREVIEW_STREAK;
-                    let max_silence_wait =
-                        SILENCE_TICKS_THRESHOLD.saturating_add(FINALIZE_UNSTABLE_EXTRA_TICKS);
-                    if needs_more_context && entry.silent_ticks < max_silence_wait {
-                        continue;
-                    }
 
-                    entry.pcm.extend(flushed);
-                    let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
-                    let revision_seq = entry.current_revision_seq.take().unwrap_or_else(|| {
-                        let seq = entry.next_revision_seq;
-                        entry.next_revision_seq = entry.next_revision_seq.wrapping_add(1);
-                        seq
-                    });
-                    let pcm = std::mem::take(&mut entry.pcm);
-                    entry.silent_ticks = 0;
-                    entry.last_preview_samples = 0;
-                    entry.last_preview_text = None;
-                    entry.frozen_prefix_words = 0;
-                    entry.stable_preview_streak = 0;
-                    maybe_job = Some((start_ts, revision_seq, pcm));
-                }
+                let entry = &mut stream.buffer;
+                entry.pcm.extend(flushed);
+                let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
+                let revision_seq = entry.current_revision_seq.take().unwrap_or_else(|| {
+                    let seq = entry.next_revision_seq;
+                    entry.next_revision_seq = entry.next_revision_seq.wrapping_add(1);
+                    seq
+                });
+                let pcm = std::mem::take(&mut entry.pcm);
+                entry.silent_ticks = 0;
+                entry.last_preview_samples = 0;
+                entry.last_preview_text = None;
+                entry.frozen_prefix_words = 0;
+                entry.stable_preview_streak = 0;
+                maybe_job = Some((start_ts, revision_seq, pcm));
             }
 
             if let Some((start_ts, revision_seq, pcm)) = maybe_job {
@@ -498,6 +519,56 @@ impl VoiceEventHandler for VoiceTickHandler {
 
         None
     }
+}
+
+fn choose_rollover_split_index(
+    pcm: &[f32],
+    keep_samples: usize,
+    max_keep_without_starving: usize,
+) -> usize {
+    let len = pcm.len();
+    if len < 3_200 {
+        return len.saturating_sub(keep_samples);
+    }
+
+    let min_split = len.saturating_sub(max_keep_without_starving).max(1_600);
+    let max_split = len.saturating_sub(1_600);
+    if min_split >= max_split {
+        return len.saturating_sub(keep_samples).clamp(min_split, max_split);
+    }
+
+    let nominal = len.saturating_sub(keep_samples).clamp(min_split, max_split);
+    let search_radius = (keep_samples / 2).clamp(800, 8_000);
+    let search_start = nominal.saturating_sub(search_radius).max(min_split);
+    let search_end = nominal.saturating_add(search_radius).min(max_split);
+
+    let frame = 800usize; // 50 ms at 16 kHz
+    let hop = 160usize; // 10 ms at 16 kHz
+    let mut best = nominal;
+    let mut best_rms = f32::INFINITY;
+
+    let mut idx = search_start;
+    while idx <= search_end {
+        let left = idx.saturating_sub(frame / 2);
+        let right = (left + frame).min(len);
+        let left = right.saturating_sub(frame);
+        if right > left {
+            let window = &pcm[left..right];
+            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+            if rms < best_rms {
+                best_rms = rms;
+                best = idx;
+            }
+        }
+
+        let next = idx.saturating_add(hop);
+        if next <= idx {
+            break;
+        }
+        idx = next;
+    }
+
+    best.clamp(min_split, max_split)
 }
 
 fn refine_provisional_for_emission(
@@ -629,56 +700,19 @@ async fn transcribe_utterance_blocking(
     transcribe_mono_pcm(Arc::clone(asr), pcm_mono.to_vec()).await
 }
 
-fn texts_equivalent(a: &str, b: &str) -> bool {
-    a.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .eq_ignore_ascii_case(&b.split_whitespace().collect::<Vec<_>>().join(" "))
+async fn transcribe_utterance_blocking_if_current(
+    asr: &Arc<AsrEngine>,
+    pcm_mono: &[f32],
+    streams: Arc<Streams>,
+    user_key: (GuildId, UserId),
+    revision_seq: u64,
+) -> Option<String> {
+    transcribe_mono_pcm_with_gate(Arc::clone(asr), pcm_mono.to_vec(), move || {
+        streams
+            .get(&user_key)
+            .map(|entry| entry.buffer.current_revision_seq == Some(revision_seq))
+            .unwrap_or(false)
+    })
+    .await
 }
 
-fn should_apply_refinement(pass1: &str, pass2: &str) -> bool {
-    if texts_equivalent(pass1, pass2) {
-        return false;
-    }
-
-    let w1 = pass1.split_whitespace().count().max(1);
-    let w2 = pass2.split_whitespace().count();
-    if w2 == 0 {
-        return false;
-    }
-
-    let ratio = w2 as f32 / w1 as f32;
-    if !(0.4..=2.5).contains(&ratio) {
-        return false;
-    }
-
-    if has_repeated_ngram(pass2, 3, 3) {
-        return false;
-    }
-
-    true
-}
-
-fn has_repeated_ngram(text: &str, n: usize, min_consecutive_repeats: usize) -> bool {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < n.saturating_mul(min_consecutive_repeats) || n == 0 {
-        return false;
-    }
-
-    let mut i = 0usize;
-    while i + n <= words.len() {
-        let candidate = &words[i..i + n];
-        let mut repeats = 1usize;
-        let mut j = i + n;
-        while j + n <= words.len() && words[j..j + n].eq(candidate) {
-            repeats += 1;
-            if repeats >= min_consecutive_repeats {
-                return true;
-            }
-            j += n;
-        }
-        i += 1;
-    }
-
-    false
-}
