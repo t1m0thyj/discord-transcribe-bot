@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use crate::config::AppConfig;
 use crate::gemini::ask_gemini;
 use crate::transcription::{
-    AsrEngine, SessionSenders, SsrcMap, Streams,
+    AsrEngine, OnlineAsrEngine, SessionSenders, SsrcMap, StreamingDecoderSenders, Streams,
 };
 
 mod commands;
@@ -22,21 +22,40 @@ mod session;
 
 pub(super) const LOG_DEFAULT_UTTERANCES: i64 = 40;
 pub(super) const LOG_MAX_DISCORD_CHARS: usize = 1800;
-pub(super) const INTERACTIVE_DRAIN_TIMEOUT: Duration = Duration::from_millis(1200);
-pub(super) const FINALIZE_SETTLE_TIMEOUT: Duration = Duration::from_millis(900);
-pub(super) const FINALIZE_SETTLE_PASSES: usize = 4;
 pub(super) const STARTUP_RECEIVE_WATCHDOG_DELAY: Duration = Duration::from_secs(10);
 pub(super) const STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(30);
 pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UtteranceStage {
+    #[default]
+    Partial,
+    StreamFinal,
+    OfflineFinal,
+}
+
+impl UtteranceStage {
+    pub fn precedence(self) -> u8 {
+        match self {
+            Self::Partial => 0,
+            Self::StreamFinal => 1,
+            Self::OfflineFinal => 2,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Utterance {
     pub user_id: UserId,
     pub start_ts: Instant,
+    pub start_offset_ms: u64,
     pub revision_id: u64,
+    pub stage: UtteranceStage,
     pub is_final: bool,
     pub text: String,
+    pub tokens: Vec<String>,
+    pub token_timestamps_s: Vec<f32>,
 }
 
 pub struct CallSession {
@@ -53,6 +72,13 @@ pub struct ThreadContext {
     pub history: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
+pub struct LivePartialSnapshot {
+    pub revision_id: u64,
+    pub start_ts: Instant,
+    pub text: String,
+}
+
 pub struct AppState {
     pub active_calls: DashMap<GuildId, Arc<RwLock<CallSession>>>,
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
@@ -60,31 +86,38 @@ pub struct AppState {
     pub gemini_model: String,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
-    pub rolling_ingest_max_ms: u64,
-    pub rolling_ingest_context_ms: u64,
     pub autojoin_suffix: String,
-    pub asr: Arc<AsrEngine>,
-    pub final_asr: Option<Arc<AsrEngine>>,
+    pub online_asr: Arc<OnlineAsrEngine>,
+    pub offline_asr: Arc<AsrEngine>,
     pub ssrc_to_user: Arc<SsrcMap>,
     pub streams: Arc<Streams>,
+    pub live_partial_text: Arc<DashMap<(GuildId, UserId), LivePartialSnapshot>>,
     pub utterance_senders: SessionSenders,
+    pub streaming_decoder_senders: StreamingDecoderSenders,
     pub transcription_inflight: DashMap<GuildId, Arc<AtomicUsize>>,
     pub transcript_pending_commits: DashMap<GuildId, Arc<AtomicUsize>>,
     pub decoded_audio_activity: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub chunks_accepted_activity: DashMap<GuildId, Arc<AtomicUsize>>,
     pub decode_failure_activity: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub decoder_queue_dropped: DashMap<GuildId, Arc<AtomicUsize>>,
     pub unmapped_ssrc_activity: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub decoder_thread_alive: DashMap<GuildId, Arc<AtomicBool>>,
+    pub offline_finalize_worker_alive: DashMap<GuildId, Arc<AtomicBool>>,
+    pub offline_finalize_rtf_milli_ewma: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub offline_finalize_empty: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub offline_finalize_dropped: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub refinement_rejected: DashMap<GuildId, Arc<AtomicUsize>>,
     pub transcription_started_notified: DashMap<GuildId, Arc<AtomicBool>>,
 }
 
 impl AppState {
     pub fn new(cfg: AppConfig) -> anyhow::Result<Self> {
-        let asr = Arc::new(AsrEngine::new(&cfg.asr_model_dir)?);
-        let final_asr = cfg
-            .final_asr_model_dir
-            .as_deref()
-            .map(AsrEngine::new)
-            .transpose()?
-            .map(Arc::new);
+        let offline_threads = Some(2);
+        let online_asr = Arc::new(OnlineAsrEngine::new(&cfg.asr_streaming_model_dir)?);
+        let offline_asr = Arc::new(AsrEngine::new_with_threads(
+            &cfg.asr_offline_model_dir,
+            offline_threads,
+        )?);
 
         Ok(Self {
             active_calls: DashMap::new(),
@@ -93,19 +126,27 @@ impl AppState {
             gemini_model: cfg.gemini_model,
             live_transcript_debug: cfg.live_transcript_debug,
             enable_denoiser: cfg.enable_denoiser,
-            rolling_ingest_max_ms: cfg.rolling_ingest_max_ms,
-            rolling_ingest_context_ms: cfg.rolling_ingest_context_ms,
             autojoin_suffix: cfg.autojoin_suffix,
-            asr,
-            final_asr,
+            online_asr,
+            offline_asr,
             ssrc_to_user: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),
+            live_partial_text: Arc::new(DashMap::new()),
             utterance_senders: DashMap::new(),
+            streaming_decoder_senders: DashMap::new(),
             transcription_inflight: DashMap::new(),
             transcript_pending_commits: DashMap::new(),
             decoded_audio_activity: DashMap::new(),
+            chunks_accepted_activity: DashMap::new(),
             decode_failure_activity: DashMap::new(),
+            decoder_queue_dropped: DashMap::new(),
             unmapped_ssrc_activity: DashMap::new(),
+            decoder_thread_alive: DashMap::new(),
+            offline_finalize_worker_alive: DashMap::new(),
+            offline_finalize_rtf_milli_ewma: DashMap::new(),
+            offline_finalize_empty: DashMap::new(),
+            offline_finalize_dropped: DashMap::new(),
+            refinement_rejected: DashMap::new(),
             transcription_started_notified: DashMap::new(),
         })
     }

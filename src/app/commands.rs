@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
-
 use anyhow::Context as _;
 use chrono::Utc;
 use serenity::all::{ChannelId, ChannelType, CommandDataOptionValue, CommandInteraction, GuildId};
@@ -11,10 +10,42 @@ use serenity::prelude::Context;
 use tokio::sync::{mpsc, RwLock};
 
 use super::{
-    AppState, CallSession, INTERACTIVE_DRAIN_TIMEOUT, LOG_DEFAULT_UTTERANCES,
+    AppState, CallSession, LOG_DEFAULT_UTTERANCES,
     LOG_MAX_DISCORD_CHARS, Utterance,
 };
-use crate::transcription::transcript_writer_loop;
+use crate::transcription::{
+    offline_finalize_worker_loop, streaming_decoder_loop, transcript_writer_loop,
+    OfflineFinalizeJob, StreamingDecoderCommand,
+};
+
+fn merge_live_partial_snapshot(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    started_mono: Instant,
+    snapshot: &mut Vec<Utterance>,
+) {
+    let live = state
+        .live_partial_text
+        .iter()
+        .filter(|entry| entry.key().0 == guild_id)
+        .map(|entry| Utterance {
+            user_id: entry.key().1,
+            start_ts: entry.value().start_ts,
+            start_offset_ms: entry
+                .value()
+                .start_ts
+                .saturating_duration_since(started_mono)
+                .as_millis() as u64,
+            revision_id: entry.value().revision_id,
+            stage: super::UtteranceStage::Partial,
+            is_final: false,
+            text: entry.value().text.clone(),
+            tokens: Vec::new(),
+            token_timestamps_s: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    super::session::upsert_utterances(snapshot, live);
+}
 
 pub(super) async fn handle_join(
     ctx: &Context,
@@ -59,6 +90,16 @@ pub(super) async fn handle_status(
     let voice_channel = session.voice_channel;
     let text_channel = session.text_channel;
     let utterance_count = session.transcript.len();
+    let stream_final_count = session
+        .transcript
+        .iter()
+        .filter(|u| u.stage == super::UtteranceStage::StreamFinal && u.is_final)
+        .count();
+    let offline_final_count = session
+        .transcript
+        .iter()
+        .filter(|u| u.stage == super::UtteranceStage::OfflineFinal && u.is_final)
+        .count();
     let elapsed = session.started_mono.elapsed();
     drop(session);
 
@@ -87,20 +128,60 @@ pub(super) async fn handle_status(
         .get(&guild_id)
         .map(|v| v.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let chunks_accepted = state
+        .chunks_accepted_activity
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let decoder_queue_dropped = state
+        .decoder_queue_dropped
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
     let unmapped_ssrc = state
         .unmapped_ssrc_activity
         .get(&guild_id)
         .map(|v| v.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let offline_finalize_dropped = state
+        .offline_finalize_dropped
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let refinement_rejected = state
+        .refinement_rejected
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let offline_rtf_milli_ewma = state
+        .offline_finalize_rtf_milli_ewma
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let offline_finalize_empty = state
+        .offline_finalize_empty
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let decoder_thread_alive = state
+        .decoder_thread_alive
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(false);
+    let offline_finalize_worker_alive = state
+        .offline_finalize_worker_alive
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(false);
     let mapped_ssrc = state
         .ssrc_to_user
         .iter()
         .filter(|e| e.key().0 == guild_id)
         .count();
     let buffered_users = state
-        .streams
+        .live_partial_text
         .iter()
-        .filter(|e| e.key().0 == guild_id && !e.value().buffer.pcm.is_empty())
+        .filter(|e| e.key().0 == guild_id)
         .count();
 
     let participants = ctx
@@ -119,14 +200,38 @@ pub(super) async fn handle_status(
     let mm = (elapsed.as_secs() % 3600) / 60;
     let ss = elapsed.as_secs() % 60;
 
+    let offline_rtf_display = if offline_rtf_milli_ewma == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.2}", offline_rtf_milli_ewma as f32 / 1000.0)
+    };
+
+    let finalized_total = stream_final_count + offline_final_count;
+    let stream_only_pct = if finalized_total == 0 {
+        0.0
+    } else {
+        (stream_final_count as f32 * 100.0) / finalized_total as f32
+    };
+
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
+        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nAccepted decoder chunks: {}\nDecode failures: {}\nDecoder queue drops: {}\nUnmapped SSRC events: {}\nDecoder thread alive: {}\nOffline finalize worker alive: {}\nOffline finalize RTF EWMA: {}\nDropped offline finals: {}\nEmpty offline finals: {}\nRejected offline finals: {}\nFinalized StreamFinal lines: {}\nFinalized OfflineFinal lines: {}\nStreamFinal share of finalized lines: {:.1}%\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
         voice_channel.get(),
         text_channel.get(),
         participants,
         decoded_frames,
+        chunks_accepted,
         decode_failures,
+        decoder_queue_dropped,
         unmapped_ssrc,
+        if decoder_thread_alive { "yes" } else { "no" },
+        if offline_finalize_worker_alive { "yes" } else { "no" },
+        offline_rtf_display,
+        offline_finalize_dropped,
+        offline_finalize_empty,
+        refinement_rejected,
+        stream_final_count,
+        offline_final_count,
+        stream_only_pct,
         if started_notified { "yes" } else { "no" },
         mapped_ssrc,
         buffered_users,
@@ -172,17 +277,11 @@ pub(super) async fn handle_ask(
         .context("no active call for this guild")?
         .clone();
 
-    let drained =
-        super::session::wait_for_capture_quiesce_with_timeout(state, guild_id, INTERACTIVE_DRAIN_TIMEOUT)
-            .await;
-
-    let (mut snapshot, started_at) = {
+    let (mut snapshot, started_at, started_mono) = {
         let session = session_lock.read().await;
-        (session.transcript.clone(), session.started_at)
+        (session.transcript.clone(), session.started_at, session.started_mono)
     };
-    let pending = super::session::snapshot_pending_buffers_for_interactive(state, guild_id).await;
-    super::session::upsert_utterances(&mut snapshot, pending);
-
+    merge_live_partial_snapshot(state, guild_id, started_mono, &mut snapshot);
     if snapshot.is_empty() {
         return Ok(
             "No transcribed utterances yet. Try /ask again after someone speaks and pauses briefly."
@@ -202,14 +301,7 @@ pub(super) async fn handle_ask(
     .await
     .unwrap_or_else(|e| format!("gemini error: {e}"));
 
-    if drained {
-        Ok(answer)
-    } else {
-        Ok(format!(
-            "(Still processing live audio; answer is based on the latest available transcript snapshot.)\n\n{}",
-            answer
-        ))
-    }
+    Ok(answer)
 }
 
 pub(super) async fn handle_log(
@@ -237,17 +329,11 @@ pub(super) async fn handle_log(
         .context("no active call for this guild")?
         .clone();
 
-    let drained =
-        super::session::wait_for_capture_quiesce_with_timeout(state, guild_id, INTERACTIVE_DRAIN_TIMEOUT)
-            .await;
-
-    let (mut snapshot, started_at) = {
+    let (mut snapshot, started_at, started_mono) = {
         let session = session_lock.read().await;
-        (session.transcript.clone(), session.started_at)
+        (session.transcript.clone(), session.started_at, session.started_mono)
     };
-    let pending = super::session::snapshot_pending_buffers_for_interactive(state, guild_id).await;
-    super::session::upsert_utterances(&mut snapshot, pending);
-
+    merge_live_partial_snapshot(state, guild_id, started_mono, &mut snapshot);
     if snapshot.is_empty() {
         return Ok("No transcribed utterances yet.".to_string());
     }
@@ -271,17 +357,10 @@ pub(super) async fn handle_log(
         transcript = format!("(truncated to recent text)\n{tail}");
     }
 
-    if drained {
-        Ok(format!(
-            "Recent transcript (last {} utterances):\n{}",
-            requested_utterances, transcript
-        ))
-    } else {
-        Ok(format!(
-            "Recent transcript (last {} utterances, snapshot while live audio is still processing):\n{}",
-            requested_utterances, transcript
-        ))
-    }
+    Ok(format!(
+        "Recent transcript (last {} utterances):\n{}",
+        requested_utterances, transcript
+    ))
 }
 
 pub(super) async fn handle_autojoin(
@@ -546,14 +625,46 @@ pub(super) async fn start_call_session(
     state
         .decoded_audio_activity
         .insert(guild_id, Arc::clone(&decode_activity));
+    let chunks_accepted_activity = Arc::new(AtomicUsize::new(0));
+    state
+        .chunks_accepted_activity
+        .insert(guild_id, Arc::clone(&chunks_accepted_activity));
     let decode_failure_activity = Arc::new(AtomicUsize::new(0));
     state
         .decode_failure_activity
         .insert(guild_id, Arc::clone(&decode_failure_activity));
+    let decoder_queue_dropped = Arc::new(AtomicUsize::new(0));
+    state
+        .decoder_queue_dropped
+        .insert(guild_id, Arc::clone(&decoder_queue_dropped));
     let unmapped_ssrc_activity = Arc::new(AtomicUsize::new(0));
     state
         .unmapped_ssrc_activity
         .insert(guild_id, Arc::clone(&unmapped_ssrc_activity));
+    let decoder_thread_alive = Arc::new(AtomicBool::new(true));
+    state
+        .decoder_thread_alive
+        .insert(guild_id, Arc::clone(&decoder_thread_alive));
+    let offline_finalize_worker_alive = Arc::new(AtomicBool::new(true));
+    state
+        .offline_finalize_worker_alive
+        .insert(guild_id, Arc::clone(&offline_finalize_worker_alive));
+    let offline_finalize_rtf_milli_ewma = Arc::new(AtomicUsize::new(0));
+    state
+        .offline_finalize_rtf_milli_ewma
+        .insert(guild_id, Arc::clone(&offline_finalize_rtf_milli_ewma));
+    let offline_finalize_empty = Arc::new(AtomicUsize::new(0));
+    state
+        .offline_finalize_empty
+        .insert(guild_id, Arc::clone(&offline_finalize_empty));
+    let offline_finalize_dropped = Arc::new(AtomicUsize::new(0));
+    state
+        .offline_finalize_dropped
+        .insert(guild_id, Arc::clone(&offline_finalize_dropped));
+    let refinement_rejected = Arc::new(AtomicUsize::new(0));
+    state
+        .refinement_rejected
+        .insert(guild_id, Arc::clone(&refinement_rejected));
     let started_notified = Arc::new(AtomicBool::new(false));
     state
         .transcription_started_notified
@@ -576,6 +687,40 @@ pub(super) async fn start_call_session(
         transcript_jsonl_path,
     ));
 
+    let online_asr = Arc::clone(&state.online_asr);
+    let (decoder_tx, decoder_rx) = mpsc::channel::<StreamingDecoderCommand>(2048);
+    let (offline_finalize_tx, offline_finalize_rx) = mpsc::channel::<OfflineFinalizeJob>(16);
+    state
+        .streaming_decoder_senders
+        .insert(guild_id, decoder_tx.clone());
+    let _decoder_thread = streaming_decoder_loop(
+        guild_id,
+        online_asr,
+        decoder_rx,
+        utterance_tx.clone(),
+        offline_finalize_tx,
+        Arc::clone(&offline_finalize_dropped),
+        Arc::clone(&inflight),
+        Arc::clone(&pending_commits),
+        Arc::clone(&state.live_partial_text),
+        state.live_transcript_debug,
+        Arc::clone(&decoder_thread_alive),
+    );
+
+    let offline_asr = Arc::clone(&state.offline_asr);
+    tokio::spawn(offline_finalize_worker_loop(
+        offline_asr,
+        offline_finalize_rx,
+        utterance_tx.clone(),
+        Arc::clone(&pending_commits),
+        Arc::clone(&inflight),
+        Arc::clone(&refinement_rejected),
+        Arc::clone(&offline_finalize_worker_alive),
+        Arc::clone(&offline_finalize_rtf_milli_ewma),
+        Arc::clone(&offline_finalize_empty),
+        state.live_transcript_debug,
+    ));
+
     super::session::attach_voice_handlers(
         state,
         super::session::VoiceHandlerAttachContext {
@@ -584,11 +729,11 @@ pub(super) async fn start_call_session(
             text_channel,
             voice_channel,
             call_lock: Arc::clone(&call_lock),
-            utterance_tx,
-            inflight,
-            pending_commits,
+            streaming_decoder_tx: decoder_tx,
             decode_activity,
+            chunks_accepted_activity,
             decode_failure_activity,
+            decoder_queue_dropped,
             unmapped_ssrc_activity,
             started_notified,
         },

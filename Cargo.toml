@@ -9,7 +9,6 @@ async-trait = "0.1"
 chrono = "0.4"
 dashmap = "6"
 dotenvy = "0.15"
-earshot = "1.2.1"
 nnnoiseless = "0.5"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rubato = "0.16"

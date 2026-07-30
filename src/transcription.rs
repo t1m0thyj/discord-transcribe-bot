@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::collections::VecDeque;
-use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
+use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use dashmap::DashMap;
-use earshot::Detector;
 use nnnoiseless::DenoiseState;
 use rubato::{FftFixedInOut, Resampler};
 use serenity::all::{GuildId, UserId};
@@ -18,29 +18,89 @@ use sherpa_onnx::{
     OfflineSenseVoiceModelConfig,
     OfflineTdnnModelConfig, OfflineTransducerModelConfig, OfflineWhisperModelConfig,
     OfflineZipformerCtcModelConfig,
+    OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig,
 };
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::Semaphore;
 use serde::Serialize;
 
-use crate::app::{CallSession, Utterance};
+use crate::app::{CallSession, LivePartialSnapshot, Utterance, UtteranceStage};
 
-pub const SILENCE_TICKS_THRESHOLD: u32 = 20;
-pub const REORDER_WINDOW: Duration = Duration::from_millis(1500);
+pub const REORDER_WINDOW: Duration = Duration::from_millis(200);
 pub const RNNOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
-const EARSHOT_FRAME_SIZE: usize = 256;
-const EARSHOT_VAD_THRESHOLD: f32 = 0.5;
-const VAD_HANGOVER_FRAMES: u8 = 16;
-const VAD_PREROLL_SAMPLES_16K: usize = 4_800;
-const AGC_TARGET_RMS: f32 = 0.06;
-const AGC_MIN_GAIN: f32 = 0.6;
-const AGC_MAX_GAIN: f32 = 3.0;
-const DENOISER_BYPASS_SNR_DB: f32 = 18.0;
-const DENOISER_BYPASS_HYSTERESIS_DB: f32 = 3.0;
 const HIGHPASS_ALPHA_48K: f32 = 0.991;
 
 pub struct AsrEngine {
     recognizer: Arc<OfflineRecognizer>,
+}
+
+pub struct OnlineAsrEngine {
+    #[allow(dead_code)]
+    recognizer: Arc<OnlineRecognizer>,
+}
+
+pub enum StreamingDecoderCommand {
+    AudioChunk {
+        user_id: UserId,
+        pcm_16k: Vec<f32>,
+        observed_at: Instant,
+    },
+    TickDone {
+        heard_users: Vec<UserId>,
+        observed_at: Instant,
+    },
+    FlushAll {
+        respond_to: tokio::sync::oneshot::Sender<()>,
+        observed_at: Instant,
+    },
+}
+
+struct StreamingStreamState {
+    stream: sherpa_onnx::OnlineStream,
+    utterance_seq: u64,
+    stream_anchor_at: Option<Instant>,
+    total_samples_fed: u64,
+    utterance_start_sample: Option<u64>,
+    last_partial_text: String,
+    last_emit_at: Option<Instant>,
+    dormant_after_endpoint: bool,
+    dormant_silence_ticks: u32,
+    pcm_16k: Vec<f32>,
+    last_clock_drift_log_at: Option<Instant>,
+}
+
+impl StreamingStreamState {
+    fn new(stream: sherpa_onnx::OnlineStream, utterance_seq: u64) -> Self {
+        Self {
+            stream,
+            utterance_seq,
+            stream_anchor_at: None,
+            total_samples_fed: 0,
+            utterance_start_sample: None,
+            last_partial_text: String::new(),
+            last_emit_at: None,
+            dormant_after_endpoint: false,
+            dormant_silence_ticks: 0,
+            pcm_16k: Vec::new(),
+            last_clock_drift_log_at: None,
+        }
+    }
+}
+
+pub struct OfflineFinalizeJob {
+    pub user_id: UserId,
+    pub start_ts: Instant,
+    pub start_offset_ms: u64,
+    pub revision_id: u64,
+    pub stream_final_text: String,
+    pub pcm_16k: Vec<f32>,
+}
+
+struct DecodeTextResult {
+    text: String,
+    tokens: Vec<String>,
+    token_timestamps_s: Vec<f32>,
+    decode_elapsed_ms: u64,
 }
 
 /// Explicit override for the single-file model families that are indistinguishable
@@ -90,7 +150,12 @@ impl ForcedFamily {
 }
 
 impl AsrEngine {
+    #[allow(dead_code)]
     pub fn new(model_dir: &str) -> anyhow::Result<Self> {
+        Self::new_with_threads(model_dir, None)
+    }
+
+    pub fn new_with_threads(model_dir: &str, num_threads: Option<i32>) -> anyhow::Result<Self> {
         let model_base = resolve_model_dir(model_dir)?;
         let mut cfg = OfflineRecognizerConfig::default();
 
@@ -113,10 +178,12 @@ impl AsrEngine {
             );
         };
 
-        cfg.model_config.num_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4)
-            .clamp(1, 8);
+        cfg.model_config.num_threads = num_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(4)
+                .clamp(1, 8)
+        });
 
         let recognizer = OfflineRecognizer::create(&cfg).ok_or_else(|| {
             anyhow::anyhow!(
@@ -127,7 +194,7 @@ impl AsrEngine {
         })?;
 
         tracing::info!(
-            "ASR backend selected: {} (ASR_MODEL_DIR={})",
+            "Offline ASR backend selected: {} ({})",
             selected_backend,
             model_base.display()
         );
@@ -135,18 +202,99 @@ impl AsrEngine {
         Ok(Self { recognizer: Arc::new(recognizer) })
     }
 
-    pub fn transcribe_16k_mono(&self, samples: &[f32]) -> String {
+    fn transcribe_16k_mono(&self, samples: &[f32]) -> DecodeTextResult {
+        let started = Instant::now();
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(16_000, samples);
         self.recognizer.decode(&stream);
-        stream
-            .get_result()
-            .map(|r| r.text)
-            .unwrap_or_default()
-            .trim()
-            .to_string()
+        let result = stream.get_result();
+        let text = result
+            .as_ref()
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default();
+        let tokens = result
+            .as_ref()
+            .map(|r| r.tokens.clone())
+            .unwrap_or_default();
+        let token_timestamps_s = result
+            .as_ref()
+            .map(|r| r.timestamps.clone())
+            .flatten()
+            .unwrap_or_default();
+        DecodeTextResult {
+            text,
+            tokens,
+            token_timestamps_s,
+            decode_elapsed_ms: started.elapsed().as_millis() as u64,
+        }
     }
 
+}
+
+impl OnlineAsrEngine {
+    pub fn new(model_dir: &str) -> anyhow::Result<Self> {
+        let model_base = resolve_model_dir(model_dir)?;
+        let mut cfg = OnlineRecognizerConfig::default();
+
+        let encoder = find_by_prefix(&model_base, "encoder").ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find streaming encoder*.onnx in {}",
+                model_base.display()
+            )
+        })?;
+        let decoder = find_by_prefix(&model_base, "decoder").ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find streaming decoder*.onnx in {}",
+                model_base.display()
+            )
+        })?;
+        let joiner = find_by_prefix(&model_base, "joiner").ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find streaming joiner*.onnx in {}",
+                model_base.display()
+            )
+        })?;
+        let tokens = find_tokens_file(&model_base).ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find streaming tokens.txt in {}",
+                model_base.display()
+            )
+        })?;
+
+        cfg.model_config.transducer = OnlineTransducerModelConfig {
+            encoder: Some(encoder.to_string_lossy().to_string()),
+            decoder: Some(decoder.to_string_lossy().to_string()),
+            joiner: Some(joiner.to_string_lossy().to_string()),
+        };
+        cfg.model_config.tokens = Some(tokens.to_string_lossy().to_string());
+        cfg.model_config.num_threads = 1;
+        cfg.enable_endpoint = true;
+        cfg.rule1_min_trailing_silence = 2.4;
+        cfg.rule2_min_trailing_silence = 1.5;
+        cfg.rule3_min_utterance_length = 20.0;
+        cfg.decoding_method = Some("greedy_search".to_string());
+
+        let recognizer = OnlineRecognizer::create(&cfg).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sherpa-onnx failed to create an online recognizer from {}",
+                model_base.display()
+            )
+        })?;
+
+        tracing::info!(
+            "Streaming ASR backend selected: transducer (ASR_STREAMING_MODEL_DIR={})",
+            model_base.display()
+        );
+
+        Ok(Self {
+            recognizer: Arc::new(recognizer),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn recognizer(&self) -> &Arc<OnlineRecognizer> {
+        &self.recognizer
+    }
 }
 
 /// Finds the first file in `dir` whose name starts with `prefix` and ends with `.onnx`,
@@ -420,66 +568,37 @@ fn resolve_model_dir(model_dir: &str) -> anyhow::Result<PathBuf> {
 
 pub struct UserDenoiseState {
     denoiser: Box<DenoiseState<'static>>,
-    vad: Detector,
     pending: Vec<f32>,
-    vad_pending_16k: Vec<f32>,
     warmed_up: bool,
-    agc_gain: f32,
     hp_prev_x: f32,
     hp_prev_y: f32,
-    noise_rms_ema: f32,
-    last_snr_db: f32,
     resampler_48k_to_16k: FftFixedInOut<f32>,
     resample_pending_48k: Vec<f32>,
-    preroll_16k: VecDeque<f32>,
-    vad_hangover_frames: u8,
-    was_speech_last_tick: bool,
-    denoiser_active: bool,
-}
-
-pub struct ProcessedSpeechChunk {
-    pub pcm_16k: Vec<f32>,
-    pub speech_active: bool,
 }
 
 impl UserDenoiseState {
     pub fn new() -> Self {
         Self {
             denoiser: DenoiseState::new(),
-            vad: Detector::default(),
             pending: Vec::new(),
-            vad_pending_16k: Vec::new(),
             warmed_up: false,
-            agc_gain: 1.0,
             hp_prev_x: 0.0,
             hp_prev_y: 0.0,
-            noise_rms_ema: 0.002,
-            last_snr_db: 0.0,
             resampler_48k_to_16k: FftFixedInOut::new(48_000, 16_000, 960, 1)
                 .expect("valid fixed 48k->16k resampler config"),
             resample_pending_48k: Vec::new(),
-            preroll_16k: VecDeque::with_capacity(VAD_PREROLL_SAMPLES_16K),
-            vad_hangover_frames: 0,
-            was_speech_last_tick: false,
-            denoiser_active: true,
         }
     }
 
-    pub fn push_stereo_pcm(&mut self, input: &[i16], enable_denoiser: bool) -> ProcessedSpeechChunk {
+    pub fn push_stereo_pcm_hybrid(&mut self, input: &[i16], enable_denoiser: bool) -> Vec<f32> {
         let mut mono = downmix_stereo_to_mono_unit_scale(input);
         if mono.is_empty() {
-            return ProcessedSpeechChunk {
-                pcm_16k: Vec::new(),
-                speech_active: false,
-            };
+            return Vec::new();
         }
 
         self.apply_highpass(&mut mono);
 
-        let rms = compute_rms(&mono);
-        self.update_noise_and_snr(rms);
-        let use_denoiser = self.select_denoiser_mode(enable_denoiser);
-        let mut cleaned_48k = if use_denoiser {
+        let cleaned_48k = if enable_denoiser {
             self.push_mono_pcm(&mono)
         } else {
             let mut passthrough = self.drain_pending_passthrough();
@@ -487,32 +606,7 @@ impl UserDenoiseState {
             passthrough
         };
 
-        let cleaned_rms = compute_rms(&cleaned_48k);
-        self.apply_agc(&mut cleaned_48k, cleaned_rms);
-
-        let pcm_16k = self.resample_48k_to_16k_stream(&cleaned_48k);
-        let was_speech_last_tick = self.was_speech_last_tick;
-        let speech_active = self.passes_vad_earshot(&pcm_16k);
-        let mut emitted_pcm_16k = pcm_16k;
-
-        if speech_active {
-            if !was_speech_last_tick && !self.preroll_16k.is_empty() {
-                let mut with_preroll = Vec::with_capacity(self.preroll_16k.len() + emitted_pcm_16k.len());
-                with_preroll.extend(self.preroll_16k.iter().copied());
-                with_preroll.extend(emitted_pcm_16k);
-                emitted_pcm_16k = with_preroll;
-            }
-            self.preroll_16k.clear();
-        } else {
-            self.push_preroll_16k(&emitted_pcm_16k);
-        }
-
-        self.was_speech_last_tick = speech_active;
-
-        ProcessedSpeechChunk {
-            pcm_16k: emitted_pcm_16k,
-            speech_active,
-        }
+        self.resample_48k_to_16k_stream(&cleaned_48k)
     }
 
     pub fn push_mono_pcm(&mut self, input: &[f32]) -> Vec<f32> {
@@ -527,98 +621,8 @@ impl UserDenoiseState {
         out
     }
 
-    pub fn flush_pending(&mut self) -> Vec<f32> {
-        if self.pending.is_empty() {
-            return Vec::new();
-        }
-
-        let mut frame = std::mem::take(&mut self.pending);
-        frame.resize(RNNOISE_FRAME_SIZE, 0.0);
-        let cleaned = self.denoise_frame(&frame);
-        self.resample_48k_to_16k_stream(&cleaned)
-    }
-
     fn drain_pending_passthrough(&mut self) -> Vec<f32> {
         std::mem::take(&mut self.pending)
-    }
-
-    fn select_denoiser_mode(&mut self, enable_denoiser: bool) -> bool {
-        if !enable_denoiser {
-            self.denoiser_active = false;
-            return false;
-        }
-
-        if self.was_speech_last_tick {
-            return self.denoiser_active;
-        }
-
-        if self.last_snr_db >= DENOISER_BYPASS_SNR_DB + DENOISER_BYPASS_HYSTERESIS_DB {
-            self.denoiser_active = false;
-        } else if self.last_snr_db <= DENOISER_BYPASS_SNR_DB - DENOISER_BYPASS_HYSTERESIS_DB {
-            self.denoiser_active = true;
-        }
-
-        self.denoiser_active
-    }
-
-    fn update_noise_and_snr(&mut self, rms: f32) {
-        let noise_update = if rms <= self.noise_rms_ema * 1.5 { 0.08 } else { 0.005 };
-        self.noise_rms_ema = self.noise_rms_ema * (1.0 - noise_update) + rms * noise_update;
-        let noise = self.noise_rms_ema.max(1e-4);
-        self.last_snr_db = 20.0 * ((rms + 1e-4) / noise).log10();
-    }
-
-    fn passes_vad_earshot(&mut self, pcm_16k: &[f32]) -> bool {
-        if !pcm_16k.is_empty() {
-            self.vad_pending_16k.extend_from_slice(pcm_16k);
-        }
-
-        let mut evaluated_any = false;
-        let mut speech_active = false;
-        while self.vad_pending_16k.len() >= EARSHOT_FRAME_SIZE {
-            let frame: Vec<f32> = self.vad_pending_16k.drain(..EARSHOT_FRAME_SIZE).collect();
-            let score = self.vad.predict_f32(&frame);
-            evaluated_any = true;
-            if score >= EARSHOT_VAD_THRESHOLD {
-                self.vad_hangover_frames = VAD_HANGOVER_FRAMES;
-                speech_active = true;
-            } else if self.vad_hangover_frames > 0 {
-                self.vad_hangover_frames -= 1;
-                speech_active = true;
-            }
-        }
-
-        if evaluated_any {
-            return speech_active;
-        }
-
-        self.vad_hangover_frames > 0
-    }
-
-    fn push_preroll_16k(&mut self, samples: &[f32]) {
-        for sample in samples {
-            if self.preroll_16k.len() == VAD_PREROLL_SAMPLES_16K {
-                self.preroll_16k.pop_front();
-            }
-            self.preroll_16k.push_back(*sample);
-        }
-    }
-
-    fn apply_agc(&mut self, samples: &mut [f32], rms: f32) {
-        if !self.was_speech_last_tick {
-            for sample in samples {
-                *sample = (*sample * self.agc_gain).clamp(-0.98, 0.98);
-            }
-            return;
-        }
-
-        let desired_gain = (AGC_TARGET_RMS / rms.max(1e-4)).clamp(AGC_MIN_GAIN, AGC_MAX_GAIN);
-        let smoothing = if desired_gain < self.agc_gain { 0.35 } else { 0.02 };
-        self.agc_gain = self.agc_gain * (1.0 - smoothing) + desired_gain * smoothing;
-
-        for sample in samples {
-            *sample = (*sample * self.agc_gain).clamp(-0.98, 0.98);
-        }
     }
 
     fn apply_highpass(&mut self, samples: &mut [f32]) {
@@ -658,6 +662,7 @@ impl UserDenoiseState {
                 )
                 .is_err()
             {
+                tracing::warn!("48k->16k resample chunk failed; dropping chunk");
                 continue;
             }
             out.extend_from_slice(&out_chunk);
@@ -693,23 +698,9 @@ impl Default for UserDenoiseState {
     }
 }
 
-#[derive(Default, Clone)]
-pub struct UserAudioBuffer {
-    pub pcm: Vec<f32>,
-    pub silent_ticks: u32,
-    pub utterance_start: Option<Instant>,
-    pub current_revision_seq: Option<u64>,
-    pub next_revision_seq: u64,
-    pub last_preview_samples: usize,
-    pub last_preview_text: Option<String>,
-    pub frozen_prefix_words: usize,
-    pub stable_preview_streak: u32,
-}
-
 #[derive(Default)]
 pub struct UserStreamState {
     pub denoiser: UserDenoiseState,
-    pub buffer: UserAudioBuffer,
 }
 
 pub fn make_revision_id(user_id: UserId, revision_seq: u64) -> u64 {
@@ -735,10 +726,10 @@ pub fn downmix_stereo_to_mono_unit_scale(input: &[i16]) -> Vec<f32> {
         .collect()
 }
 
-pub async fn transcribe_mono_pcm(
+async fn transcribe_mono_pcm(
     asr: Arc<AsrEngine>,
     pcm_mono: Vec<f32>,
-) -> Option<String> {
+) -> Option<DecodeTextResult> {
     if pcm_mono.len() < 1600 {
         return None;
     }
@@ -751,41 +742,7 @@ pub async fn transcribe_mono_pcm(
         .ok()?;
     drop(permit);
 
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-pub async fn transcribe_mono_pcm_with_gate<F>(
-    asr: Arc<AsrEngine>,
-    pcm_mono: Vec<f32>,
-    should_decode: F,
-) -> Option<String>
-where
-    F: FnOnce() -> bool,
-{
-    if pcm_mono.len() < 1600 {
-        return None;
-    }
-
-    let permit = asr_decode_semaphore().acquire_owned().await.ok()?;
-    if !should_decode() {
-        drop(permit);
-        return None;
-    }
-
-    let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
-        .await
-        .ok()?;
-    drop(permit);
-
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    Some(text)
 }
 
 fn asr_decode_semaphore() -> Arc<Semaphore> {
@@ -793,43 +750,604 @@ fn asr_decode_semaphore() -> Arc<Semaphore> {
     Arc::clone(ASR_DECODE_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
-fn compute_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
+pub fn should_accept_offline_final(stream_final: &str, offline_final: &str) -> bool {
+    if offline_final.trim().is_empty() {
+        return false;
     }
 
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
+    // Prefer offline final even when lexical content is equivalent; it carries
+    // better punctuation/casing and produces a more uniform transcript.
+    if texts_equivalent(stream_final, offline_final) {
+        return true;
+    }
+
+    // Streaming hypotheses are the most likely place for loop artifacts.
+    // If stream loops and offline does not, prefer offline before ratio checks.
+    if has_repeated_ngram(stream_final, 3, 3) && !has_repeated_ngram(offline_final, 3, 3) {
+        return true;
+    }
+
+    if has_repeated_ngram(offline_final, 3, 3) {
+        return false;
+    }
+
+    let w1 = stream_final.split_whitespace().count().max(1);
+    let w2 = offline_final.split_whitespace().count();
+    let ratio = w2 as f32 / w1 as f32;
+    (0.4..=3.0).contains(&ratio)
 }
 
-pub fn should_apply_refinement(pass1: &str, pass2: &str) -> bool {
-    if texts_equivalent(pass1, pass2) {
-        return false;
+fn normalize_streaming_text(raw: &str) -> String {
+    raw.trim().to_string()
+}
+
+fn polish_stream_final_text(raw: &str) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return compact;
     }
 
-    let w1 = pass1.split_whitespace().count().max(1);
-    let w2 = pass2.split_whitespace().count();
-    if w2 == 0 {
-        return false;
+    let mut chars = compact.chars();
+    let mut out = String::with_capacity(compact.len() + 1);
+    if let Some(first) = chars.next() {
+        if first.is_ascii_alphabetic() {
+            out.push(first.to_ascii_uppercase());
+        } else {
+            out.push(first);
+        }
+    }
+    out.extend(chars);
+
+    let has_terminal_punct = out
+        .chars()
+        .last()
+        .map(|c| matches!(c, '.' | '!' | '?'))
+        .unwrap_or(false);
+    if !has_terminal_punct {
+        out.push('.');
     }
 
-    let ratio = w2 as f32 / w1 as f32;
-    if !(0.4..=2.5).contains(&ratio) {
-        return false;
+    out
+}
+
+fn sample_clock_to_instant(anchor: Instant, sample_index: u64) -> Instant {
+    let ms = sample_index.saturating_mul(1000) / 16_000;
+    anchor + Duration::from_millis(ms)
+}
+
+fn sample_clock_to_offset_ms(sample_index: u64) -> u64 {
+    sample_index.saturating_mul(1000) / 16_000
+}
+
+fn trim_trailing_silence_keep_tail(samples: &mut Vec<f32>, keep_tail_samples: usize) {
+    if samples.is_empty() {
+        return;
     }
 
-    if has_repeated_ngram(pass2, 3, 3) {
-        return false;
+    let last_non_silent = samples.iter().rposition(|x| x.abs() > 1.0e-6);
+    let Some(last_non_silent) = last_non_silent else {
+        samples.truncate(keep_tail_samples.min(samples.len()));
+        return;
+    };
+
+    let target_len = (last_non_silent + 1).saturating_add(keep_tail_samples);
+    if target_len < samples.len() {
+        samples.truncate(target_len);
+    }
+}
+
+pub fn streaming_decoder_loop(
+    guild_id: GuildId,
+    online_asr: Arc<OnlineAsrEngine>,
+    mut rx: mpsc::Receiver<StreamingDecoderCommand>,
+    utterance_tx: mpsc::Sender<Utterance>,
+    offline_finalize_tx: mpsc::Sender<OfflineFinalizeJob>,
+    offline_finalize_dropped: Arc<AtomicUsize>,
+    offline_finalize_inflight: Arc<AtomicUsize>,
+    pending_commits: Arc<AtomicUsize>,
+    live_partial_text: Arc<DashMap<(GuildId, UserId), LivePartialSnapshot>>,
+    live_transcript_debug: bool,
+    decoder_thread_alive: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    const STREAMING_SILENCE_SAMPLES: usize = 320;
+    const PARTIAL_EMIT_MIN_INTERVAL: Duration = Duration::from_millis(250);
+    const DORMANT_TEARDOWN_TICKS: u32 = 100;
+    const MAX_DECODE_BATCHES_PER_TICK: usize = 64;
+
+    thread::Builder::new()
+        .name(format!("stream-decoder-{}", guild_id.get()))
+        .spawn(move || {
+    struct DecoderAliveGuard {
+        alive: Arc<AtomicBool>,
+    }
+    impl Drop for DecoderAliveGuard {
+        fn drop(&mut self) {
+            self.alive.store(false, AtomicOrdering::SeqCst);
+        }
     }
 
-    true
+    let _alive_guard = DecoderAliveGuard {
+        alive: Arc::clone(&decoder_thread_alive),
+    };
+
+    let recognizer = online_asr.recognizer();
+    let silence = [0.0f32; STREAMING_SILENCE_SAMPLES];
+    let mut streams = HashMap::<UserId, StreamingStreamState>::new();
+    let mut next_utterance_seq = HashMap::<UserId, u64>::new();
+
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            StreamingDecoderCommand::AudioChunk {
+                user_id,
+                pcm_16k,
+                observed_at,
+            } => {
+                let state = streams
+                    .entry(user_id)
+                    .or_insert_with(|| {
+                        StreamingStreamState::new(
+                            recognizer.create_stream(),
+                            *next_utterance_seq.get(&user_id).unwrap_or(&0),
+                        )
+                    });
+                if state.dormant_after_endpoint {
+                    state.pcm_16k.clear();
+                }
+                if state.stream_anchor_at.is_none() {
+                    state.stream_anchor_at = Some(observed_at);
+                }
+                if state.utterance_start_sample.is_none() {
+                    state.utterance_start_sample = Some(state.total_samples_fed);
+                }
+                state.dormant_after_endpoint = false;
+                state.dormant_silence_ticks = 0;
+                state.pcm_16k.extend_from_slice(&pcm_16k);
+                state.stream.accept_waveform(16_000, &pcm_16k);
+                state.total_samples_fed = state
+                    .total_samples_fed
+                    .saturating_add(pcm_16k.len() as u64);
+            }
+            StreamingDecoderCommand::TickDone {
+                heard_users,
+                observed_at,
+            } => {
+                let heard = heard_users.into_iter().collect::<HashSet<_>>();
+                let tracked_users = streams.keys().copied().collect::<Vec<_>>();
+                let mut to_drop = Vec::new();
+
+                for user_id in tracked_users {
+                    let Some(state) = streams.get_mut(&user_id) else {
+                        continue;
+                    };
+
+                    if heard.contains(&user_id) {
+                        state.dormant_silence_ticks = 0;
+                        if let Some(anchor) = state.stream_anchor_at {
+                            let sample_elapsed_ms = state.total_samples_fed.saturating_mul(1000) / 16_000;
+                            let wall_elapsed_ms = observed_at
+                                .saturating_duration_since(anchor)
+                                .as_millis() as u64;
+                            let drift_ms = sample_elapsed_ms.abs_diff(wall_elapsed_ms);
+                            let should_log = drift_ms > 200
+                                && state
+                                    .last_clock_drift_log_at
+                                    .map(|t| observed_at.saturating_duration_since(t) >= Duration::from_secs(10))
+                                    .unwrap_or(true);
+                            if should_log {
+                                state.last_clock_drift_log_at = Some(observed_at);
+                                tracing::warn!(
+                                    guild = %guild_id,
+                                    user = %user_id,
+                                    sample_elapsed_ms,
+                                    wall_elapsed_ms,
+                                    drift_ms,
+                                    "stream sample clock drift exceeds threshold"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
+                    state.stream.accept_waveform(16_000, &silence);
+                    state.pcm_16k.extend_from_slice(&silence);
+                    state.total_samples_fed = state
+                        .total_samples_fed
+                        .saturating_add(silence.len() as u64);
+                    if state.dormant_after_endpoint {
+                        state.dormant_silence_ticks = state.dormant_silence_ticks.saturating_add(1);
+                        if state.dormant_silence_ticks >= DORMANT_TEARDOWN_TICKS {
+                            to_drop.push(user_id);
+                        }
+                    }
+                }
+
+                let mut decode_iterations = 0usize;
+                loop {
+                    let ready_users = streams
+                        .iter()
+                        .filter_map(|(user_id, state)| recognizer.is_ready(&state.stream).then_some(*user_id))
+                        .collect::<Vec<_>>();
+                    if ready_users.is_empty() {
+                        break;
+                    }
+                    decode_iterations += 1;
+                    if decode_iterations > MAX_DECODE_BATCHES_PER_TICK {
+                        tracing::warn!(guild = %guild_id, "streaming decode loop hit iteration cap during TickDone");
+                        break;
+                    }
+
+                    let ready_streams = ready_users
+                        .iter()
+                        .filter_map(|user_id| streams.get(user_id).map(|state| &state.stream))
+                        .collect::<Vec<_>>();
+                    recognizer.decode_multiple_streams(&ready_streams);
+
+                    let mut emissions = Vec::<Utterance>::new();
+
+                    for user_id in ready_users {
+                        let Some(state) = streams.get_mut(&user_id) else {
+                            continue;
+                        };
+
+                        let Some(result) = recognizer.get_result(&state.stream) else {
+                            continue;
+                        };
+
+                        let text = normalize_streaming_text(&result.text);
+                        let tokens = result.tokens.clone();
+                        let token_timestamps_s = result.timestamps.clone().unwrap_or_default();
+
+                        let revision_id = make_revision_id(user_id, state.utterance_seq);
+                        let start_sample = state
+                            .utterance_start_sample
+                            .unwrap_or(state.total_samples_fed);
+                        let start_ts = state
+                            .stream_anchor_at
+                            .map(|anchor| sample_clock_to_instant(anchor, start_sample))
+                            .unwrap_or(observed_at);
+                        let start_offset_ms = sample_clock_to_offset_ms(start_sample);
+
+                        if !text.is_empty()
+                            && text != state.last_partial_text
+                            && state
+                                .last_emit_at
+                                .map(|t| observed_at.saturating_duration_since(t) >= PARTIAL_EMIT_MIN_INTERVAL)
+                                .unwrap_or(true)
+                        {
+                            state.last_partial_text = text.clone();
+                            state.last_emit_at = Some(observed_at);
+                            live_partial_text.insert(
+                                (guild_id, user_id),
+                                LivePartialSnapshot {
+                                    revision_id,
+                                    start_ts,
+                                    text: text.clone(),
+                                },
+                            );
+                            if live_transcript_debug {
+                                tracing::debug!(
+                                    user = %user_id,
+                                    revision_id,
+                                    transcript = %text,
+                                    "streaming provisional transcription"
+                                );
+                            }
+                        }
+
+                        if recognizer.is_endpoint(&state.stream) {
+                            let final_text = if !text.is_empty() {
+                                text
+                            } else {
+                                state.last_partial_text.clone()
+                            };
+                            let final_text = polish_stream_final_text(&final_text);
+
+                            if !final_text.is_empty() {
+                                live_partial_text.remove(&(guild_id, user_id));
+                                emissions.push(Utterance {
+                                    user_id,
+                                    start_ts,
+                                    start_offset_ms,
+                                    revision_id,
+                                    stage: crate::app::UtteranceStage::StreamFinal,
+                                    is_final: true,
+                                    text: final_text.clone(),
+                                    tokens,
+                                    token_timestamps_s,
+                                });
+                                trim_trailing_silence_keep_tail(&mut state.pcm_16k, 3_200);
+                                if offline_finalize_tx
+                                    .try_send(OfflineFinalizeJob {
+                                        user_id,
+                                        start_ts,
+                                        start_offset_ms,
+                                        revision_id,
+                                        stream_final_text: final_text.clone(),
+                                        pcm_16k: std::mem::take(&mut state.pcm_16k),
+                                    })
+                                    .is_err()
+                                {
+                                    offline_finalize_dropped.fetch_add(1, AtomicOrdering::SeqCst);
+                                } else {
+                                    offline_finalize_inflight.fetch_add(1, AtomicOrdering::SeqCst);
+                                }
+                                if live_transcript_debug {
+                                    tracing::debug!(
+                                        user = %user_id,
+                                        revision_id,
+                                        transcript = %final_text,
+                                        "streaming final transcription"
+                                    );
+                                }
+                            }
+
+                            recognizer.reset(&state.stream);
+                            state.utterance_seq = state.utterance_seq.wrapping_add(1);
+                            next_utterance_seq.insert(user_id, state.utterance_seq);
+                            state.utterance_start_sample = None;
+                            state.last_partial_text.clear();
+                            state.last_emit_at = None;
+                            state.dormant_after_endpoint = true;
+                            state.dormant_silence_ticks = 0;
+                            state.pcm_16k.clear();
+                        }
+                    }
+
+                    for utterance in emissions {
+                        pending_commits.fetch_add(1, AtomicOrdering::SeqCst);
+                        if utterance_tx.blocking_send(utterance).is_err() {
+                            pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
+                        }
+                    }
+                }
+
+                for user_id in to_drop {
+                    live_partial_text.remove(&(guild_id, user_id));
+                    streams.remove(&user_id);
+                }
+            }
+            StreamingDecoderCommand::FlushAll {
+                respond_to,
+                observed_at,
+            } => {
+                let tracked_users = streams.keys().copied().collect::<Vec<_>>();
+                for user_id in &tracked_users {
+                    if let Some(state) = streams.get_mut(user_id) {
+                        state.stream.input_finished();
+                    }
+                }
+
+                let mut decode_iterations = 0usize;
+                loop {
+                    let ready_users = streams
+                        .iter()
+                        .filter_map(|(user_id, state)| recognizer.is_ready(&state.stream).then_some(*user_id))
+                        .collect::<Vec<_>>();
+                    if ready_users.is_empty() {
+                        break;
+                    }
+                    decode_iterations += 1;
+                    if decode_iterations > MAX_DECODE_BATCHES_PER_TICK {
+                        tracing::warn!(guild = %guild_id, "streaming decode loop hit iteration cap during FlushAll");
+                        break;
+                    }
+
+                    let ready_streams = ready_users
+                        .iter()
+                        .filter_map(|user_id| streams.get(user_id).map(|state| &state.stream))
+                        .collect::<Vec<_>>();
+                    recognizer.decode_multiple_streams(&ready_streams);
+                }
+
+                let mut emissions = Vec::<Utterance>::new();
+                for user_id in tracked_users {
+                    let Some(mut state) = streams.remove(&user_id) else {
+                        continue;
+                    };
+
+                    let result = recognizer.get_result(&state.stream);
+                    let result_text = result
+                        .as_ref()
+                        .map(|r| normalize_streaming_text(&r.text))
+                        .unwrap_or_default();
+                    let result_tokens = result
+                        .as_ref()
+                        .map(|r| r.tokens.clone())
+                        .unwrap_or_default();
+                    let result_token_timestamps_s = result
+                        .as_ref()
+                        .map(|r| r.timestamps.clone())
+                        .flatten()
+                        .unwrap_or_default();
+                    let final_text = if !result_text.is_empty() {
+                        result_text
+                    } else {
+                        state.last_partial_text.clone()
+                    };
+                    let final_text = polish_stream_final_text(&final_text);
+
+                    live_partial_text.remove(&(guild_id, user_id));
+
+                    if final_text.is_empty() {
+                        continue;
+                    }
+
+                    let revision_id = make_revision_id(user_id, state.utterance_seq);
+                    let start_sample = state
+                        .utterance_start_sample
+                        .unwrap_or(state.total_samples_fed);
+                    let start_ts = state
+                        .stream_anchor_at
+                        .map(|anchor| sample_clock_to_instant(anchor, start_sample))
+                        .unwrap_or(observed_at);
+                    let start_offset_ms = sample_clock_to_offset_ms(start_sample);
+                    emissions.push(Utterance {
+                        user_id,
+                        start_ts,
+                        start_offset_ms,
+                        revision_id,
+                        stage: crate::app::UtteranceStage::StreamFinal,
+                        is_final: true,
+                        text: final_text.clone(),
+                        tokens: result_tokens,
+                        token_timestamps_s: result_token_timestamps_s,
+                    });
+
+                    trim_trailing_silence_keep_tail(&mut state.pcm_16k, 3_200);
+                    if offline_finalize_tx
+                        .try_send(OfflineFinalizeJob {
+                            user_id,
+                            start_ts,
+                            start_offset_ms,
+                            revision_id,
+                            stream_final_text: final_text,
+                            pcm_16k: std::mem::take(&mut state.pcm_16k),
+                        })
+                        .is_err()
+                    {
+                        offline_finalize_dropped.fetch_add(1, AtomicOrdering::SeqCst);
+                    } else {
+                        offline_finalize_inflight.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+
+                    next_utterance_seq.insert(user_id, state.utterance_seq.wrapping_add(1));
+                }
+
+                for utterance in emissions {
+                    pending_commits.fetch_add(1, AtomicOrdering::SeqCst);
+                    if utterance_tx.blocking_send(utterance).is_err() {
+                        pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
+                    }
+                }
+
+                let _ = respond_to.send(());
+            }
+        }
+    }
+        })
+        .expect("failed to spawn streaming decoder thread")
+}
+
+pub async fn offline_finalize_worker_loop(
+    offline_asr: Arc<AsrEngine>,
+    mut rx: mpsc::Receiver<OfflineFinalizeJob>,
+    utterance_tx: mpsc::Sender<Utterance>,
+    pending_commits: Arc<AtomicUsize>,
+    inflight: Arc<AtomicUsize>,
+    refinement_rejected: Arc<AtomicUsize>,
+    worker_alive: Arc<AtomicBool>,
+    offline_rtf_milli_ewma: Arc<AtomicUsize>,
+    offline_finalize_empty: Arc<AtomicUsize>,
+    live_transcript_debug: bool,
+) {
+    struct OfflineWorkerAliveGuard {
+        alive: Arc<AtomicBool>,
+    }
+    impl Drop for OfflineWorkerAliveGuard {
+        fn drop(&mut self) {
+            self.alive.store(false, AtomicOrdering::SeqCst);
+        }
+    }
+
+    worker_alive.store(true, AtomicOrdering::SeqCst);
+    let _alive_guard = OfflineWorkerAliveGuard {
+        alive: Arc::clone(&worker_alive),
+    };
+
+    while let Some(job) = rx.recv().await {
+        struct InflightTaskGuard {
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for InflightTaskGuard {
+            fn drop(&mut self) {
+                self.counter.fetch_sub(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let _guard = InflightTaskGuard {
+            counter: Arc::clone(&inflight),
+        };
+
+        let audio_duration_ms = ((job.pcm_16k.len() as u64).saturating_mul(1000)) / 16_000;
+        let Some(decoded) = transcribe_mono_pcm(Arc::clone(&offline_asr), job.pcm_16k).await else {
+            continue;
+        };
+
+        if audio_duration_ms > 0 {
+            let sample_rtf_milli = ((decoded.decode_elapsed_ms as f32 / audio_duration_ms as f32) * 1000.0)
+                .round()
+                .max(0.0) as usize;
+            let mut prev = offline_rtf_milli_ewma.load(AtomicOrdering::Relaxed);
+            loop {
+                let next = if prev == 0 {
+                    sample_rtf_milli
+                } else {
+                    ((prev * 8) + (sample_rtf_milli * 2) + 5) / 10
+                };
+                match offline_rtf_milli_ewma.compare_exchange_weak(
+                    prev,
+                    next,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => prev = actual,
+                }
+            }
+        }
+
+        if decoded.text.trim().is_empty() {
+            offline_finalize_empty.fetch_add(1, AtomicOrdering::SeqCst);
+            continue;
+        }
+
+        if !should_accept_offline_final(&job.stream_final_text, &decoded.text) {
+            refinement_rejected.fetch_add(1, AtomicOrdering::SeqCst);
+            continue;
+        }
+
+        if live_transcript_debug {
+            tracing::debug!(
+                user = %job.user_id,
+                revision_id = job.revision_id,
+                transcript = %decoded.text,
+                stream_final = %job.stream_final_text,
+                "offline final transcription"
+            );
+        }
+
+        pending_commits.fetch_add(1, AtomicOrdering::SeqCst);
+        if utterance_tx
+            .send(Utterance {
+                user_id: job.user_id,
+                start_ts: job.start_ts,
+                start_offset_ms: job.start_offset_ms,
+                revision_id: job.revision_id,
+                stage: crate::app::UtteranceStage::OfflineFinal,
+                is_final: true,
+                text: decoded.text,
+                tokens: decoded.tokens,
+                token_timestamps_s: decoded.token_timestamps_s,
+            })
+            .await
+            .is_err()
+        {
+            pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    }
 }
 
 fn texts_equivalent(a: &str, b: &str) -> bool {
-    a.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .eq_ignore_ascii_case(&b.split_whitespace().collect::<Vec<_>>().join(" "))
+    fn normalize_for_equivalence(input: &str) -> String {
+        input
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'))
+            .to_string()
+    }
+
+    normalize_for_equivalence(a).eq_ignore_ascii_case(&normalize_for_equivalence(b))
 }
 
 fn has_repeated_ngram(text: &str, n: usize, min_consecutive_repeats: usize) -> bool {
@@ -854,47 +1372,6 @@ fn has_repeated_ngram(text: &str, n: usize, min_consecutive_repeats: usize) -> b
     }
 
     false
-}
-
-fn trim_overlap_from_previous_final(transcript: &[Utterance], utterance: &mut Utterance) {
-    if !utterance.is_final {
-        return;
-    }
-
-    let Some(prev) = transcript
-        .iter()
-        .rev()
-        .find(|u| u.user_id == utterance.user_id && u.is_final && u.start_ts <= utterance.start_ts)
-    else {
-        return;
-    };
-
-    let prev_words: Vec<&str> = prev.text.split_whitespace().collect();
-    let curr_words: Vec<&str> = utterance.text.split_whitespace().collect();
-    if prev_words.is_empty() || curr_words.is_empty() {
-        return;
-    }
-
-    let max_overlap = prev_words.len().min(curr_words.len()).min(24);
-    let mut overlap = 0usize;
-    for k in (4..=max_overlap).rev() {
-        let prev_tail = &prev_words[prev_words.len() - k..];
-        let curr_head = &curr_words[..k];
-        if prev_tail
-            .iter()
-            .zip(curr_head.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
-            overlap = k;
-            break;
-        }
-    }
-
-    if overlap == 0 || overlap >= curr_words.len() {
-        return;
-    }
-
-    utterance.text = curr_words[overlap..].join(" ");
 }
 
 pub type Streams = DashMap<(GuildId, UserId), UserStreamState>;
@@ -946,28 +1423,43 @@ pub async fn transcript_writer_loop(
         revision_id: u64,
         user_id: u64,
         start_offset_ms: u64,
+        stage: UtteranceStage,
         is_final: bool,
         text: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tokens: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        token_timestamps_s: Vec<f32>,
     }
 
-    fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) {
-        let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(item) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
-    }
+    let mut journal_writer = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&transcript_jsonl_path)
+        .ok()
+        .map(BufWriter::new);
 
     async fn apply_revision(
         session: &Arc<RwLock<CallSession>>,
         revision_index: &mut std::collections::HashMap<u64, usize>,
         pending_commits: &Arc<AtomicUsize>,
-        transcript_jsonl_path: &Path,
+        journal_writer: &mut Option<BufWriter<fs::File>>,
         mut utterance: Utterance,
     ) {
         let mut lock = session.write().await;
+
+        // Rebase to call-relative time at commit; decoder-side sample clocks are stream-local.
+        let start_offset_ms = utterance
+            .start_ts
+            .saturating_duration_since(lock.started_mono)
+            .as_millis() as u64;
+        utterance.start_offset_ms = start_offset_ms;
+        if !utterance.token_timestamps_s.is_empty() {
+            let base_s = start_offset_ms as f32 / 1000.0;
+            for t in &mut utterance.token_timestamps_s {
+                *t += base_s;
+            }
+        }
 
         if revision_index.is_empty() || revision_index.len() != lock.transcript.len() {
             revision_index.clear();
@@ -977,34 +1469,33 @@ pub async fn transcript_writer_loop(
         }
 
         if let Some(existing_idx) = revision_index.get(&utterance.revision_id).copied() {
-            if lock.transcript[existing_idx].is_final && !utterance.is_final {
+            if lock.transcript[existing_idx].stage.precedence() > utterance.stage.precedence() {
                 pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
                 return;
             }
-            let start_offset_ms = utterance
-                .start_ts
-                .saturating_duration_since(lock.started_mono)
-                .as_millis() as u64;
             lock.transcript[existing_idx] = utterance;
-            let persisted = PersistedUtterance {
-                revision_id: lock.transcript[existing_idx].revision_id,
-                user_id: lock.transcript[existing_idx].user_id.get(),
-                start_offset_ms,
-                is_final: lock.transcript[existing_idx].is_final,
-                text: lock.transcript[existing_idx].text.clone(),
-            };
+            let persisted = (lock.transcript[existing_idx].stage != UtteranceStage::Partial)
+                .then(|| PersistedUtterance {
+                    revision_id: lock.transcript[existing_idx].revision_id,
+                    user_id: lock.transcript[existing_idx].user_id.get(),
+                    start_offset_ms: lock.transcript[existing_idx].start_offset_ms,
+                    stage: lock.transcript[existing_idx].stage,
+                    is_final: lock.transcript[existing_idx].is_final,
+                    text: lock.transcript[existing_idx].text.clone(),
+                    tokens: lock.transcript[existing_idx].tokens.clone(),
+                    token_timestamps_s: lock.transcript[existing_idx].token_timestamps_s.clone(),
+                });
             drop(lock);
-            append_persisted_utterance(transcript_jsonl_path, &persisted);
+            if let (Some(writer), Some(item)) = (journal_writer.as_mut(), persisted) {
+                if let Ok(line) = serde_json::to_string(&item) {
+                    let _ = writeln!(writer, "{line}");
+                    let _ = writer.flush();
+                }
+            }
             pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
             return;
         }
 
-        trim_overlap_from_previous_final(&lock.transcript, &mut utterance);
-
-        let start_offset_ms = utterance
-            .start_ts
-            .saturating_duration_since(lock.started_mono)
-            .as_millis() as u64;
         lock.transcript.push(utterance.clone());
         lock.transcript.sort_by_key(|u| u.start_ts);
         revision_index.clear();
@@ -1012,16 +1503,24 @@ pub async fn transcript_writer_loop(
             revision_index.insert(u.revision_id, idx);
         }
 
-        let persisted = PersistedUtterance {
+        let persisted = (utterance.stage != UtteranceStage::Partial).then(|| PersistedUtterance {
             revision_id: utterance.revision_id,
             user_id: utterance.user_id.get(),
-            start_offset_ms,
+            start_offset_ms: utterance.start_offset_ms,
+            stage: utterance.stage,
             is_final: utterance.is_final,
             text: utterance.text,
-        };
+            tokens: utterance.tokens,
+            token_timestamps_s: utterance.token_timestamps_s,
+        });
 
         drop(lock);
-        append_persisted_utterance(transcript_jsonl_path, &persisted);
+        if let (Some(writer), Some(item)) = (journal_writer.as_mut(), persisted) {
+            if let Ok(line) = serde_json::to_string(&item) {
+                let _ = writeln!(writer, "{line}");
+                let _ = writer.flush();
+            }
+        }
 
         pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
     }
@@ -1051,7 +1550,7 @@ pub async fn transcript_writer_loop(
                     &session,
                     &mut revision_index,
                     &pending_commits,
-                    &transcript_jsonl_path,
+                    &mut journal_writer,
                     item.utterance,
                 )
                     .await;
@@ -1064,7 +1563,7 @@ pub async fn transcript_writer_loop(
             &session,
             &mut revision_index,
             &pending_commits,
-            &transcript_jsonl_path,
+            &mut journal_writer,
             item.utterance,
         )
         .await;
@@ -1073,3 +1572,4 @@ pub async fn transcript_writer_loop(
 
 pub type SsrcMap = DashMap<(GuildId, u32), UserId>;
 pub type SessionSenders = DashMap<GuildId, mpsc::Sender<Utterance>>;
+pub type StreamingDecoderSenders = DashMap<GuildId, mpsc::Sender<StreamingDecoderCommand>>;
