@@ -13,15 +13,14 @@ Short, current design summary for the Discord live transcription bot.
 ## Runtime flow
 
 1. /join starts a guild-scoped call session.
-2. Voice events populate guild-scoped speaker maps and per-user DSP state.
-3. Audio pipeline performs stereo downmix, DC-block high-pass, optional RNNoise denoise, and anti-aliased 48 kHz to 16 kHz resampling (rubato FFT). The resulting 16 kHz stream is fed to both live streaming ASR state and the offline-final capture buffer.
-4. A per-session streaming decoder loop owns all `OnlineStream` state. Each 20 ms tick, absent active speakers are fed 320 zero samples so streaming endpoint rules can fire even though Discord stops sending packets on silence.
-5. The streaming recognizer emits low-latency `Partial` updates into an in-memory live snapshot map and emits `StreamFinal` utterances on endpoint. Each final shares a `revision_id` with its later offline replacement.
-6. Endpointed 16 kHz audio is queued to a bounded offline-final worker. The worker runs one offline decode at a time through the global ASR semaphore and upgrades `StreamFinal` to `OfflineFinal` only if the refinement guard accepts it.
-7. Utterance revisions are merged by stage precedence (`Partial < StreamFinal < OfflineFinal`) inside a transcript writer with a small reorder window. Only `StreamFinal`/`OfflineFinal` are persisted to per-session JSONL for crash-safe recovery.
-8. `/log` and `/ask` read the published live partial map directly and merge it with committed transcript state for instant snapshots.
-9. `/leave` (or empty channel auto-finalize) sends an explicit decoder flush command, waits for the ack and offline queue drain, writes transcript text to local disk, then uploads it and creates a Q&A thread.
-10. Thread messages use transcript + in-memory thread history; transcript can be lazily restored from the starter attachment after restart.
+2. Voice events populate guild-scoped speaker maps and per-user stream state (denoiser + audio buffer in a single map entry).
+3. Audio pipeline performs downmix, high-pass filter, optional RNNoise denoise with SNR hysteresis and speech-latched mode switching, speech-gated AGC, anti-aliased 48 kHz to 16 kHz resampling (rubato FFT), and earshot VAD gating with a 300 ms pre-roll ring, before provisional ASR and final ASR on silence.
+4. Provisional decodes use geometric backoff (0.5 s, then doubling up to 8 s of buffered audio) and all ASR decodes are serialized through a global one-permit semaphore; stale revisions are dropped after the permit is acquired.
+5. Rolling ingest bounds memory for long speech: old chunk is finalized at a low-RMS cut point near the rollover boundary, recent context tail is retained, and transcript commit logic trims strong tail/head word overlap for final utterances from the same speaker.
+6. Utterance revisions are queued and merged by a transcript writer with a small reorder window, and appended incrementally to a per-session JSONL file so transcripts survive a crash or a failed Discord upload.
+7. /ask and /log wait for brief quiescence, then non-destructively snapshot pending guild buffers and read the current transcript.
+8. /leave (or empty channel auto-finalize) performs settle+flush, disconnects, settle+flush again, merges the persisted JSONL, writes the transcript to local disk, then uploads it and creates a Q&A thread. Drain loops are bounded by timeouts.
+9. Thread messages use transcript + in-memory thread history; transcript can be lazily restored from the starter attachment after restart.
 
 ## Commands
 
@@ -36,16 +35,17 @@ Suffix-based auto-join is implemented: channels ending with the configured marke
 
 ## Key state
 
-- Utterance: user_id, start_ts, start_offset_ms, revision_id, stage, is_final, text, tokens, token_timestamps_s
+- Utterance: user_id, start_ts, revision_id, is_final, text
+- UserAudioBuffer: audio PCM + segmentation/revision/provisional-stability tracking
 - CallSession: voice_channel, text_channel, transcript, started_at, started_mono
 - ThreadContext: transcript + turn history
-- AppState: active calls, thread contexts, streaming/offline ASR engines, guild-scoped DSP maps, live partial map, queue/health counters
+- AppState: active calls, thread contexts, ASR engine, guild-scoped buffers/maps, drain counters
 
 ## Ordering and consistency
 
-- Streaming decode is serialized inside the per-session decoder task; offline finalization runs through a bounded queue and a one-permit ASR semaphore.
+- ASR work runs concurrently (spawn + spawn_blocking).
 - Transcript writes are revision-aware and ordered by start timestamp with a watermark.
-- Finalization uses an explicit decoder flush ack plus inflight/pending drain waits.
+- Finalization and interactive reads use inflight/pending counters and explicit flush/drain waits.
 
 ## Modules
 
@@ -63,11 +63,12 @@ Suffix-based auto-join is implemented: channels ending with the configured marke
 - DISCORD_TOKEN
 - GEMINI_API_KEY
 - GEMINI_MODEL
-- ASR_STREAMING_MODEL_DIR
-- ASR_OFFLINE_MODEL_DIR
+- ASR_MODEL_DIR (or MOONSHINE_MODEL_DIR fallback)
 - ASR_MODEL_FAMILY (optional)
 - LIVE_TRANSCRIPT_DEBUG
 - ENABLE_DENOISER
+- ROLLING_INGEST_MAX_MS
+- ROLLING_INGEST_CONTEXT_MS
 - AUTOJOIN_SUFFIX (optional; default `[Transcribe]`)
 
 ## Current limits

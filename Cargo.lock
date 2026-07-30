@@ -813,6 +813,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "earshot"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86b09710f15e995d175f80aa9101f37cd2bc12bb45593e7eac1809ab99acd1ab"
+
+[[package]]
 name = "easyfft"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4246,6 +4252,7 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "dotenvy",
+ "earshot",
  "nnnoiseless",
  "reqwest 0.13.4",
  "rubato",

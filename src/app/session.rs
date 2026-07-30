@@ -14,16 +14,15 @@ use serenity::all::{
 use serde::Deserialize;
 use serenity::prelude::Context;
 use songbird::events::{CoreEvent, Event};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc};
 
 use super::{
-    AppState, STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS,
-    STARTUP_RECEIVE_WATCHDOG_DELAY, STEADY_STATE_NO_PROGRESS_TIMEOUT,
-    STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
-    UtteranceStage,
+    AppState, CallSession, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT,
+    STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS, STARTUP_RECEIVE_WATCHDOG_DELAY,
+    STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
 };
 use crate::audio::{ClientDisconnectHandler, SpeakingUpdateHandler, VoiceTickHandler};
-use crate::transcription::StreamingDecoderCommand;
+use crate::transcription::{make_revision_id, should_apply_refinement, transcribe_mono_pcm};
 
 pub struct VoiceHandlerAttachContext {
     pub http: Arc<serenity::http::Http>,
@@ -31,11 +30,11 @@ pub struct VoiceHandlerAttachContext {
     pub text_channel: ChannelId,
     pub voice_channel: ChannelId,
     pub call_lock: Arc<tokio::sync::Mutex<songbird::Call>>,
-    pub streaming_decoder_tx: mpsc::Sender<StreamingDecoderCommand>,
+    pub utterance_tx: mpsc::Sender<Utterance>,
+    pub inflight: Arc<AtomicUsize>,
+    pub pending_commits: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
-    pub chunks_accepted_activity: Arc<AtomicUsize>,
     pub decode_failure_activity: Arc<AtomicUsize>,
-    pub decoder_queue_dropped: Arc<AtomicUsize>,
     pub unmapped_ssrc_activity: Arc<AtomicUsize>,
     pub started_notified: Arc<AtomicBool>,
 }
@@ -49,20 +48,7 @@ pub async fn finalize_call_for_guild(
         return Ok(());
     };
 
-    if let Some(decoder_tx) = state
-        .streaming_decoder_senders
-        .get(&guild_id)
-        .map(|v| v.value().clone())
-    {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let _ = decoder_tx
-            .send(crate::transcription::StreamingDecoderCommand::FlushAll {
-                respond_to: ack_tx,
-                observed_at: Instant::now(),
-            })
-            .await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
-    }
+    settle_and_flush_guild_audio(state, guild_id, &session_lock).await;
     wait_for_transcription_drain(state, guild_id).await;
     wait_for_transcript_commit_drain(state, guild_id).await;
 
@@ -92,17 +78,11 @@ pub async fn finalize_call_for_guild(
         state.streams.remove(&key);
     }
 
+    settle_and_flush_guild_audio(state, guild_id, &session_lock).await;
+    wait_for_transcription_drain(state, guild_id).await;
+    wait_for_transcript_commit_drain(state, guild_id).await;
+
     state.utterance_senders.remove(&guild_id);
-    state.streaming_decoder_senders.remove(&guild_id);
-    for key in state
-        .live_partial_text
-        .iter()
-        .map(|e| *e.key())
-        .filter(|(g, _)| *g == guild_id)
-        .collect::<Vec<_>>()
-    {
-        state.live_partial_text.remove(&key);
-    }
 
     let session = session_lock.read().await;
     let mut transcript = load_persisted_transcript(
@@ -171,16 +151,8 @@ pub async fn finalize_call_for_guild(
     state.transcription_inflight.remove(&guild_id);
     state.transcript_pending_commits.remove(&guild_id);
     state.decoded_audio_activity.remove(&guild_id);
-    state.chunks_accepted_activity.remove(&guild_id);
     state.decode_failure_activity.remove(&guild_id);
-    state.decoder_queue_dropped.remove(&guild_id);
     state.unmapped_ssrc_activity.remove(&guild_id);
-    state.decoder_thread_alive.remove(&guild_id);
-    state.offline_finalize_worker_alive.remove(&guild_id);
-    state.offline_finalize_rtf_milli_ewma.remove(&guild_id);
-    state.offline_finalize_empty.remove(&guild_id);
-    state.offline_finalize_dropped.remove(&guild_id);
-    state.refinement_rejected.remove(&guild_id);
     state.transcription_started_notified.remove(&guild_id);
 
     Ok(())
@@ -191,14 +163,8 @@ struct PersistedUtterance {
     revision_id: u64,
     user_id: u64,
     start_offset_ms: u64,
-    #[serde(default)]
-    stage: Option<UtteranceStage>,
     is_final: bool,
     text: String,
-    #[serde(default)]
-    tokens: Vec<String>,
-    #[serde(default)]
-    token_timestamps_s: Vec<f32>,
 }
 
 fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> Vec<Utterance> {
@@ -214,17 +180,9 @@ fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> V
         upsert_utterances(&mut out, vec![Utterance {
             user_id: UserId::new(item.user_id),
             start_ts: started_mono + Duration::from_millis(item.start_offset_ms),
-            start_offset_ms: item.start_offset_ms,
             revision_id: item.revision_id,
-            stage: item.stage.unwrap_or(if item.is_final {
-                UtteranceStage::OfflineFinal
-            } else {
-                UtteranceStage::Partial
-            }),
             is_final: item.is_final,
             text: item.text,
-            tokens: item.tokens,
-            token_timestamps_s: item.token_timestamps_s,
         }]);
     }
 
@@ -238,11 +196,11 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
         text_channel,
         voice_channel,
         call_lock,
-        streaming_decoder_tx,
+        utterance_tx,
+        inflight,
+        pending_commits,
         decode_activity,
-        chunks_accepted_activity,
         decode_failure_activity,
-        decoder_queue_dropped,
         unmapped_ssrc_activity,
         started_notified,
     } = ctx;
@@ -260,7 +218,6 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
         ClientDisconnectHandler {
             guild_id,
             ssrc_to_user: Arc::clone(&state.ssrc_to_user),
-            streams: Arc::clone(&state.streams),
         },
     );
     call.add_global_event(
@@ -273,13 +230,18 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
             guild_id,
             ssrc_to_user: Arc::clone(&state.ssrc_to_user),
             streams: Arc::clone(&state.streams),
-            streaming_decoder_tx,
             enable_denoiser: state.enable_denoiser,
+            utterance_tx,
+            transcription_inflight: inflight,
+            transcript_pending_commits: pending_commits,
             decode_activity,
-            chunks_accepted_activity,
             decode_failure_activity,
-            decoder_queue_dropped,
             unmapped_ssrc_activity,
+            asr: Arc::clone(&state.asr),
+            asr_finalize: state.final_asr.as_ref().map(Arc::clone),
+            live_transcript_debug: state.live_transcript_debug,
+            rolling_ingest_max_ms: state.rolling_ingest_max_ms,
+            rolling_ingest_context_ms: state.rolling_ingest_context_ms,
         },
     );
 }
@@ -458,15 +420,41 @@ pub async fn startup_receive_watchdog(
         return;
     };
 
-    let Some(streaming_decoder_tx) = state
-        .streaming_decoder_senders
+    let Some(utterance_tx) = state
+        .utterance_senders
         .get(&guild_id)
         .map(|v| v.value().clone())
     else {
         tracing::warn!(
             guild = %guild_id,
             attempt,
-            "startup recovery retrying: missing streaming decoder sender state"
+            "startup recovery retrying: missing utterance sender state"
+        );
+        schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
+        return;
+    };
+    let Some(inflight) = state
+        .transcription_inflight
+        .get(&guild_id)
+        .map(|v| Arc::clone(v.value()))
+    else {
+        tracing::warn!(
+            guild = %guild_id,
+            attempt,
+            "startup recovery retrying: missing inflight counter state"
+        );
+        schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
+        return;
+    };
+    let Some(pending_commits) = state
+        .transcript_pending_commits
+        .get(&guild_id)
+        .map(|v| Arc::clone(v.value()))
+    else {
+        tracing::warn!(
+            guild = %guild_id,
+            attempt,
+            "startup recovery retrying: missing pending commits counter state"
         );
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
@@ -484,19 +472,6 @@ pub async fn startup_receive_watchdog(
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
     };
-    let Some(chunks_accepted_activity) = state
-        .chunks_accepted_activity
-        .get(&guild_id)
-        .map(|v| Arc::clone(v.value()))
-    else {
-        tracing::warn!(
-            guild = %guild_id,
-            attempt,
-            "startup recovery retrying: missing accepted-chunks counter state"
-        );
-        schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
-        return;
-    };
     let Some(decode_failure_activity) = state
         .decode_failure_activity
         .get(&guild_id)
@@ -506,19 +481,6 @@ pub async fn startup_receive_watchdog(
             guild = %guild_id,
             attempt,
             "startup recovery retrying: missing decode-failure counter state"
-        );
-        schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
-        return;
-    };
-    let Some(decoder_queue_dropped) = state
-        .decoder_queue_dropped
-        .get(&guild_id)
-        .map(|v| Arc::clone(v.value()))
-    else {
-        tracing::warn!(
-            guild = %guild_id,
-            attempt,
-            "startup recovery retrying: missing decoder queue-drop counter state"
         );
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
@@ -550,9 +512,7 @@ pub async fn startup_receive_watchdog(
         return;
     };
     decode_activity.store(0, Ordering::SeqCst);
-    chunks_accepted_activity.store(0, Ordering::SeqCst);
     decode_failure_activity.store(0, Ordering::SeqCst);
-    decoder_queue_dropped.store(0, Ordering::SeqCst);
     unmapped_ssrc_activity.store(0, Ordering::SeqCst);
 
     attach_voice_handlers(
@@ -563,11 +523,11 @@ pub async fn startup_receive_watchdog(
             text_channel,
             voice_channel,
             call_lock: Arc::clone(&call_lock),
-            streaming_decoder_tx,
+            utterance_tx,
+            inflight,
+            pending_commits,
             decode_activity,
-            chunks_accepted_activity,
             decode_failure_activity,
-            decoder_queue_dropped,
             unmapped_ssrc_activity,
             started_notified,
         },
@@ -591,10 +551,7 @@ pub async fn steady_state_receive_watchdog(
     text_channel: ChannelId,
 ) {
     let mut last_decode_activity = 0usize;
-    let mut last_chunks_accepted = 0usize;
     let mut last_progress = Instant::now();
-    let mut decode_without_accept_since: Option<Instant> = None;
-    let mut offline_finalize_warned = false;
 
     loop {
         tokio::time::sleep(STEADY_STATE_WATCHDOG_CADENCE).await;
@@ -620,7 +577,6 @@ pub async fn steady_state_receive_watchdog(
 
         if !non_bot_present {
             last_progress = Instant::now();
-            decode_without_accept_since = None;
             continue;
         }
 
@@ -629,106 +585,9 @@ pub async fn steady_state_receive_watchdog(
             .get(&guild_id)
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
-        let chunks_accepted = state
-            .chunks_accepted_activity
-            .get(&guild_id)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or(0);
-        let decoder_alive = state
-            .decoder_thread_alive
-            .get(&guild_id)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or(false);
-        let offline_finalize_alive = state
-            .offline_finalize_worker_alive
-            .get(&guild_id)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or(false);
 
-        if !decoder_alive {
-            tracing::error!(
-                guild = %guild_id,
-                decode_activity,
-                chunks_accepted,
-                "steady-state watchdog detected dead decoder thread"
-            );
-            let _ = text_channel
-                .say(
-                    &ctx.http,
-                    "Decoder thread exited unexpectedly; ending this session so you can /join again cleanly.",
-                )
-                .await;
-            let _ = finalize_call_for_guild(&ctx, &state, guild_id).await;
-            return;
-        }
-
-        if !offline_finalize_alive {
-            if !offline_finalize_warned {
-                tracing::warn!(
-                    guild = %guild_id,
-                    "steady-state watchdog detected dead offline finalize worker"
-                );
-                let _ = text_channel
-                    .say(
-                        &ctx.http,
-                        "Offline refinement worker exited unexpectedly; continuing with stream-final transcripts for this session.",
-                    )
-                    .await;
-                offline_finalize_warned = true;
-            }
-        } else {
-            offline_finalize_warned = false;
-        }
-
-        if decode_activity > last_decode_activity && chunks_accepted == last_chunks_accepted {
-            let since = decode_without_accept_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= STEADY_STATE_NO_PROGRESS_TIMEOUT {
-                tracing::error!(
-                    guild = %guild_id,
-                    decode_activity,
-                    chunks_accepted,
-                    "steady-state watchdog detected decode activity without accepted decoder chunks"
-                );
-                let _ = text_channel
-                    .say(
-                        &ctx.http,
-                        "Decoded audio is arriving but decoder queue accepts no chunks; reinitializing voice receive.",
-                    )
-                    .await;
-
-                startup_receive_watchdog(
-                    ctx.clone(),
-                    Arc::clone(&state),
-                    guild_id,
-                    voice_channel,
-                    text_channel,
-                    1,
-                )
-                .await;
-
-                last_progress = Instant::now();
-                last_decode_activity = state
-                    .decoded_audio_activity
-                    .get(&guild_id)
-                    .map(|v| v.load(Ordering::SeqCst))
-                    .unwrap_or(0);
-                last_chunks_accepted = state
-                    .chunks_accepted_activity
-                    .get(&guild_id)
-                    .map(|v| v.load(Ordering::SeqCst))
-                    .unwrap_or(0);
-                decode_without_accept_since = None;
-            } else {
-                last_decode_activity = decode_activity;
-            }
-            continue;
-        }
-
-        decode_without_accept_since = None;
-
-        if decode_activity > last_decode_activity || chunks_accepted > last_chunks_accepted {
+        if decode_activity > last_decode_activity {
             last_decode_activity = decode_activity;
-            last_chunks_accepted = chunks_accepted;
             last_progress = Instant::now();
             continue;
         }
@@ -742,18 +601,8 @@ pub async fn steady_state_receive_watchdog(
             .get(&guild_id)
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
-        let decoder_queue_dropped = state
-            .decoder_queue_dropped
-            .get(&guild_id)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or(0);
         let unmapped_ssrc = state
             .unmapped_ssrc_activity
-            .get(&guild_id)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or(0);
-        let offline_finalize_dropped = state
-            .offline_finalize_dropped
             .get(&guild_id)
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -761,11 +610,8 @@ pub async fn steady_state_receive_watchdog(
         tracing::warn!(
             guild = %guild_id,
             decode_activity,
-            chunks_accepted,
             decode_failures,
-            decoder_queue_dropped,
             unmapped_ssrc,
-            offline_finalize_dropped,
             "steady-state watchdog detected stalled receive path; forcing startup-style recovery"
         );
         let _ = text_channel
@@ -791,11 +637,41 @@ pub async fn steady_state_receive_watchdog(
             .get(&guild_id)
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
-        last_chunks_accepted = state
-            .chunks_accepted_activity
+    }
+}
+
+async fn settle_and_flush_guild_audio(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    session_lock: &Arc<RwLock<CallSession>>,
+) {
+    for _ in 0..FINALIZE_SETTLE_PASSES {
+        let _ = wait_for_capture_quiesce_with_timeout(state, guild_id, FINALIZE_SETTLE_TIMEOUT).await;
+
+        let pending = flush_pending_buffers_for_export(state, guild_id).await;
+        if !pending.is_empty() {
+            let mut session = session_lock.write().await;
+            upsert_utterances(&mut session.transcript, pending);
+        }
+
+        let inflight = state
+            .transcription_inflight
             .get(&guild_id)
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
+        let pending_commits = state
+            .transcript_pending_commits
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let buffered_audio = state
+            .streams
+            .iter()
+            .any(|e| e.key().0 == guild_id && !e.value().buffer.pcm.is_empty());
+
+        if inflight == 0 && pending_commits == 0 && !buffered_audio {
+            break;
+        }
     }
 }
 
@@ -820,6 +696,37 @@ async fn wait_for_transcription_drain(state: &Arc<AppState>, guild_id: GuildId) 
             guild = %guild_id,
             "timed out waiting for transcription drain; continuing finalize with partial state"
         );
+    }
+}
+
+pub(super) async fn wait_for_capture_quiesce_with_timeout(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+
+    loop {
+        let inflight = state
+            .transcription_inflight
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let pending_commits = state
+            .transcript_pending_commits
+            .get(&guild_id)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+
+        if inflight == 0 && pending_commits == 0 {
+            return true;
+        }
+
+        if start.elapsed() >= timeout {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -853,7 +760,7 @@ pub(super) fn upsert_utterances(transcript: &mut Vec<Utterance>, incoming: Vec<U
             .iter_mut()
             .find(|u| u.revision_id == utterance.revision_id)
         {
-            if existing.stage.precedence() > utterance.stage.precedence() {
+            if existing.is_final && !utterance.is_final {
                 continue;
             }
             *existing = utterance;
@@ -863,6 +770,124 @@ pub(super) fn upsert_utterances(transcript: &mut Vec<Utterance>, incoming: Vec<U
     }
 
     transcript.sort_by_key(|u| u.start_ts);
+}
+
+pub(super) async fn flush_pending_buffers_for_export(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+) -> Vec<Utterance> {
+    let user_keys: Vec<(GuildId, UserId)> = state
+        .streams
+        .iter()
+        .map(|e| *e.key())
+        .filter(|(g, _)| *g == guild_id)
+        .collect();
+    let mut out = Vec::new();
+
+    for user_key in user_keys {
+        let user_id = user_key.1;
+        let mut start_ts = None;
+        let mut pcm = Vec::new();
+        let mut revision_seq = None;
+
+        if let Some(mut stream) = state.streams.get_mut(&user_key) {
+            let flushed = stream.denoiser.flush_pending();
+            let entry = &mut stream.buffer;
+            entry.pcm.extend(flushed);
+
+            if entry.pcm.is_empty() {
+                continue;
+            }
+
+            start_ts = Some(entry.utterance_start.take().unwrap_or_else(Instant::now));
+            revision_seq = Some(entry.current_revision_seq.take().unwrap_or_else(|| {
+                let seq = entry.next_revision_seq;
+                entry.next_revision_seq = entry.next_revision_seq.wrapping_add(1);
+                seq
+            }));
+            pcm = std::mem::take(&mut entry.pcm);
+            entry.silent_ticks = 0;
+            entry.last_preview_samples = 0;
+            entry.last_preview_text = None;
+            entry.frozen_prefix_words = 0;
+            entry.stable_preview_streak = 0;
+        }
+
+        let Some(start_ts) = start_ts else {
+            continue;
+        };
+        let Some(revision_seq) = revision_seq else {
+            continue;
+        };
+
+        if let Some(text) = transcribe_finalized_mono_pcm(state, pcm).await {
+            out.push(Utterance {
+                user_id,
+                start_ts,
+                revision_id: make_revision_id(user_id, revision_seq),
+                is_final: true,
+                text,
+            });
+        }
+    }
+
+    out
+}
+
+pub(super) async fn snapshot_pending_buffers_for_interactive(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+) -> Vec<Utterance> {
+    let user_keys: Vec<(GuildId, UserId)> = state
+        .streams
+        .iter()
+        .map(|e| *e.key())
+        .filter(|(g, _)| *g == guild_id)
+        .collect();
+    let mut out = Vec::new();
+
+    for user_key in user_keys {
+        let user_id = user_key.1;
+        let (start_ts, revision_seq, pcm) = if let Some(stream) = state.streams.get(&user_key) {
+            let entry = &stream.buffer;
+            if entry.pcm.is_empty() {
+                continue;
+            }
+            (
+                entry.utterance_start.unwrap_or_else(Instant::now),
+                entry.current_revision_seq.unwrap_or(entry.next_revision_seq),
+                entry.pcm.clone(),
+            )
+        } else {
+            continue;
+        };
+
+        if let Some(text) = transcribe_finalized_mono_pcm(state, pcm).await {
+            out.push(Utterance {
+                user_id,
+                start_ts,
+                revision_id: make_revision_id(user_id, revision_seq),
+                is_final: false,
+                text,
+            });
+        }
+    }
+
+    out
+}
+
+async fn transcribe_finalized_mono_pcm(state: &Arc<AppState>, pcm: Vec<f32>) -> Option<String> {
+    let pass1 = transcribe_mono_pcm(Arc::clone(&state.asr), pcm.clone()).await?;
+
+    if let Some(final_asr) = state.final_asr.as_ref() {
+        if let Some(pass2) = transcribe_mono_pcm(Arc::clone(final_asr), pcm).await {
+            if should_apply_refinement(&pass1, &pass2) {
+                return Some(pass2);
+            }
+        }
+    }
+
+    Some(pass1)
 }
 
 async fn ensure_thread_context_loaded(
@@ -983,6 +1008,8 @@ pub async fn format_transcript(
 
     let mut by_user = HashMap::<UserId, String>::new();
     let mut lines = Vec::with_capacity(transcript.len());
+    let first = transcript[0].start_ts;
+
     lines.push("Meeting transcript".to_string());
     lines.push(format!(
         "Started: {} UTC",
@@ -1003,18 +1030,13 @@ pub async fn format_transcript(
             name
         };
 
-        let total = utt.start_offset_ms / 1000;
+        let delta = utt.start_ts.saturating_duration_since(first);
+        let total = delta.as_secs();
         let hh = total / 3600;
         let mm = (total % 3600) / 60;
         let ss = total % 60;
-        let stage_hint = match utt.stage {
-            UtteranceStage::StreamFinal => " [stream-final]",
-            _ => "",
-        };
-        lines.push(format!(
-            "[{hh:02}:{mm:02}:{ss:02}] {display}{stage_hint}: {}",
-            utt.text
-        ));
+
+        lines.push(format!("[{hh:02}:{mm:02}:{ss:02}] {display}: {}", utt.text));
     }
 
     lines.join("\n")
