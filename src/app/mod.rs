@@ -63,9 +63,11 @@ pub struct AppState {
     pub asr: Arc<AsrEngine>,
     pub ssrc_to_user: Arc<SsrcMap>,
     pub streams: Arc<Streams>,
+    pub recovery_locks: DashMap<GuildId, Arc<tokio::sync::Mutex<()>>>,
     pub utterance_senders: SessionSenders,
     pub transcription_inflight: DashMap<GuildId, Arc<AtomicUsize>>,
     pub transcript_pending_commits: DashMap<GuildId, Arc<AtomicUsize>>,
+    pub decode_shed_total: DashMap<GuildId, Arc<AtomicUsize>>,
     pub decoded_audio_activity: DashMap<GuildId, Arc<AtomicUsize>>,
     pub decode_failure_activity: DashMap<GuildId, Arc<AtomicUsize>>,
     pub unmapped_ssrc_activity: DashMap<GuildId, Arc<AtomicUsize>>,
@@ -74,7 +76,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(cfg: AppConfig) -> anyhow::Result<Self> {
-        let asr = Arc::new(AsrEngine::new(&cfg.asr_model_dir)?);
+        let asr = Arc::new(AsrEngine::new(&cfg.asr_model_dir, cfg.asr_num_threads)?);
 
         Ok(Self {
             active_calls: DashMap::new(),
@@ -89,9 +91,11 @@ impl AppState {
             asr,
             ssrc_to_user: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),
+            recovery_locks: DashMap::new(),
             utterance_senders: DashMap::new(),
             transcription_inflight: DashMap::new(),
             transcript_pending_commits: DashMap::new(),
+            decode_shed_total: DashMap::new(),
             decoded_audio_activity: DashMap::new(),
             decode_failure_activity: DashMap::new(),
             unmapped_ssrc_activity: DashMap::new(),

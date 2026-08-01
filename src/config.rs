@@ -6,6 +6,7 @@ pub struct AppConfig {
     pub gemini_api_key: String,
     pub gemini_model: String,
     pub asr_model_dir: String,
+    pub asr_num_threads: i32,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
     pub rolling_ingest_max_ms: u64,
@@ -21,12 +22,23 @@ impl AppConfig {
         let asr_model_dir = env::var("ASR_MODEL_DIR").map_err(|_| {
             anyhow::anyhow!("missing ASR model directory: set ASR_MODEL_DIR")
         })?;
+        let detected_cores = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4)
+            .clamp(1, 8);
+        let default_asr_num_threads = if detected_cores >= 4 { 3 } else { detected_cores };
+        let asr_num_threads = env::var("ASR_NUM_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(default_asr_num_threads)
+            .clamp(1, 8);
         let live_transcript_debug = env::var("LIVE_TRANSCRIPT_DEBUG")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
         let enable_denoiser = env::var("ENABLE_DENOISER")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // Keep in-memory audio bounded for long uninterrupted speech.
         let rolling_ingest_max_ms = env::var("ROLLING_INGEST_MAX_MS")
@@ -52,6 +64,7 @@ impl AppConfig {
             gemini_api_key,
             gemini_model,
             asr_model_dir,
+            asr_num_threads,
             live_transcript_debug,
             enable_denoiser,
             rolling_ingest_max_ms,

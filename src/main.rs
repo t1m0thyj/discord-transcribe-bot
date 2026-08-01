@@ -74,7 +74,7 @@ async fn run() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(
-                    "meeting_bot=info,serenity=info,songbird=info,songbird::driver::tasks::udp_rx::ssrc_state=off,songbird::driver::tasks::udp_rx=off",
+                    "warn,transcribe_bot=info,serenity=warn,songbird=warn,songbird::driver::tasks::udp_rx=warn,songbird::driver::tasks::udp_rx::ssrc_state=warn",
                 )
             }),
         )

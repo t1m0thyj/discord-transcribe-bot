@@ -87,6 +87,11 @@ pub(super) async fn handle_status(
         .get(&guild_id)
         .map(|v| v.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let decode_shed_total = state
+        .decode_shed_total
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
     let unmapped_ssrc = state
         .unmapped_ssrc_activity
         .get(&guild_id)
@@ -120,12 +125,13 @@ pub(super) async fn handle_status(
     let ss = elapsed.as_secs() % 60;
 
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
+        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nDecode shed total: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
         voice_channel.get(),
         text_channel.get(),
         participants,
         decoded_frames,
         decode_failures,
+        decode_shed_total,
         unmapped_ssrc,
         if started_notified { "yes" } else { "no" },
         mapped_ssrc,
@@ -172,10 +178,12 @@ pub(super) async fn handle_ask(
         .context("no active call for this guild")?
         .clone();
 
-    let (snapshot, started_at) = {
+    let (mut snapshot, started_at) = {
         let session = session_lock.read().await;
         (session.transcript.clone(), session.started_at)
     };
+
+    snapshot.sort_by_key(|u| u.start_ts);
 
     if snapshot.is_empty() {
         return Ok(
@@ -224,10 +232,12 @@ pub(super) async fn handle_log(
         .context("no active call for this guild")?
         .clone();
 
-    let (snapshot, started_at) = {
+    let (mut snapshot, started_at) = {
         let session = session_lock.read().await;
         (session.transcript.clone(), session.started_at)
     };
+
+    snapshot.sort_by_key(|u| u.start_ts);
 
     if snapshot.is_empty() {
         return Ok("No transcribed utterances yet.".to_string());
@@ -516,6 +526,10 @@ pub(super) async fn start_call_session(
     state
         .transcript_pending_commits
         .insert(guild_id, Arc::clone(&pending_commits));
+    let decode_shed_total = Arc::new(AtomicUsize::new(0));
+    state
+        .decode_shed_total
+        .insert(guild_id, Arc::clone(&decode_shed_total));
     let decode_activity = Arc::new(AtomicUsize::new(0));
     state
         .decoded_audio_activity
@@ -542,6 +556,9 @@ pub(super) async fn start_call_session(
         started_mono: Instant::now(),
     }));
     state.active_calls.insert(guild_id, session.clone());
+    state
+        .recovery_locks
+        .insert(guild_id, Arc::new(tokio::sync::Mutex::new(())));
 
     tokio::spawn(transcript_writer_loop(
         session,
@@ -561,6 +578,7 @@ pub(super) async fn start_call_session(
             utterance_tx,
             inflight,
             pending_commits,
+            decode_shed_total,
             decode_activity,
             decode_failure_activity,
             unmapped_ssrc_activity,

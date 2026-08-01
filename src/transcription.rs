@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -20,7 +20,6 @@ use sherpa_onnx::{
     OfflineZipformerCtcModelConfig,
 };
 use tokio::sync::{mpsc, RwLock};
-use tokio::sync::Semaphore;
 use serde::Serialize;
 
 use crate::app::{CallSession, Utterance};
@@ -32,9 +31,6 @@ const EARSHOT_FRAME_SIZE: usize = 256;
 const EARSHOT_VAD_THRESHOLD: f32 = 0.5;
 const VAD_HANGOVER_FRAMES: u8 = 16;
 const VAD_PREROLL_SAMPLES_16K: usize = 4_800;
-const AGC_TARGET_RMS: f32 = 0.06;
-const AGC_MIN_GAIN: f32 = 0.6;
-const AGC_MAX_GAIN: f32 = 3.0;
 const DENOISER_BYPASS_SNR_DB: f32 = 18.0;
 const DENOISER_BYPASS_HYSTERESIS_DB: f32 = 3.0;
 const HIGHPASS_ALPHA_48K: f32 = 0.991;
@@ -90,7 +86,7 @@ impl ForcedFamily {
 }
 
 impl AsrEngine {
-    pub fn new(model_dir: &str) -> anyhow::Result<Self> {
+    pub fn new(model_dir: &str, asr_num_threads: i32) -> anyhow::Result<Self> {
         let model_base = resolve_model_dir(model_dir)?;
         let mut cfg = OfflineRecognizerConfig::default();
 
@@ -113,10 +109,7 @@ impl AsrEngine {
             );
         };
 
-        cfg.model_config.num_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4)
-            .clamp(1, 8);
+        cfg.model_config.num_threads = asr_num_threads.clamp(1, 8);
 
         let recognizer = OfflineRecognizer::create(&cfg).ok_or_else(|| {
             anyhow::anyhow!(
@@ -127,10 +120,17 @@ impl AsrEngine {
         })?;
 
         tracing::info!(
-            "ASR backend selected: {} (ASR_MODEL_DIR={})",
+            "ASR backend selected: {} (ASR_MODEL_DIR={}, ASR_NUM_THREADS={})",
             selected_backend,
-            model_base.display()
+            model_base.display(),
+            cfg.model_config.num_threads
         );
+
+        if selected_backend.contains("whisper") {
+            tracing::warn!(
+                "Whisper backend selected: offline decode cost is effectively fixed by padded context; short conversational turns may incur high latency/backlog."
+            );
+        }
 
         Ok(Self { recognizer: Arc::new(recognizer) })
     }
@@ -424,7 +424,6 @@ pub struct UserDenoiseState {
     pending: Vec<f32>,
     vad_pending_16k: Vec<f32>,
     warmed_up: bool,
-    agc_gain: f32,
     hp_prev_x: f32,
     hp_prev_y: f32,
     noise_rms_ema: f32,
@@ -454,7 +453,6 @@ impl UserDenoiseState {
             pending: Vec::new(),
             vad_pending_16k: Vec::new(),
             warmed_up: false,
-            agc_gain: 1.0,
             hp_prev_x: 0.0,
             hp_prev_y: 0.0,
             noise_rms_ema: 0.002,
@@ -487,16 +485,13 @@ impl UserDenoiseState {
         let rms = compute_rms(&mono);
         self.update_noise_and_snr(rms);
         let use_denoiser = self.select_denoiser_mode(enable_denoiser);
-        let mut cleaned_48k = if use_denoiser {
+        let cleaned_48k = if use_denoiser {
             self.push_mono_pcm(&mono)
         } else {
             let mut passthrough = self.drain_pending_passthrough();
             passthrough.extend_from_slice(&mono);
             passthrough
         };
-
-        let cleaned_rms = compute_rms(&cleaned_48k);
-        self.apply_agc(&mut cleaned_48k, cleaned_rms);
 
         let pcm_16k = self.resample_48k_to_16k_stream(&cleaned_48k);
         let was_speech_last_tick = self.was_speech_last_tick;
@@ -531,7 +526,8 @@ impl UserDenoiseState {
             self.rnnoise_frame_buf
                 .copy_from_slice(&self.pending[..RNNOISE_FRAME_SIZE]);
             self.pending.drain(..RNNOISE_FRAME_SIZE);
-            out.extend(self.denoise_frame(&self.rnnoise_frame_buf));
+            let frame = self.rnnoise_frame_buf.clone();
+            out.extend(self.denoise_frame(&frame));
         }
 
         out
@@ -546,6 +542,10 @@ impl UserDenoiseState {
         frame.resize(RNNOISE_FRAME_SIZE, 0.0);
         let cleaned = self.denoise_frame(&frame);
         self.resample_48k_to_16k_stream(&cleaned)
+    }
+
+    pub fn noise_rms_ema(&self) -> f32 {
+        self.noise_rms_ema
     }
 
     fn drain_pending_passthrough(&mut self) -> Vec<f32> {
@@ -613,23 +613,6 @@ impl UserDenoiseState {
                 self.preroll_16k.pop_front();
             }
             self.preroll_16k.push_back(*sample);
-        }
-    }
-
-    fn apply_agc(&mut self, samples: &mut [f32], rms: f32) {
-        if !self.was_speech_last_tick {
-            for sample in samples {
-                *sample = (*sample * self.agc_gain).clamp(-0.98, 0.98);
-            }
-            return;
-        }
-
-        let desired_gain = (AGC_TARGET_RMS / rms.max(1e-4)).clamp(AGC_MIN_GAIN, AGC_MAX_GAIN);
-        let smoothing = if desired_gain < self.agc_gain { 0.35 } else { 0.02 };
-        self.agc_gain = self.agc_gain * (1.0 - smoothing) + desired_gain * smoothing;
-
-        for sample in samples {
-            *sample = (*sample * self.agc_gain).clamp(-0.98, 0.98);
         }
     }
 
@@ -712,6 +695,7 @@ impl Default for UserDenoiseState {
 pub struct UserAudioBuffer {
     pub pcm: Vec<f32>,
     pub silent_ticks: u32,
+    pub voiced_ticks: u32,
     pub utterance_start: Option<Instant>,
 }
 
@@ -749,21 +733,14 @@ pub async fn transcribe_mono_pcm(
         return None;
     }
 
-    let wait_started = Instant::now();
-    // Bound concurrent ASR decode work to keep CPU usage stable on small devices.
-    let permit = asr_decode_semaphore().acquire_owned().await.ok()?;
-    let semaphore_wait_ms = wait_started.elapsed().as_millis() as u64;
-
     let decode_started = Instant::now();
     let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
         .await
         .ok()?;
     let decode_ms = decode_started.elapsed().as_millis() as u64;
-    drop(permit);
 
     tracing::debug!(
         samples = sample_count,
-        semaphore_wait_ms,
         decode_ms,
         "asr decode completed"
     );
@@ -775,11 +752,6 @@ pub async fn transcribe_mono_pcm(
     }
 }
 
-fn asr_decode_semaphore() -> Arc<Semaphore> {
-    static ASR_DECODE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(ASR_DECODE_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
-}
-
 fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -787,43 +759,6 @@ fn compute_rms(samples: &[f32]) -> f32 {
 
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
-}
-
-fn trim_overlap_from_previous_final(transcript: &[Utterance], utterance: &mut Utterance) {
-    let Some(prev) = transcript
-        .iter()
-        .rev()
-        .find(|u| u.user_id == utterance.user_id && u.start_ts <= utterance.start_ts)
-    else {
-        return;
-    };
-
-    let prev_words: Vec<&str> = prev.text.split_whitespace().collect();
-    let curr_words: Vec<&str> = utterance.text.split_whitespace().collect();
-    if prev_words.is_empty() || curr_words.is_empty() {
-        return;
-    }
-
-    let max_overlap = prev_words.len().min(curr_words.len()).min(24);
-    let mut overlap = 0usize;
-    for k in (4..=max_overlap).rev() {
-        let prev_tail = &prev_words[prev_words.len() - k..];
-        let curr_head = &curr_words[..k];
-        if prev_tail
-            .iter()
-            .zip(curr_head.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
-            overlap = k;
-            break;
-        }
-    }
-
-    if overlap == 0 || overlap >= curr_words.len() {
-        return;
-    }
-
-    utterance.text = curr_words[overlap..].join(" ");
 }
 
 pub type Streams = DashMap<(GuildId, UserId), UserStreamState>;
@@ -890,11 +825,9 @@ pub async fn transcript_writer_loop(
         session: &Arc<RwLock<CallSession>>,
         pending_commits: &Arc<AtomicUsize>,
         transcript_jsonl_path: &Path,
-        mut utterance: Utterance,
+        utterance: Utterance,
     ) {
         let mut lock = session.write().await;
-
-        trim_overlap_from_previous_final(&lock.transcript, &mut utterance);
 
         let start_offset_ms = utterance
             .start_ts

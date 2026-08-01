@@ -14,10 +14,10 @@ use serenity::all::{
 use serde::Deserialize;
 use serenity::prelude::Context;
 use songbird::events::{CoreEvent, Event};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 use super::{
-    AppState, CallSession, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT,
+    AppState, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT,
     STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS, STARTUP_RECEIVE_WATCHDOG_DELAY,
     STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
 };
@@ -33,6 +33,7 @@ pub struct VoiceHandlerAttachContext {
     pub utterance_tx: mpsc::Sender<Utterance>,
     pub inflight: Arc<AtomicUsize>,
     pub pending_commits: Arc<AtomicUsize>,
+    pub decode_shed_total: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
     pub decode_failure_activity: Arc<AtomicUsize>,
     pub unmapped_ssrc_activity: Arc<AtomicUsize>,
@@ -48,7 +49,7 @@ pub async fn finalize_call_for_guild(
         return Ok(());
     };
 
-    settle_and_flush_guild_audio(state, guild_id, &session_lock).await;
+    settle_and_flush_guild_audio(state, guild_id).await;
     wait_for_transcription_drain(state, guild_id).await;
     wait_for_transcript_commit_drain(state, guild_id).await;
 
@@ -78,20 +79,17 @@ pub async fn finalize_call_for_guild(
         state.streams.remove(&key);
     }
 
-    settle_and_flush_guild_audio(state, guild_id, &session_lock).await;
+    settle_and_flush_guild_audio(state, guild_id).await;
     wait_for_transcription_drain(state, guild_id).await;
     wait_for_transcript_commit_drain(state, guild_id).await;
 
     state.utterance_senders.remove(&guild_id);
 
     let session = session_lock.read().await;
-    let mut transcript = load_persisted_transcript(
+    let transcript = load_persisted_transcript(
         &session.transcript_jsonl_path,
         session.started_mono,
     );
-    if transcript.is_empty() {
-        transcript = session.transcript.clone();
-    }
 
     let transcript_text = format_transcript(ctx, &transcript, session.started_at).await;
     let filename = format!(
@@ -148,6 +146,8 @@ pub async fn finalize_call_for_guild(
 
     state.transcription_inflight.remove(&guild_id);
     state.transcript_pending_commits.remove(&guild_id);
+    state.decode_shed_total.remove(&guild_id);
+    state.recovery_locks.remove(&guild_id);
     state.decoded_audio_activity.remove(&guild_id);
     state.decode_failure_activity.remove(&guild_id);
     state.unmapped_ssrc_activity.remove(&guild_id);
@@ -195,6 +195,7 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
         utterance_tx,
         inflight,
         pending_commits,
+        decode_shed_total,
         decode_activity,
         decode_failure_activity,
         unmapped_ssrc_activity,
@@ -230,6 +231,7 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
             utterance_tx,
             transcription_inflight: inflight,
             transcript_pending_commits: pending_commits,
+            decode_shed_total,
             decode_activity,
             decode_failure_activity,
             unmapped_ssrc_activity,
@@ -358,6 +360,22 @@ pub async fn startup_receive_watchdog(
         unmapped_ssrc,
         "decode/mapping failures observed without usable audio after join; reinitializing voice receive"
     );
+
+    let recovery_lock = if let Some(lock) = state.recovery_locks.get(&guild_id) {
+        Arc::clone(lock.value())
+    } else {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        state.recovery_locks.insert(guild_id, Arc::clone(&lock));
+        lock
+    };
+    let Ok(_recovery_guard) = recovery_lock.try_lock() else {
+        tracing::debug!(
+            guild = %guild_id,
+            attempt,
+            "startup recovery skipped: another recovery attempt is already in progress"
+        );
+        return;
+    };
 
     let _ = text_channel
         .say(
@@ -493,6 +511,19 @@ pub async fn startup_receive_watchdog(
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
     };
+    let Some(decode_shed_total) = state
+        .decode_shed_total
+        .get(&guild_id)
+        .map(|v| Arc::clone(v.value()))
+    else {
+        tracing::warn!(
+            guild = %guild_id,
+            attempt,
+            "startup recovery retrying: missing decode shed counter state"
+        );
+        schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
+        return;
+    };
     let Some(started_notified) = state
         .transcription_started_notified
         .get(&guild_id)
@@ -521,6 +552,7 @@ pub async fn startup_receive_watchdog(
             utterance_tx,
             inflight,
             pending_commits,
+            decode_shed_total,
             decode_activity,
             decode_failure_activity,
             unmapped_ssrc_activity,
@@ -638,15 +670,13 @@ pub async fn steady_state_receive_watchdog(
 async fn settle_and_flush_guild_audio(
     state: &Arc<AppState>,
     guild_id: GuildId,
-    session_lock: &Arc<RwLock<CallSession>>,
 ) {
     for _ in 0..FINALIZE_SETTLE_PASSES {
         let _ = wait_for_capture_quiesce_with_timeout(state, guild_id, FINALIZE_SETTLE_TIMEOUT).await;
 
         let pending = flush_pending_buffers_for_export(state, guild_id).await;
         if !pending.is_empty() {
-            let mut session = session_lock.write().await;
-            merge_utterances(&mut session.transcript, pending);
+            commit_flushed_utterances(state, guild_id, pending).await;
         }
 
         let inflight = state
@@ -749,9 +779,44 @@ async fn wait_for_transcript_commit_drain(state: &Arc<AppState>, guild_id: Guild
     }
 }
 
-pub(super) fn merge_utterances(transcript: &mut Vec<Utterance>, incoming: Vec<Utterance>) {
-    transcript.extend(incoming);
-    transcript.sort_by_key(|u| u.start_ts);
+async fn commit_flushed_utterances(state: &Arc<AppState>, guild_id: GuildId, pending: Vec<Utterance>) {
+    let Some(tx) = state
+        .utterance_senders
+        .get(&guild_id)
+        .map(|v| v.value().clone())
+    else {
+        tracing::warn!(
+            guild = %guild_id,
+            flushed = pending.len(),
+            "missing utterance sender; dropped flushed tail utterances during finalize"
+        );
+        return;
+    };
+
+    let Some(pending_commits) = state
+        .transcript_pending_commits
+        .get(&guild_id)
+        .map(|v| Arc::clone(v.value()))
+    else {
+        tracing::warn!(
+            guild = %guild_id,
+            flushed = pending.len(),
+            "missing pending commits counter; dropped flushed tail utterances during finalize"
+        );
+        return;
+    };
+
+    for utterance in pending {
+        pending_commits.fetch_add(1, Ordering::SeqCst);
+        if tx.send(utterance).await.is_err() {
+            pending_commits.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(
+                guild = %guild_id,
+                "failed to enqueue flushed tail utterance for journal commit"
+            );
+            break;
+        }
+    }
 }
 
 pub(super) async fn flush_pending_buffers_for_export(

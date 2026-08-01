@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,7 @@ pub struct VoiceTickHandler {
     pub utterance_tx: mpsc::Sender<Utterance>,
     pub transcription_inflight: Arc<AtomicUsize>,
     pub transcript_pending_commits: Arc<AtomicUsize>,
+    pub decode_shed_total: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
     pub decode_failure_activity: Arc<AtomicUsize>,
     pub unmapped_ssrc_activity: Arc<AtomicUsize>,
@@ -83,6 +85,187 @@ pub struct VoiceTickHandler {
     pub live_transcript_debug: bool,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
+}
+
+const DECODE_QUEUE_CAPACITY: usize = 8;
+
+struct DecodeJob {
+    guild_id: GuildId,
+    user_id: UserId,
+    start_ts: Instant,
+    stage: &'static str,
+    pcm: Vec<f32>,
+    sample_count: usize,
+    asr: Arc<AsrEngine>,
+    utterance_tx: mpsc::Sender<Utterance>,
+    inflight: Arc<AtomicUsize>,
+    pending_commits: Arc<AtomicUsize>,
+    decode_shed_total: Arc<AtomicUsize>,
+    live_transcript_debug: bool,
+}
+
+struct DecodeDispatcher {
+    queue: Mutex<VecDeque<DecodeJob>>,
+    notify: tokio::sync::Notify,
+    capacity: usize,
+}
+
+impl DecodeDispatcher {
+    fn global() -> Arc<Self> {
+        static INSTANCE: OnceLock<Arc<DecodeDispatcher>> = OnceLock::new();
+        Arc::clone(INSTANCE.get_or_init(|| {
+            let dispatcher = Arc::new(DecodeDispatcher {
+                queue: Mutex::new(VecDeque::new()),
+                notify: tokio::sync::Notify::new(),
+                capacity: DECODE_QUEUE_CAPACITY,
+            });
+            spawn_decode_worker(Arc::clone(&dispatcher));
+            dispatcher
+        }))
+    }
+
+    fn enqueue(&self, job: DecodeJob) -> Option<DecodeJob> {
+        let mut queue = self
+            .queue
+            .lock()
+            .expect("decode queue mutex poisoned");
+        let dropped = if queue.len() >= self.capacity {
+            queue.pop_front()
+        } else {
+            None
+        };
+        queue.push_back(job);
+        drop(queue);
+        self.notify.notify_one();
+        dropped
+    }
+}
+
+fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
+    tokio::spawn(async move {
+        loop {
+            let job = loop {
+                if let Some(job) = dispatcher
+                    .queue
+                    .lock()
+                    .expect("decode queue mutex poisoned")
+                    .pop_front()
+                {
+                    break job;
+                }
+
+                dispatcher.notify.notified().await;
+            };
+
+            process_decode_job(job).await;
+        }
+    });
+}
+
+async fn process_decode_job(job: DecodeJob) {
+    if let Some(text) = transcribe_utterance_blocking(&job.asr, job.pcm).await {
+        let audio_secs = (job.sample_count as f32 / 16_000.0).max(0.001);
+        if let Some(reason) = decode_rejection_reason(&text, audio_secs) {
+            tracing::warn!(
+                guild = %job.guild_id,
+                user = %job.user_id,
+                stage = job.stage,
+                reason,
+                transcript = %text,
+                "rejected decoded utterance"
+            );
+            job.inflight.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+
+        if job.live_transcript_debug {
+            tracing::debug!(
+                user = %job.user_id,
+                transcript = %text,
+                stage = job.stage,
+                "final transcription"
+            );
+        }
+
+        job.pending_commits.fetch_add(1, Ordering::SeqCst);
+        if job
+            .utterance_tx
+            .send(Utterance {
+                user_id: job.user_id,
+                start_ts: job.start_ts,
+                text,
+            })
+            .await
+            .is_err()
+        {
+            job.pending_commits.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    job.inflight.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn queue_decode_job(job: DecodeJob) {
+    let dispatcher = DecodeDispatcher::global();
+    if let Some(dropped) = dispatcher.enqueue(job) {
+        dropped.decode_shed_total.fetch_add(1, Ordering::SeqCst);
+        dropped.inflight.fetch_sub(1, Ordering::SeqCst);
+        tracing::warn!(
+            guild = %dropped.guild_id,
+            user = %dropped.user_id,
+            "decode queue full; dropped oldest queued chunk"
+        );
+    }
+}
+
+fn should_dispatch_chunk(pcm: &[f32], voiced_ticks: u32, noise_rms_ema: f32) -> bool {
+    if voiced_ticks < 12 {
+        return false;
+    }
+
+    let rms = compute_rms(pcm);
+    let floor = (noise_rms_ema * 1.4).max(0.0025);
+    rms >= floor
+}
+
+fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+fn decode_rejection_reason(text: &str, audio_secs: f32) -> Option<&'static str> {
+    let normalized = text
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
+        .collect::<String>();
+
+    const HALLUCINATION_BLOCKLIST: &[&str] = &[
+        "thank you",
+        "thanks for watching",
+        "thank you for watching",
+        "subtitles by",
+        "captions by",
+    ];
+
+    if HALLUCINATION_BLOCKLIST
+        .iter()
+        .any(|phrase| normalized == *phrase)
+    {
+        return Some("blocklist");
+    }
+
+    let chars_per_second = text.chars().count() as f32 / audio_secs;
+    if chars_per_second > 25.0 {
+        return Some("implausible_char_rate");
+    }
+
+    None
 }
 
 #[serenity::async_trait]
@@ -128,33 +311,46 @@ impl VoiceEventHandler for VoiceTickHandler {
             if processed.speech_active {
                 currently_speaking.insert(user_id);
             }
-            if !processed.speech_active || processed.pcm_16k.is_empty() {
+            if processed.pcm_16k.is_empty() {
                 continue;
             }
 
-            if self
-                .started_notified
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                let http = Arc::clone(&self.http);
-                let text_channel = self.text_channel;
-                let voice_channel = self.voice_channel;
-                tokio::spawn(async move {
-                    let _ = text_channel
-                        .say(&http, format!("Started transcribing in <#{}>.", voice_channel.get()))
-                        .await;
-                });
+            if stream.buffer.utterance_start.is_none() && !processed.speech_active {
+                continue;
+            }
+
+            if processed.speech_active {
+                if self
+                    .started_notified
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let http = Arc::clone(&self.http);
+                    let text_channel = self.text_channel;
+                    let voice_channel = self.voice_channel;
+                    tokio::spawn(async move {
+                        let _ = text_channel
+                            .say(&http, format!("Started transcribing in <#{}>.", voice_channel.get()))
+                            .await;
+                    });
+                }
             }
 
             let cleaned = processed.pcm_16k;
+            let noise_rms_ema = stream.denoiser.noise_rms_ema();
 
             let entry = &mut stream.buffer;
             if entry.utterance_start.is_none() {
                 entry.utterance_start = Some(Instant::now());
             }
-            entry.silent_ticks = 0;
+            if processed.speech_active {
+                entry.silent_ticks = 0;
+            }
             entry.pcm.extend_from_slice(&cleaned);
+
+            if processed.speech_active {
+                entry.voiced_ticks = entry.voiced_ticks.saturating_add(1);
+            }
 
             let mut maybe_rollover_final = None;
             if entry.pcm.len() >= max_ingest_samples {
@@ -169,9 +365,16 @@ impl VoiceEventHandler for VoiceTickHandler {
                 );
                 if split_at >= 1_600 {
                     let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
+                    let source_len = entry.pcm.len();
 
                     let tail = entry.pcm.split_off(split_at);
                     let chunk = std::mem::replace(&mut entry.pcm, tail);
+                    let chunk_voiced = if source_len == 0 {
+                        0
+                    } else {
+                        ((entry.voiced_ticks as u64 * split_at as u64) / source_len as u64) as u32
+                    };
+                    entry.voiced_ticks = entry.voiced_ticks.saturating_sub(chunk_voiced);
 
                     entry.utterance_start = Some(
                         Instant::now()
@@ -179,7 +382,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                             .unwrap_or_else(Instant::now),
                     );
 
-                    maybe_rollover_final = Some((start_ts, chunk));
+                    maybe_rollover_final = Some((start_ts, chunk, chunk_voiced, noise_rms_ema));
                 }
             }
 
@@ -191,47 +394,25 @@ impl VoiceEventHandler for VoiceTickHandler {
                 "processed 16k pcm tick"
             );
 
-            if let Some((start_ts, pcm)) = maybe_rollover_final {
-                let tx = self.utterance_tx.clone();
-                let asr = Arc::clone(&self.asr);
-                let inflight = Arc::clone(&self.transcription_inflight);
-                let pending_commits = Arc::clone(&self.transcript_pending_commits);
-                let live_transcript_debug = self.live_transcript_debug;
+            if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_rollover_final {
+                if !should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
+                    continue;
+                }
                 self.transcription_inflight.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    struct InflightTaskGuard {
-                        counter: Arc<AtomicUsize>,
-                    }
-                    impl Drop for InflightTaskGuard {
-                        fn drop(&mut self) {
-                            self.counter.fetch_sub(1, Ordering::SeqCst);
-                        }
-                    }
-
-                    let _guard = InflightTaskGuard { counter: inflight };
-
-                    if let Some(text) = transcribe_utterance_blocking(&asr, pcm).await {
-                        if live_transcript_debug {
-                            tracing::debug!(
-                                user = %user_id,
-                                transcript = %text,
-                                "final transcription stage=rollover"
-                            );
-                        }
-                        pending_commits.fetch_add(1, Ordering::SeqCst);
-                        if tx
-                            .send(Utterance {
-                                user_id,
-                                start_ts,
-                                text,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            pending_commits.fetch_sub(1, Ordering::SeqCst);
-                            return;
-                        }
-                    }
+                let sample_count = pcm.len();
+                queue_decode_job(DecodeJob {
+                    guild_id: self.guild_id,
+                    user_id,
+                    start_ts,
+                    stage: "rollover",
+                    pcm,
+                    sample_count,
+                    asr: Arc::clone(&self.asr),
+                    utterance_tx: self.utterance_tx.clone(),
+                    inflight: Arc::clone(&self.transcription_inflight),
+                    pending_commits: Arc::clone(&self.transcript_pending_commits),
+                    decode_shed_total: Arc::clone(&self.decode_shed_total),
+                    live_transcript_debug: self.live_transcript_debug,
                 });
             }
         }
@@ -269,50 +450,31 @@ impl VoiceEventHandler for VoiceTickHandler {
                 entry.pcm.extend(flushed);
                 let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
                 let pcm = std::mem::take(&mut entry.pcm);
+                let voiced_ticks = std::mem::take(&mut entry.voiced_ticks);
                 entry.silent_ticks = 0;
-                maybe_job = Some((start_ts, pcm));
+                let noise_rms_ema = stream.denoiser.noise_rms_ema();
+                maybe_job = Some((start_ts, pcm, voiced_ticks, noise_rms_ema));
             }
 
-            if let Some((start_ts, pcm)) = maybe_job {
-                let tx = self.utterance_tx.clone();
-                let asr = Arc::clone(&self.asr);
-                let inflight = Arc::clone(&self.transcription_inflight);
-                let pending_commits = Arc::clone(&self.transcript_pending_commits);
-                let live_transcript_debug = self.live_transcript_debug;
+            if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_job {
+                if !should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
+                    continue;
+                }
                 self.transcription_inflight.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    struct InflightTaskGuard {
-                        counter: Arc<AtomicUsize>,
-                    }
-                    impl Drop for InflightTaskGuard {
-                        fn drop(&mut self) {
-                            self.counter.fetch_sub(1, Ordering::SeqCst);
-                        }
-                    }
-
-                    let _guard = InflightTaskGuard { counter: inflight };
-
-                    if let Some(text) = transcribe_utterance_blocking(&asr, pcm).await {
-                        if live_transcript_debug {
-                            tracing::debug!(
-                                user = %user_id,
-                                transcript = %text,
-                                "final transcription stage=silence"
-                            );
-                        }
-                        pending_commits.fetch_add(1, Ordering::SeqCst);
-                        if tx
-                            .send(Utterance {
-                                user_id,
-                                start_ts,
-                                text,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            pending_commits.fetch_sub(1, Ordering::SeqCst);
-                        }
-                    }
+                let sample_count = pcm.len();
+                queue_decode_job(DecodeJob {
+                    guild_id: self.guild_id,
+                    user_id,
+                    start_ts,
+                    stage: "silence",
+                    pcm,
+                    sample_count,
+                    asr: Arc::clone(&self.asr),
+                    utterance_tx: self.utterance_tx.clone(),
+                    inflight: Arc::clone(&self.transcription_inflight),
+                    pending_commits: Arc::clone(&self.transcript_pending_commits),
+                    decode_shed_total: Arc::clone(&self.decode_shed_total),
+                    live_transcript_debug: self.live_transcript_debug,
                 });
             }
         }
