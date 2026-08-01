@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use dashmap::DashMap;
@@ -24,15 +24,74 @@ use serde::Serialize;
 
 use crate::app::{CallSession, Utterance};
 
-pub const REORDER_WINDOW: Duration = Duration::from_millis(1500);
 pub const RNNOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 const EARSHOT_FRAME_SIZE: usize = 256;
 const EARSHOT_VAD_THRESHOLD: f32 = 0.5;
 const VAD_HANGOVER_FRAMES: u8 = 16;
+const VAD_HANGOVER_MS: u32 = 256;
 const VAD_PREROLL_SAMPLES_16K: usize = 4_800;
+const DISPATCH_GATE_MIN_VOICED_TICKS: u32 = 8;
+const FINALIZE_TAIL_KEEP_MS: u32 = 200;
 const DENOISER_BYPASS_SNR_DB: f32 = 18.0;
 const DENOISER_BYPASS_HYSTERESIS_DB: f32 = 3.0;
 const HIGHPASS_ALPHA_48K: f32 = 0.991;
+
+pub struct DispatchGateRejection {
+    pub reason: &'static str,
+    pub voiced_ticks: u32,
+    pub rms: f32,
+    pub floor: f32,
+}
+
+pub fn should_dispatch_chunk(
+    pcm: &[f32],
+    voiced_ticks: u32,
+    noise_rms_ema: f32,
+) -> Result<(), DispatchGateRejection> {
+    let rms = compute_rms(pcm);
+    let floor = (noise_rms_ema * 1.4).max(0.0025);
+
+    if voiced_ticks < DISPATCH_GATE_MIN_VOICED_TICKS {
+        return Err(DispatchGateRejection {
+            reason: "insufficient_voiced_ticks",
+            voiced_ticks,
+            rms,
+            floor,
+        });
+    }
+
+    if rms < floor {
+        return Err(DispatchGateRejection {
+            reason: "below_noise_floor",
+            voiced_ticks,
+            rms,
+            floor,
+        });
+    }
+
+    Ok(())
+}
+
+pub fn trim_finalize_tail(pcm: &mut Vec<f32>, silence_ticks: u32) {
+    // On explicit export/finalize, silence_ticks can be 0 while speech is still active.
+    // In that case we skip trimming to avoid clipping live speech tails.
+    if silence_ticks == 0 {
+        return;
+    }
+
+    let estimated_tail_ms = silence_ticks
+        .saturating_mul(20)
+        .saturating_add(VAD_HANGOVER_MS);
+    let trim_ms = estimated_tail_ms.saturating_sub(FINALIZE_TAIL_KEEP_MS);
+    let trim_samples = trim_ms as usize * 16;
+    let min_samples_to_keep: usize = 1_600;
+
+    if trim_samples == 0 || pcm.len() <= min_samples_to_keep.saturating_add(trim_samples) {
+        return;
+    }
+
+    pcm.truncate(pcm.len().saturating_sub(trim_samples));
+}
 
 pub struct AsrEngine {
     recognizer: Arc<OfflineRecognizer>,
@@ -434,7 +493,6 @@ pub struct UserDenoiseState {
     vad_hangover_frames: u8,
     was_speech_last_tick: bool,
     denoiser_active: bool,
-    rnnoise_frame_buf: Vec<f32>,
     vad_frame_buf: Vec<f32>,
     resample_in_buf: Vec<f32>,
     resample_out_buf: Vec<f32>,
@@ -465,7 +523,6 @@ impl UserDenoiseState {
             vad_hangover_frames: 0,
             was_speech_last_tick: false,
             denoiser_active: true,
-            rnnoise_frame_buf: vec![0.0; RNNOISE_FRAME_SIZE],
             vad_frame_buf: vec![0.0; EARSHOT_FRAME_SIZE],
             resample_in_buf: Vec::new(),
             resample_out_buf: Vec::new(),
@@ -524,10 +581,7 @@ impl UserDenoiseState {
         let mut out = Vec::new();
 
         while self.pending.len() >= RNNOISE_FRAME_SIZE {
-            self.rnnoise_frame_buf
-                .copy_from_slice(&self.pending[..RNNOISE_FRAME_SIZE]);
-            self.pending.drain(..RNNOISE_FRAME_SIZE);
-            let frame = self.rnnoise_frame_buf.clone();
+            let frame: Vec<f32> = self.pending.drain(..RNNOISE_FRAME_SIZE).collect();
             out.extend(self.denoise_frame(&frame));
         }
 
@@ -751,20 +805,62 @@ pub async fn transcribe_mono_pcm(
         "asr decode completed"
     );
 
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return None;
     }
+
+    let audio_secs = (sample_count as f32 / 16_000.0).max(0.001);
+    if let Some(reason) = decode_rejection_reason(&text, audio_secs) {
+        tracing::warn!(
+            reason,
+            samples = sample_count,
+            "rejected decoded utterance"
+        );
+        return None;
+    }
+
+    Some(text)
 }
 
-fn compute_rms(samples: &[f32]) -> f32 {
+pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
 
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
+}
+
+fn decode_rejection_reason(text: &str, audio_secs: f32) -> Option<&'static str> {
+    let normalized = text
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
+        .collect::<String>();
+
+    const HALLUCINATION_BLOCKLIST: &[&str] = &[
+        "thank you",
+        "thanks for watching",
+        "thank you for watching",
+        "subtitles by",
+        "captions by",
+    ];
+
+    if HALLUCINATION_BLOCKLIST
+        .iter()
+        .any(|phrase| normalized == *phrase)
+    {
+        return Some("blocklist");
+    }
+
+    let chars_per_second = text.chars().count() as f32 / audio_secs;
+    if chars_per_second > 25.0 {
+        return Some("implausible_char_rate");
+    }
+
+    None
 }
 
 pub type Streams = DashMap<(GuildId, UserId), UserStreamState>;
@@ -775,41 +871,6 @@ pub async fn transcript_writer_loop(
     pending_commits: Arc<AtomicUsize>,
     transcript_jsonl_path: PathBuf,
 ) {
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
-
-    #[derive(Clone)]
-    struct HeapItem {
-        start_ts: Instant,
-        seq: u64,
-        utterance: Utterance,
-    }
-
-    impl Eq for HeapItem {}
-    impl PartialEq for HeapItem {
-        fn eq(&self, other: &Self) -> bool {
-            self.start_ts == other.start_ts && self.seq == other.seq
-        }
-    }
-    impl Ord for HeapItem {
-        fn cmp(&self, other: &Self) -> Ordering {
-            match self.start_ts.cmp(&other.start_ts) {
-                Ordering::Equal => self.seq.cmp(&other.seq),
-                o => o,
-            }
-            .reverse()
-        }
-    }
-    impl PartialOrd for HeapItem {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    let mut heap = BinaryHeap::new();
-    let mut seq = 0u64;
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-
     #[derive(Serialize)]
     struct PersistedUtterance {
         user_id: u64,
@@ -858,48 +919,15 @@ pub async fn transcript_writer_loop(
         pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
     }
 
-    loop {
-        tokio::select! {
-            maybe_u = rx.recv() => {
-                match maybe_u {
-                    Some(u) => {
-                        heap.push(HeapItem { start_ts: u.start_ts, seq, utterance: u });
-                        seq = seq.wrapping_add(1);
-                    }
-                    None => break,
-                }
-            }
-            _ = tick.tick() => {}
-        }
-
-        let watermark = Instant::now() - REORDER_WINDOW;
-        while let Some(top) = heap.peek() {
-            if top.start_ts > watermark {
-                break;
-            }
-
-            if let Some(item) = heap.pop() {
-                append_utterance(
-                    &session,
-                    &pending_commits,
-                    &transcript_jsonl_path,
-                    item.utterance,
-                )
-                    .await;
-            }
-        }
-    }
-
-    while let Some(item) = heap.pop() {
+    while let Some(item) = rx.recv().await {
         append_utterance(
             &session,
             &pending_commits,
             &transcript_jsonl_path,
-            item.utterance,
+            item,
         )
         .await;
     }
 }
 
 pub type SsrcMap = DashMap<(GuildId, u32), UserId>;
-pub type SessionSenders = DashMap<GuildId, mpsc::Sender<Utterance>>;

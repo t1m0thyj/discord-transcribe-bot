@@ -9,12 +9,13 @@ use serenity::all::{
     EditInteractionResponse, GuildId, Message, UserId,
 };
 use serenity::prelude::Context;
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
 use crate::config::AppConfig;
 use crate::gemini::ask_gemini;
 use crate::transcription::{
-    AsrEngine, SessionSenders, SsrcMap, Streams,
+    AsrEngine, SsrcMap, Streams,
 };
 
 mod commands;
@@ -52,6 +53,20 @@ pub struct ThreadContext {
     pub history: Vec<(String, String)>,
 }
 
+pub struct GuildRuntime {
+    pub utterance_tx: mpsc::Sender<Utterance>,
+    pub transcription_inflight: Arc<AtomicUsize>,
+    pub transcript_pending_commits: Arc<AtomicUsize>,
+    pub decode_shed_total: Arc<AtomicUsize>,
+    pub dispatch_gate_total: Arc<AtomicUsize>,
+    pub resample_error_total: Arc<AtomicUsize>,
+    pub decoded_audio_activity: Arc<AtomicUsize>,
+    pub decode_failure_activity: Arc<AtomicUsize>,
+    pub unmapped_ssrc_activity: Arc<AtomicUsize>,
+    pub transcription_started_notified: Arc<AtomicBool>,
+    pub recovery_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
 pub struct AppState {
     pub active_calls: DashMap<GuildId, Arc<RwLock<CallSession>>>,
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
@@ -67,16 +82,7 @@ pub struct AppState {
     pub asr: Arc<AsrEngine>,
     pub ssrc_to_user: Arc<SsrcMap>,
     pub streams: Arc<Streams>,
-    pub recovery_locks: DashMap<GuildId, Arc<tokio::sync::Mutex<()>>>,
-    pub utterance_senders: SessionSenders,
-    pub transcription_inflight: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub transcript_pending_commits: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub decode_shed_total: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub resample_error_total: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub decoded_audio_activity: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub decode_failure_activity: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub unmapped_ssrc_activity: DashMap<GuildId, Arc<AtomicUsize>>,
-    pub transcription_started_notified: DashMap<GuildId, Arc<AtomicBool>>,
+    pub guild_runtimes: DashMap<GuildId, Arc<GuildRuntime>>,
 }
 
 impl AppState {
@@ -91,6 +97,8 @@ impl AppState {
             gemini_model: cfg.gemini_model,
             live_transcript_debug: cfg.live_transcript_debug,
             enable_denoiser: cfg.enable_denoiser,
+            // Endpoint uses VAD hangover plus silence ticks; effective trailing wait
+            // is roughly (endpoint_silence_ticks * 20ms) + ~256ms.
             endpoint_silence_ticks: ((cfg.endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1),
             rolling_ingest_max_ms: cfg.rolling_ingest_max_ms,
             rolling_ingest_context_ms: cfg.rolling_ingest_context_ms,
@@ -98,16 +106,7 @@ impl AppState {
             asr,
             ssrc_to_user: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),
-            recovery_locks: DashMap::new(),
-            utterance_senders: DashMap::new(),
-            transcription_inflight: DashMap::new(),
-            transcript_pending_commits: DashMap::new(),
-            decode_shed_total: DashMap::new(),
-            resample_error_total: DashMap::new(),
-            decoded_audio_activity: DashMap::new(),
-            decode_failure_activity: DashMap::new(),
-            unmapped_ssrc_activity: DashMap::new(),
-            transcription_started_notified: DashMap::new(),
+            guild_runtimes: DashMap::new(),
         })
     }
 }

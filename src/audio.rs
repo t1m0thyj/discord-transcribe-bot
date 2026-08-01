@@ -1,16 +1,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use serenity::http::Http;
 use serenity::all::{GuildId, UserId};
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
-use tokio::sync::mpsc;
 
-use crate::app::Utterance;
+use crate::app::{GuildRuntime, Utterance};
 use crate::transcription::{
-    transcribe_mono_pcm, AsrEngine,
+    should_dispatch_chunk, transcribe_mono_pcm, AsrEngine,
+    compute_rms, trim_finalize_tail,
     SsrcMap, Streams,
 };
 
@@ -68,19 +68,11 @@ pub struct VoiceTickHandler {
     pub http: Arc<Http>,
     pub text_channel: serenity::all::ChannelId,
     pub voice_channel: serenity::all::ChannelId,
-    pub started_notified: Arc<AtomicBool>,
+    pub runtime: Arc<GuildRuntime>,
     pub guild_id: GuildId,
     pub ssrc_to_user: Arc<SsrcMap>,
     pub streams: Arc<Streams>,
     pub enable_denoiser: bool,
-    pub utterance_tx: mpsc::Sender<Utterance>,
-    pub transcription_inflight: Arc<AtomicUsize>,
-    pub transcript_pending_commits: Arc<AtomicUsize>,
-    pub decode_shed_total: Arc<AtomicUsize>,
-    pub resample_error_total: Arc<AtomicUsize>,
-    pub decode_activity: Arc<AtomicUsize>,
-    pub decode_failure_activity: Arc<AtomicUsize>,
-    pub unmapped_ssrc_activity: Arc<AtomicUsize>,
     pub asr: Arc<AsrEngine>,
     pub live_transcript_debug: bool,
     pub silence_ticks_threshold: u32,
@@ -135,13 +127,7 @@ fn push_unknown_ssrc_audio(guild_id: GuildId, ssrc: u32, decoded: &[i16]) {
     map.retain(|_, buf| now.saturating_duration_since(buf.last_update) <= UNKNOWN_SSRC_RETENTION);
 
     if !map.contains_key(&(guild_id, ssrc)) && map.len() >= UNKNOWN_SSRC_MAX_TRACKED {
-        if let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, buf)| buf.last_update)
-            .map(|(key, _)| *key)
-        {
-            map.remove(&oldest_key);
-        }
+        return;
     }
 
     let entry = map.entry((guild_id, ssrc)).or_insert_with(UnknownSsrcAudio::new);
@@ -170,12 +156,8 @@ struct DecodeJob {
     start_ts: Instant,
     stage: &'static str,
     pcm: Vec<f32>,
-    sample_count: usize,
+    runtime: Arc<GuildRuntime>,
     asr: Arc<AsrEngine>,
-    utterance_tx: mpsc::Sender<Utterance>,
-    inflight: Arc<AtomicUsize>,
-    pending_commits: Arc<AtomicUsize>,
-    decode_shed_total: Arc<AtomicUsize>,
     live_transcript_debug: bool,
 }
 
@@ -220,12 +202,15 @@ fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
     tokio::spawn(async move {
         loop {
             let job = loop {
-                if let Some(job) = dispatcher
-                    .queue
-                    .lock()
-                    .expect("decode queue mutex poisoned")
-                    .pop_front()
-                {
+                let maybe_job = {
+                    let mut queue = dispatcher
+                        .queue
+                        .lock()
+                        .expect("decode queue mutex poisoned");
+                    queue.pop_front()
+                };
+
+                if let Some(job) = maybe_job {
                     break job;
                 }
 
@@ -239,20 +224,6 @@ fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
 
 async fn process_decode_job(job: DecodeJob) {
     if let Some(text) = transcribe_utterance_blocking(&job.asr, job.pcm).await {
-        let audio_secs = (job.sample_count as f32 / 16_000.0).max(0.001);
-        if let Some(reason) = decode_rejection_reason(&text, audio_secs) {
-            tracing::warn!(
-                guild = %job.guild_id,
-                user = %job.user_id,
-                stage = job.stage,
-                reason,
-                transcript = %text,
-                "rejected decoded utterance"
-            );
-            job.inflight.fetch_sub(1, Ordering::SeqCst);
-            return;
-        }
-
         if job.live_transcript_debug {
             tracing::debug!(
                 user = %job.user_id,
@@ -262,8 +233,11 @@ async fn process_decode_job(job: DecodeJob) {
             );
         }
 
-        job.pending_commits.fetch_add(1, Ordering::SeqCst);
+        job.runtime
+            .transcript_pending_commits
+            .fetch_add(1, Ordering::SeqCst);
         if job
+            .runtime
             .utterance_tx
             .send(Utterance {
                 user_id: job.user_id,
@@ -273,74 +247,34 @@ async fn process_decode_job(job: DecodeJob) {
             .await
             .is_err()
         {
-            job.pending_commits.fetch_sub(1, Ordering::SeqCst);
+            job.runtime
+                .transcript_pending_commits
+                .fetch_sub(1, Ordering::SeqCst);
         }
     }
 
-    job.inflight.fetch_sub(1, Ordering::SeqCst);
+    job.runtime
+        .transcription_inflight
+        .fetch_sub(1, Ordering::SeqCst);
 }
 
 fn queue_decode_job(job: DecodeJob) {
     let dispatcher = DecodeDispatcher::global();
     if let Some(dropped) = dispatcher.enqueue(job) {
-        dropped.decode_shed_total.fetch_add(1, Ordering::SeqCst);
-        dropped.inflight.fetch_sub(1, Ordering::SeqCst);
+        dropped
+            .runtime
+            .decode_shed_total
+            .fetch_add(1, Ordering::SeqCst);
+        dropped
+            .runtime
+            .transcription_inflight
+            .fetch_sub(1, Ordering::SeqCst);
         tracing::warn!(
             guild = %dropped.guild_id,
             user = %dropped.user_id,
             "decode queue full; dropped oldest queued chunk"
         );
     }
-}
-
-fn should_dispatch_chunk(pcm: &[f32], voiced_ticks: u32, noise_rms_ema: f32) -> bool {
-    if voiced_ticks < 12 {
-        return false;
-    }
-
-    let rms = compute_rms(pcm);
-    let floor = (noise_rms_ema * 1.4).max(0.0025);
-    rms >= floor
-}
-
-fn compute_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
-}
-
-fn decode_rejection_reason(text: &str, audio_secs: f32) -> Option<&'static str> {
-    let normalized = text
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
-        .collect::<String>();
-
-    const HALLUCINATION_BLOCKLIST: &[&str] = &[
-        "thank you",
-        "thanks for watching",
-        "thank you for watching",
-        "subtitles by",
-        "captions by",
-    ];
-
-    if HALLUCINATION_BLOCKLIST
-        .iter()
-        .any(|phrase| normalized == *phrase)
-    {
-        return Some("blocklist");
-    }
-
-    let chars_per_second = text.chars().count() as f32 / audio_secs;
-    if chars_per_second > 25.0 {
-        return Some("implausible_char_rate");
-    }
-
-    None
 }
 
 #[serenity::async_trait]
@@ -357,7 +291,9 @@ impl VoiceEventHandler for VoiceTickHandler {
 
         for (ssrc, data) in &tick.speaking {
             if data.decoded_voice.is_none() && data.packet.is_some() {
-                self.decode_failure_activity.fetch_add(1, Ordering::SeqCst);
+                self.runtime
+                    .decode_failure_activity
+                    .fetch_add(1, Ordering::SeqCst);
             }
 
             let Some(decoded) = &data.decoded_voice else {
@@ -371,29 +307,33 @@ impl VoiceEventHandler for VoiceTickHandler {
             else {
                 // Decoded audio without an SSRC mapping is not usable yet.
                 // Count it as startup receive failure signal so watchdog can recover.
-                self.unmapped_ssrc_activity.fetch_add(1, Ordering::SeqCst);
+                self.runtime
+                    .unmapped_ssrc_activity
+                    .fetch_add(1, Ordering::SeqCst);
                 push_unknown_ssrc_audio(self.guild_id, *ssrc, decoded);
                 continue;
             };
 
-            let mut merged_audio = take_unknown_ssrc_audio(self.guild_id, *ssrc);
-            if merged_audio.is_empty() {
-                merged_audio = decoded.clone();
-            } else {
-                merged_audio.extend_from_slice(decoded);
-            }
-
-            self.decode_activity.fetch_add(1, Ordering::SeqCst);
+            self.runtime
+                .decoded_audio_activity
+                .fetch_add(1, Ordering::SeqCst);
 
             let user_key = (self.guild_id, user_id);
 
             let mut stream = self.streams.entry(user_key).or_default();
-            let processed = stream
-                .denoiser
-                .push_stereo_pcm(&merged_audio, self.enable_denoiser);
+            let mut replay = take_unknown_ssrc_audio(self.guild_id, *ssrc);
+            let processed = if replay.is_empty() {
+                stream.denoiser.push_stereo_pcm(decoded, self.enable_denoiser)
+            } else {
+                replay.extend_from_slice(decoded);
+                stream
+                    .denoiser
+                    .push_stereo_pcm(&replay, self.enable_denoiser)
+            };
             let resample_errors = stream.denoiser.take_resample_error_count();
             if resample_errors > 0 {
-                self.resample_error_total
+                self.runtime
+                    .resample_error_total
                     .fetch_add(resample_errors, Ordering::SeqCst);
             }
             if processed.speech_active {
@@ -409,7 +349,8 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             if processed.speech_active {
                 if self
-                    .started_notified
+                    .runtime
+                    .transcription_started_notified
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
@@ -483,23 +424,33 @@ impl VoiceEventHandler for VoiceTickHandler {
             );
 
             if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_rollover_final {
-                if !should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
+                if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
+                    self.runtime
+                        .dispatch_gate_total
+                        .fetch_add(1, Ordering::SeqCst);
+                    tracing::debug!(
+                        guild = %self.guild_id,
+                        user = %user_id,
+                        stage = "rollover",
+                        reason = rejection.reason,
+                        voiced_ticks = rejection.voiced_ticks,
+                        rms = rejection.rms,
+                        floor = rejection.floor,
+                        "dispatch gate rejected utterance"
+                    );
                     continue;
                 }
-                self.transcription_inflight.fetch_add(1, Ordering::SeqCst);
-                let sample_count = pcm.len();
+                self.runtime
+                    .transcription_inflight
+                    .fetch_add(1, Ordering::SeqCst);
                 queue_decode_job(DecodeJob {
                     guild_id: self.guild_id,
                     user_id,
                     start_ts,
                     stage: "rollover",
                     pcm,
-                    sample_count,
+                    runtime: Arc::clone(&self.runtime),
                     asr: Arc::clone(&self.asr),
-                    utterance_tx: self.utterance_tx.clone(),
-                    inflight: Arc::clone(&self.transcription_inflight),
-                    pending_commits: Arc::clone(&self.transcript_pending_commits),
-                    decode_shed_total: Arc::clone(&self.decode_shed_total),
                     live_transcript_debug: self.live_transcript_debug,
                 });
             }
@@ -537,31 +488,43 @@ impl VoiceEventHandler for VoiceTickHandler {
                 let entry = &mut stream.buffer;
                 entry.pcm.extend(flushed);
                 let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
-                let pcm = std::mem::take(&mut entry.pcm);
+                let mut pcm = std::mem::take(&mut entry.pcm);
                 let voiced_ticks = std::mem::take(&mut entry.voiced_ticks);
+                let final_silent_ticks = entry.silent_ticks;
                 entry.silent_ticks = 0;
+                trim_finalize_tail(&mut pcm, final_silent_ticks);
                 let noise_rms_ema = stream.denoiser.noise_rms_ema();
                 maybe_job = Some((start_ts, pcm, voiced_ticks, noise_rms_ema));
             }
 
             if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_job {
-                if !should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
+                if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
+                    self.runtime
+                        .dispatch_gate_total
+                        .fetch_add(1, Ordering::SeqCst);
+                    tracing::debug!(
+                        guild = %self.guild_id,
+                        user = %user_id,
+                        stage = "silence",
+                        reason = rejection.reason,
+                        voiced_ticks = rejection.voiced_ticks,
+                        rms = rejection.rms,
+                        floor = rejection.floor,
+                        "dispatch gate rejected utterance"
+                    );
                     continue;
                 }
-                self.transcription_inflight.fetch_add(1, Ordering::SeqCst);
-                let sample_count = pcm.len();
+                self.runtime
+                    .transcription_inflight
+                    .fetch_add(1, Ordering::SeqCst);
                 queue_decode_job(DecodeJob {
                     guild_id: self.guild_id,
                     user_id,
                     start_ts,
                     stage: "silence",
                     pcm,
-                    sample_count,
+                    runtime: Arc::clone(&self.runtime),
                     asr: Arc::clone(&self.asr),
-                    utterance_tx: self.utterance_tx.clone(),
-                    inflight: Arc::clone(&self.transcription_inflight),
-                    pending_commits: Arc::clone(&self.transcript_pending_commits),
-                    decode_shed_total: Arc::clone(&self.decode_shed_total),
                     live_transcript_debug: self.live_transcript_debug,
                 });
             }
@@ -604,7 +567,7 @@ fn choose_rollover_split_index(
         let left = right.saturating_sub(frame);
         if right > left {
             let window = &pcm[left..right];
-            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+            let rms = compute_rms(window);
             if rms < best_rms {
                 best_rms = rms;
                 best = idx;

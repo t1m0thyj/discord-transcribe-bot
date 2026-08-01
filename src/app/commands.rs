@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
 
 use super::{
-    AppState, CallSession, LOG_DEFAULT_UTTERANCES,
+    AppState, CallSession, GuildRuntime, LOG_DEFAULT_UTTERANCES,
     LOG_MAX_DISCORD_CHARS, Utterance,
 };
 use crate::transcription::transcript_writer_loop;
@@ -62,45 +62,46 @@ pub(super) async fn handle_status(
     let elapsed = session.started_mono.elapsed();
     drop(session);
 
-    let decoded_frames = state
-        .decoded_audio_activity
+    let runtime = state
+        .guild_runtimes
         .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+        .map(|v| Arc::clone(v.value()));
+
+    let decoded_frames = runtime
+        .as_ref()
+        .map(|v| v.decoded_audio_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let started_notified = state
-        .transcription_started_notified
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let started_notified = runtime
+        .as_ref()
+        .map(|v| v.transcription_started_notified.load(Ordering::SeqCst))
         .unwrap_or(false);
-    let inflight = state
-        .transcription_inflight
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let inflight = runtime
+        .as_ref()
+        .map(|v| v.transcription_inflight.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let pending_commits = state
-        .transcript_pending_commits
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let pending_commits = runtime
+        .as_ref()
+        .map(|v| v.transcript_pending_commits.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let decode_failures = state
-        .decode_failure_activity
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let decode_failures = runtime
+        .as_ref()
+        .map(|v| v.decode_failure_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let decode_shed_total = state
-        .decode_shed_total
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let decode_shed_total = runtime
+        .as_ref()
+        .map(|v| v.decode_shed_total.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let resample_errors = state
-        .resample_error_total
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let dispatch_gate_total = runtime
+        .as_ref()
+        .map(|v| v.dispatch_gate_total.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let unmapped_ssrc = state
-        .unmapped_ssrc_activity
-        .get(&guild_id)
-        .map(|v| v.load(Ordering::SeqCst))
+    let resample_errors = runtime
+        .as_ref()
+        .map(|v| v.resample_error_total.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let unmapped_ssrc = runtime
+        .as_ref()
+        .map(|v| v.unmapped_ssrc_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
     let mapped_ssrc = state
         .ssrc_to_user
@@ -130,13 +131,14 @@ pub(super) async fn handle_status(
     let ss = elapsed.as_secs() % 60;
 
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nDecode shed total: {}\nResample errors: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
+        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nDecode shed total: {}\nDispatch gate drops: {}\nResample errors: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
         voice_channel.get(),
         text_channel.get(),
         participants,
         decoded_frames,
         decode_failures,
         decode_shed_total,
+        dispatch_gate_total,
         resample_errors,
         unmapped_ssrc,
         if started_notified { "yes" } else { "no" },
@@ -524,39 +526,20 @@ pub(super) async fn start_call_session(
         )
     })?;
 
-    state
-        .utterance_senders
-        .insert(guild_id, utterance_tx.clone());
-    let inflight = Arc::new(AtomicUsize::new(0));
-    state.transcription_inflight.insert(guild_id, Arc::clone(&inflight));
-    let pending_commits = Arc::new(AtomicUsize::new(0));
-    state
-        .transcript_pending_commits
-        .insert(guild_id, Arc::clone(&pending_commits));
-    let decode_shed_total = Arc::new(AtomicUsize::new(0));
-    state
-        .decode_shed_total
-        .insert(guild_id, Arc::clone(&decode_shed_total));
-    let resample_error_total = Arc::new(AtomicUsize::new(0));
-    state
-        .resample_error_total
-        .insert(guild_id, Arc::clone(&resample_error_total));
-    let decode_activity = Arc::new(AtomicUsize::new(0));
-    state
-        .decoded_audio_activity
-        .insert(guild_id, Arc::clone(&decode_activity));
-    let decode_failure_activity = Arc::new(AtomicUsize::new(0));
-    state
-        .decode_failure_activity
-        .insert(guild_id, Arc::clone(&decode_failure_activity));
-    let unmapped_ssrc_activity = Arc::new(AtomicUsize::new(0));
-    state
-        .unmapped_ssrc_activity
-        .insert(guild_id, Arc::clone(&unmapped_ssrc_activity));
-    let started_notified = Arc::new(AtomicBool::new(false));
-    state
-        .transcription_started_notified
-        .insert(guild_id, Arc::clone(&started_notified));
+    let runtime = Arc::new(GuildRuntime {
+        utterance_tx: utterance_tx.clone(),
+        transcription_inflight: Arc::new(AtomicUsize::new(0)),
+        transcript_pending_commits: Arc::new(AtomicUsize::new(0)),
+        decode_shed_total: Arc::new(AtomicUsize::new(0)),
+        dispatch_gate_total: Arc::new(AtomicUsize::new(0)),
+        resample_error_total: Arc::new(AtomicUsize::new(0)),
+        decoded_audio_activity: Arc::new(AtomicUsize::new(0)),
+        decode_failure_activity: Arc::new(AtomicUsize::new(0)),
+        unmapped_ssrc_activity: Arc::new(AtomicUsize::new(0)),
+        transcription_started_notified: Arc::new(AtomicBool::new(false)),
+        recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+    state.guild_runtimes.insert(guild_id, Arc::clone(&runtime));
 
     let session = Arc::new(RwLock::new(CallSession {
         voice_channel,
@@ -567,14 +550,11 @@ pub(super) async fn start_call_session(
         started_mono: Instant::now(),
     }));
     state.active_calls.insert(guild_id, session.clone());
-    state
-        .recovery_locks
-        .insert(guild_id, Arc::new(tokio::sync::Mutex::new(())));
 
     tokio::spawn(transcript_writer_loop(
         session,
         utterance_rx,
-        Arc::clone(&pending_commits),
+        Arc::clone(&runtime.transcript_pending_commits),
         transcript_jsonl_path,
     ));
 
@@ -586,15 +566,7 @@ pub(super) async fn start_call_session(
             text_channel,
             voice_channel,
             call_lock: Arc::clone(&call_lock),
-            utterance_tx,
-            inflight,
-            pending_commits,
-            decode_shed_total,
-            resample_error_total,
-            decode_activity,
-            decode_failure_activity,
-            unmapped_ssrc_activity,
-            started_notified,
+            runtime,
         },
     )
     .await;

@@ -61,7 +61,6 @@ impl EventHandler for Handler {
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(2)
         .build()
         .context("failed to build tokio runtime")?;
 
