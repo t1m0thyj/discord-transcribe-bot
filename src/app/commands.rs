@@ -11,7 +11,7 @@ use serenity::prelude::Context;
 use tokio::sync::{mpsc, RwLock};
 
 use super::{
-    AppState, CallSession, INTERACTIVE_DRAIN_TIMEOUT, LOG_DEFAULT_UTTERANCES,
+    AppState, CallSession, LOG_DEFAULT_UTTERANCES,
     LOG_MAX_DISCORD_CHARS, Utterance,
 };
 use crate::transcription::transcript_writer_loop;
@@ -172,16 +172,10 @@ pub(super) async fn handle_ask(
         .context("no active call for this guild")?
         .clone();
 
-    let drained =
-        super::session::wait_for_capture_quiesce_with_timeout(state, guild_id, INTERACTIVE_DRAIN_TIMEOUT)
-            .await;
-
-    let (mut snapshot, started_at) = {
+    let (snapshot, started_at) = {
         let session = session_lock.read().await;
         (session.transcript.clone(), session.started_at)
     };
-    let pending = super::session::snapshot_pending_buffers_for_interactive(state, guild_id).await;
-    super::session::upsert_utterances(&mut snapshot, pending);
 
     if snapshot.is_empty() {
         return Ok(
@@ -202,14 +196,7 @@ pub(super) async fn handle_ask(
     .await
     .unwrap_or_else(|e| format!("gemini error: {e}"));
 
-    if drained {
-        Ok(answer)
-    } else {
-        Ok(format!(
-            "(Still processing live audio; answer is based on the latest available transcript snapshot.)\n\n{}",
-            answer
-        ))
-    }
+    Ok(answer)
 }
 
 pub(super) async fn handle_log(
@@ -237,16 +224,10 @@ pub(super) async fn handle_log(
         .context("no active call for this guild")?
         .clone();
 
-    let drained =
-        super::session::wait_for_capture_quiesce_with_timeout(state, guild_id, INTERACTIVE_DRAIN_TIMEOUT)
-            .await;
-
-    let (mut snapshot, started_at) = {
+    let (snapshot, started_at) = {
         let session = session_lock.read().await;
         (session.transcript.clone(), session.started_at)
     };
-    let pending = super::session::snapshot_pending_buffers_for_interactive(state, guild_id).await;
-    super::session::upsert_utterances(&mut snapshot, pending);
 
     if snapshot.is_empty() {
         return Ok("No transcribed utterances yet.".to_string());
@@ -271,17 +252,10 @@ pub(super) async fn handle_log(
         transcript = format!("(truncated to recent text)\n{tail}");
     }
 
-    if drained {
-        Ok(format!(
-            "Recent transcript (last {} utterances):\n{}",
-            requested_utterances, transcript
-        ))
-    } else {
-        Ok(format!(
-            "Recent transcript (last {} utterances, snapshot while live audio is still processing):\n{}",
-            requested_utterances, transcript
-        ))
-    }
+    Ok(format!(
+        "Recent transcript (last {} utterances):\n{}",
+        requested_utterances, transcript
+    ))
 }
 
 pub(super) async fn handle_autojoin(

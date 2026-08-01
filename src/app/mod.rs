@@ -22,7 +22,6 @@ mod session;
 
 pub(super) const LOG_DEFAULT_UTTERANCES: i64 = 40;
 pub(super) const LOG_MAX_DISCORD_CHARS: usize = 1800;
-pub(super) const INTERACTIVE_DRAIN_TIMEOUT: Duration = Duration::from_millis(1200);
 pub(super) const FINALIZE_SETTLE_TIMEOUT: Duration = Duration::from_millis(900);
 pub(super) const FINALIZE_SETTLE_PASSES: usize = 4;
 pub(super) const STARTUP_RECEIVE_WATCHDOG_DELAY: Duration = Duration::from_secs(10);
@@ -34,8 +33,6 @@ pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_sec
 pub struct Utterance {
     pub user_id: UserId,
     pub start_ts: Instant,
-    pub revision_id: u64,
-    pub is_final: bool,
     pub text: String,
 }
 
@@ -64,7 +61,6 @@ pub struct AppState {
     pub rolling_ingest_context_ms: u64,
     pub autojoin_suffix: String,
     pub asr: Arc<AsrEngine>,
-    pub final_asr: Option<Arc<AsrEngine>>,
     pub ssrc_to_user: Arc<SsrcMap>,
     pub streams: Arc<Streams>,
     pub utterance_senders: SessionSenders,
@@ -79,12 +75,6 @@ pub struct AppState {
 impl AppState {
     pub fn new(cfg: AppConfig) -> anyhow::Result<Self> {
         let asr = Arc::new(AsrEngine::new(&cfg.asr_model_dir)?);
-        let final_asr = cfg
-            .final_asr_model_dir
-            .as_deref()
-            .map(AsrEngine::new)
-            .transpose()?
-            .map(Arc::new);
 
         Ok(Self {
             active_calls: DashMap::new(),
@@ -97,7 +87,6 @@ impl AppState {
             rolling_ingest_context_ms: cfg.rolling_ingest_context_ms,
             autojoin_suffix: cfg.autojoin_suffix,
             asr,
-            final_asr,
             ssrc_to_user: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),
             utterance_senders: DashMap::new(),
@@ -117,7 +106,7 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
         CreateCommand::new("leave").description("Leave voice and finalize transcript export"),
         CreateCommand::new("status").description("Show live transcription status for this guild"),
         CreateCommand::new("log")
-            .description("Show recent transcript snapshot for the active call")
+            .description("Show recent committed transcript lines for the active call")
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::Integer,

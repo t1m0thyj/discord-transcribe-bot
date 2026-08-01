@@ -6,7 +6,6 @@ pub struct AppConfig {
     pub gemini_api_key: String,
     pub gemini_model: String,
     pub asr_model_dir: String,
-    pub final_asr_model_dir: Option<String>,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
     pub rolling_ingest_max_ms: u64,
@@ -19,17 +18,9 @@ impl AppConfig {
         let discord_token = env::var("DISCORD_TOKEN")?;
         let gemini_api_key = env::var("GEMINI_API_KEY")?;
         let gemini_model = env::var("GEMINI_MODEL")?;
-        let asr_model_dir = env::var("ASR_MODEL_DIR")
-            .or_else(|_| env::var("MOONSHINE_MODEL_DIR"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "missing ASR model directory: set ASR_MODEL_DIR (preferred) or MOONSHINE_MODEL_DIR (legacy)"
-                )
-            })?;
-        let final_asr_model_dir = env::var("FINAL_ASR_MODEL_DIR")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let asr_model_dir = env::var("ASR_MODEL_DIR").map_err(|_| {
+            anyhow::anyhow!("missing ASR model directory: set ASR_MODEL_DIR")
+        })?;
         let live_transcript_debug = env::var("LIVE_TRANSCRIPT_DEBUG")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
@@ -61,7 +52,6 @@ impl AppConfig {
             gemini_api_key,
             gemini_model,
             asr_model_dir,
-            final_asr_model_dir,
             live_transcript_debug,
             enable_denoiser,
             rolling_ingest_max_ms,

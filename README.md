@@ -54,8 +54,8 @@ Format: [HH:MM:SS] Speaker: text
 
 - `/join` - bot joins your current voice channel in that guild.
 - `/status` - shows current receive/transcription health and queue state.
-- `/log` - prints a recent transcript snapshot.
-- `/ask` - asks Gemini about the current live transcript.
+- `/log` - prints recent committed transcript lines.
+- `/ask` - asks Gemini about the current committed transcript.
 - `/autojoin` - marks/unmarks your current voice channel (or an explicitly mentioned voice channel) by suffix so the bot auto-starts there later (default marker: `[Transcribe]`).
 - `/leave` - bot leaves and finalizes call transcript export.
 

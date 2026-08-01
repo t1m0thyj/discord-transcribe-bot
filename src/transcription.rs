@@ -435,6 +435,10 @@ pub struct UserDenoiseState {
     vad_hangover_frames: u8,
     was_speech_last_tick: bool,
     denoiser_active: bool,
+    rnnoise_frame_buf: Vec<f32>,
+    vad_frame_buf: Vec<f32>,
+    resample_in_buf: Vec<f32>,
+    resample_out_buf: Vec<f32>,
 }
 
 pub struct ProcessedSpeechChunk {
@@ -462,6 +466,10 @@ impl UserDenoiseState {
             vad_hangover_frames: 0,
             was_speech_last_tick: false,
             denoiser_active: true,
+            rnnoise_frame_buf: vec![0.0; RNNOISE_FRAME_SIZE],
+            vad_frame_buf: vec![0.0; EARSHOT_FRAME_SIZE],
+            resample_in_buf: Vec::new(),
+            resample_out_buf: Vec::new(),
         }
     }
 
@@ -520,8 +528,10 @@ impl UserDenoiseState {
         let mut out = Vec::new();
 
         while self.pending.len() >= RNNOISE_FRAME_SIZE {
-            let frame: Vec<f32> = self.pending.drain(..RNNOISE_FRAME_SIZE).collect();
-            out.extend(self.denoise_frame(&frame));
+            self.rnnoise_frame_buf
+                .copy_from_slice(&self.pending[..RNNOISE_FRAME_SIZE]);
+            self.pending.drain(..RNNOISE_FRAME_SIZE);
+            out.extend(self.denoise_frame(&self.rnnoise_frame_buf));
         }
 
         out
@@ -576,8 +586,10 @@ impl UserDenoiseState {
         let mut evaluated_any = false;
         let mut speech_active = false;
         while self.vad_pending_16k.len() >= EARSHOT_FRAME_SIZE {
-            let frame: Vec<f32> = self.vad_pending_16k.drain(..EARSHOT_FRAME_SIZE).collect();
-            let score = self.vad.predict_f32(&frame);
+            self.vad_frame_buf
+                .copy_from_slice(&self.vad_pending_16k[..EARSHOT_FRAME_SIZE]);
+            self.vad_pending_16k.drain(..EARSHOT_FRAME_SIZE);
+            let score = self.vad.predict_f32(&self.vad_frame_buf);
             evaluated_any = true;
             if score >= EARSHOT_VAD_THRESHOLD {
                 self.vad_hangover_frames = VAD_HANGOVER_FRAMES;
@@ -645,22 +657,25 @@ impl UserDenoiseState {
             (self.resample_pending_48k.len() / in_frames)
                 .saturating_mul(out_frames),
         );
+        self.resample_in_buf.resize(in_frames, 0.0);
+        self.resample_out_buf.resize(out_frames, 0.0);
 
         while self.resample_pending_48k.len() >= in_frames {
-            let in_chunk: Vec<f32> = self.resample_pending_48k.drain(..in_frames).collect();
-            let mut out_chunk = vec![0.0f32; out_frames];
+            self.resample_in_buf
+                .copy_from_slice(&self.resample_pending_48k[..in_frames]);
+            self.resample_pending_48k.drain(..in_frames);
             if self
                 .resampler_48k_to_16k
                 .process_into_buffer(
-                    &[in_chunk.as_slice()],
-                    &mut [out_chunk.as_mut_slice()],
+                    &[self.resample_in_buf.as_slice()],
+                    &mut [self.resample_out_buf.as_mut_slice()],
                     None,
                 )
                 .is_err()
             {
                 continue;
             }
-            out.extend_from_slice(&out_chunk);
+            out.extend_from_slice(&self.resample_out_buf);
         }
 
         out
@@ -698,22 +713,12 @@ pub struct UserAudioBuffer {
     pub pcm: Vec<f32>,
     pub silent_ticks: u32,
     pub utterance_start: Option<Instant>,
-    pub current_revision_seq: Option<u64>,
-    pub next_revision_seq: u64,
-    pub last_preview_samples: usize,
-    pub last_preview_text: Option<String>,
-    pub frozen_prefix_words: usize,
-    pub stable_preview_streak: u32,
 }
 
 #[derive(Default)]
 pub struct UserStreamState {
     pub denoiser: UserDenoiseState,
     pub buffer: UserAudioBuffer,
-}
-
-pub fn make_revision_id(user_id: UserId, revision_seq: u64) -> u64 {
-    user_id.get().wrapping_mul(0x9E37_79B1_85EB_CA87) ^ revision_seq
 }
 
 pub fn downmix_stereo_to_mono_i16_scale(input: &[i16]) -> Vec<f32> {
@@ -739,47 +744,29 @@ pub async fn transcribe_mono_pcm(
     asr: Arc<AsrEngine>,
     pcm_mono: Vec<f32>,
 ) -> Option<String> {
-    if pcm_mono.len() < 1600 {
+    let sample_count = pcm_mono.len();
+    if sample_count < 1600 {
         return None;
     }
 
+    let wait_started = Instant::now();
     // Bound concurrent ASR decode work to keep CPU usage stable on small devices.
     let permit = asr_decode_semaphore().acquire_owned().await.ok()?;
+    let semaphore_wait_ms = wait_started.elapsed().as_millis() as u64;
 
+    let decode_started = Instant::now();
     let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
         .await
         .ok()?;
+    let decode_ms = decode_started.elapsed().as_millis() as u64;
     drop(permit);
 
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-pub async fn transcribe_mono_pcm_with_gate<F>(
-    asr: Arc<AsrEngine>,
-    pcm_mono: Vec<f32>,
-    should_decode: F,
-) -> Option<String>
-where
-    F: FnOnce() -> bool,
-{
-    if pcm_mono.len() < 1600 {
-        return None;
-    }
-
-    let permit = asr_decode_semaphore().acquire_owned().await.ok()?;
-    if !should_decode() {
-        drop(permit);
-        return None;
-    }
-
-    let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
-        .await
-        .ok()?;
-    drop(permit);
+    tracing::debug!(
+        samples = sample_count,
+        semaphore_wait_ms,
+        decode_ms,
+        "asr decode completed"
+    );
 
     if text.trim().is_empty() {
         None
@@ -802,69 +789,11 @@ fn compute_rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
-pub fn should_apply_refinement(pass1: &str, pass2: &str) -> bool {
-    if texts_equivalent(pass1, pass2) {
-        return false;
-    }
-
-    let w1 = pass1.split_whitespace().count().max(1);
-    let w2 = pass2.split_whitespace().count();
-    if w2 == 0 {
-        return false;
-    }
-
-    let ratio = w2 as f32 / w1 as f32;
-    if !(0.4..=2.5).contains(&ratio) {
-        return false;
-    }
-
-    if has_repeated_ngram(pass2, 3, 3) {
-        return false;
-    }
-
-    true
-}
-
-fn texts_equivalent(a: &str, b: &str) -> bool {
-    a.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .eq_ignore_ascii_case(&b.split_whitespace().collect::<Vec<_>>().join(" "))
-}
-
-fn has_repeated_ngram(text: &str, n: usize, min_consecutive_repeats: usize) -> bool {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < n.saturating_mul(min_consecutive_repeats) || n == 0 {
-        return false;
-    }
-
-    let mut i = 0usize;
-    while i + n <= words.len() {
-        let candidate = &words[i..i + n];
-        let mut repeats = 1usize;
-        let mut j = i + n;
-        while j + n <= words.len() && words[j..j + n].eq(candidate) {
-            repeats += 1;
-            if repeats >= min_consecutive_repeats {
-                return true;
-            }
-            j += n;
-        }
-        i += 1;
-    }
-
-    false
-}
-
 fn trim_overlap_from_previous_final(transcript: &[Utterance], utterance: &mut Utterance) {
-    if !utterance.is_final {
-        return;
-    }
-
     let Some(prev) = transcript
         .iter()
         .rev()
-        .find(|u| u.user_id == utterance.user_id && u.is_final && u.start_ts <= utterance.start_ts)
+        .find(|u| u.user_id == utterance.user_id && u.start_ts <= utterance.start_ts)
     else {
         return;
     };
@@ -939,14 +868,11 @@ pub async fn transcript_writer_loop(
     let mut heap = BinaryHeap::new();
     let mut seq = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut revision_index = std::collections::HashMap::<u64, usize>::new();
 
     #[derive(Serialize)]
     struct PersistedUtterance {
-        revision_id: u64,
         user_id: u64,
         start_offset_ms: u64,
-        is_final: bool,
         text: String,
     }
 
@@ -960,44 +886,13 @@ pub async fn transcript_writer_loop(
         let _ = writeln!(file, "{line}");
     }
 
-    async fn apply_revision(
+    async fn append_utterance(
         session: &Arc<RwLock<CallSession>>,
-        revision_index: &mut std::collections::HashMap<u64, usize>,
         pending_commits: &Arc<AtomicUsize>,
         transcript_jsonl_path: &Path,
         mut utterance: Utterance,
     ) {
         let mut lock = session.write().await;
-
-        if revision_index.is_empty() || revision_index.len() != lock.transcript.len() {
-            revision_index.clear();
-            for (idx, u) in lock.transcript.iter().enumerate() {
-                revision_index.insert(u.revision_id, idx);
-            }
-        }
-
-        if let Some(existing_idx) = revision_index.get(&utterance.revision_id).copied() {
-            if lock.transcript[existing_idx].is_final && !utterance.is_final {
-                pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
-                return;
-            }
-            let start_offset_ms = utterance
-                .start_ts
-                .saturating_duration_since(lock.started_mono)
-                .as_millis() as u64;
-            lock.transcript[existing_idx] = utterance;
-            let persisted = PersistedUtterance {
-                revision_id: lock.transcript[existing_idx].revision_id,
-                user_id: lock.transcript[existing_idx].user_id.get(),
-                start_offset_ms,
-                is_final: lock.transcript[existing_idx].is_final,
-                text: lock.transcript[existing_idx].text.clone(),
-            };
-            drop(lock);
-            append_persisted_utterance(transcript_jsonl_path, &persisted);
-            pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
-            return;
-        }
 
         trim_overlap_from_previous_final(&lock.transcript, &mut utterance);
 
@@ -1006,17 +901,10 @@ pub async fn transcript_writer_loop(
             .saturating_duration_since(lock.started_mono)
             .as_millis() as u64;
         lock.transcript.push(utterance.clone());
-        lock.transcript.sort_by_key(|u| u.start_ts);
-        revision_index.clear();
-        for (idx, u) in lock.transcript.iter().enumerate() {
-            revision_index.insert(u.revision_id, idx);
-        }
 
         let persisted = PersistedUtterance {
-            revision_id: utterance.revision_id,
             user_id: utterance.user_id.get(),
             start_offset_ms,
-            is_final: utterance.is_final,
             text: utterance.text,
         };
 
@@ -1047,9 +935,8 @@ pub async fn transcript_writer_loop(
             }
 
             if let Some(item) = heap.pop() {
-                apply_revision(
+                append_utterance(
                     &session,
-                    &mut revision_index,
                     &pending_commits,
                     &transcript_jsonl_path,
                     item.utterance,
@@ -1060,9 +947,8 @@ pub async fn transcript_writer_loop(
     }
 
     while let Some(item) = heap.pop() {
-        apply_revision(
+        append_utterance(
             &session,
-            &mut revision_index,
             &pending_commits,
             &transcript_jsonl_path,
             item.utterance,

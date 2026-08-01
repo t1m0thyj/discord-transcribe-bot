@@ -22,7 +22,7 @@ use super::{
     STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
 };
 use crate::audio::{ClientDisconnectHandler, SpeakingUpdateHandler, VoiceTickHandler};
-use crate::transcription::{make_revision_id, should_apply_refinement, transcribe_mono_pcm};
+use crate::transcription::transcribe_mono_pcm;
 
 pub struct VoiceHandlerAttachContext {
     pub http: Arc<serenity::http::Http>,
@@ -91,8 +91,6 @@ pub async fn finalize_call_for_guild(
     );
     if transcript.is_empty() {
         transcript = session.transcript.clone();
-    } else {
-        upsert_utterances(&mut transcript, session.transcript.clone());
     }
 
     let transcript_text = format_transcript(ctx, &transcript, session.started_at).await;
@@ -160,10 +158,8 @@ pub async fn finalize_call_for_guild(
 
 #[derive(Deserialize)]
 struct PersistedUtterance {
-    revision_id: u64,
     user_id: u64,
     start_offset_ms: u64,
-    is_final: bool,
     text: String,
 }
 
@@ -177,14 +173,14 @@ fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> V
         let Ok(item) = serde_json::from_str::<PersistedUtterance>(line) else {
             continue;
         };
-        upsert_utterances(&mut out, vec![Utterance {
+        out.push(Utterance {
             user_id: UserId::new(item.user_id),
             start_ts: started_mono + Duration::from_millis(item.start_offset_ms),
-            revision_id: item.revision_id,
-            is_final: item.is_final,
             text: item.text,
-        }]);
+        });
     }
+
+    out.sort_by_key(|u| u.start_ts);
 
     out
 }
@@ -238,7 +234,6 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
             decode_failure_activity,
             unmapped_ssrc_activity,
             asr: Arc::clone(&state.asr),
-            asr_finalize: state.final_asr.as_ref().map(Arc::clone),
             live_transcript_debug: state.live_transcript_debug,
             rolling_ingest_max_ms: state.rolling_ingest_max_ms,
             rolling_ingest_context_ms: state.rolling_ingest_context_ms,
@@ -651,7 +646,7 @@ async fn settle_and_flush_guild_audio(
         let pending = flush_pending_buffers_for_export(state, guild_id).await;
         if !pending.is_empty() {
             let mut session = session_lock.write().await;
-            upsert_utterances(&mut session.transcript, pending);
+            merge_utterances(&mut session.transcript, pending);
         }
 
         let inflight = state
@@ -699,7 +694,7 @@ async fn wait_for_transcription_drain(state: &Arc<AppState>, guild_id: GuildId) 
     }
 }
 
-pub(super) async fn wait_for_capture_quiesce_with_timeout(
+async fn wait_for_capture_quiesce_with_timeout(
     state: &Arc<AppState>,
     guild_id: GuildId,
     timeout: Duration,
@@ -754,21 +749,8 @@ async fn wait_for_transcript_commit_drain(state: &Arc<AppState>, guild_id: Guild
     }
 }
 
-pub(super) fn upsert_utterances(transcript: &mut Vec<Utterance>, incoming: Vec<Utterance>) {
-    for utterance in incoming {
-        if let Some(existing) = transcript
-            .iter_mut()
-            .find(|u| u.revision_id == utterance.revision_id)
-        {
-            if existing.is_final && !utterance.is_final {
-                continue;
-            }
-            *existing = utterance;
-        } else {
-            transcript.push(utterance);
-        }
-    }
-
+pub(super) fn merge_utterances(transcript: &mut Vec<Utterance>, incoming: Vec<Utterance>) {
+    transcript.extend(incoming);
     transcript.sort_by_key(|u| u.start_ts);
 }
 
@@ -788,7 +770,6 @@ pub(super) async fn flush_pending_buffers_for_export(
         let user_id = user_key.1;
         let mut start_ts = None;
         let mut pcm = Vec::new();
-        let mut revision_seq = None;
 
         if let Some(mut stream) = state.streams.get_mut(&user_key) {
             let flushed = stream.denoiser.flush_pending();
@@ -800,32 +781,18 @@ pub(super) async fn flush_pending_buffers_for_export(
             }
 
             start_ts = Some(entry.utterance_start.take().unwrap_or_else(Instant::now));
-            revision_seq = Some(entry.current_revision_seq.take().unwrap_or_else(|| {
-                let seq = entry.next_revision_seq;
-                entry.next_revision_seq = entry.next_revision_seq.wrapping_add(1);
-                seq
-            }));
             pcm = std::mem::take(&mut entry.pcm);
             entry.silent_ticks = 0;
-            entry.last_preview_samples = 0;
-            entry.last_preview_text = None;
-            entry.frozen_prefix_words = 0;
-            entry.stable_preview_streak = 0;
         }
 
         let Some(start_ts) = start_ts else {
             continue;
         };
-        let Some(revision_seq) = revision_seq else {
-            continue;
-        };
 
         if let Some(text) = transcribe_finalized_mono_pcm(state, pcm).await {
             out.push(Utterance {
                 user_id,
                 start_ts,
-                revision_id: make_revision_id(user_id, revision_seq),
-                is_final: true,
                 text,
             });
         }
@@ -833,61 +800,8 @@ pub(super) async fn flush_pending_buffers_for_export(
 
     out
 }
-
-pub(super) async fn snapshot_pending_buffers_for_interactive(
-    state: &Arc<AppState>,
-    guild_id: GuildId,
-) -> Vec<Utterance> {
-    let user_keys: Vec<(GuildId, UserId)> = state
-        .streams
-        .iter()
-        .map(|e| *e.key())
-        .filter(|(g, _)| *g == guild_id)
-        .collect();
-    let mut out = Vec::new();
-
-    for user_key in user_keys {
-        let user_id = user_key.1;
-        let (start_ts, revision_seq, pcm) = if let Some(stream) = state.streams.get(&user_key) {
-            let entry = &stream.buffer;
-            if entry.pcm.is_empty() {
-                continue;
-            }
-            (
-                entry.utterance_start.unwrap_or_else(Instant::now),
-                entry.current_revision_seq.unwrap_or(entry.next_revision_seq),
-                entry.pcm.clone(),
-            )
-        } else {
-            continue;
-        };
-
-        if let Some(text) = transcribe_finalized_mono_pcm(state, pcm).await {
-            out.push(Utterance {
-                user_id,
-                start_ts,
-                revision_id: make_revision_id(user_id, revision_seq),
-                is_final: false,
-                text,
-            });
-        }
-    }
-
-    out
-}
-
 async fn transcribe_finalized_mono_pcm(state: &Arc<AppState>, pcm: Vec<f32>) -> Option<String> {
-    let pass1 = transcribe_mono_pcm(Arc::clone(&state.asr), pcm.clone()).await?;
-
-    if let Some(final_asr) = state.final_asr.as_ref() {
-        if let Some(pass2) = transcribe_mono_pcm(Arc::clone(final_asr), pcm).await {
-            if should_apply_refinement(&pass1, &pass2) {
-                return Some(pass2);
-            }
-        }
-    }
-
-    Some(pass1)
+    transcribe_mono_pcm(Arc::clone(&state.asr), pcm).await
 }
 
 async fn ensure_thread_context_loaded(
