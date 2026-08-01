@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub asr_num_threads: i32,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
+    pub endpoint_silence_ms: u64,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
     pub autojoin_suffix: String,
@@ -39,6 +40,11 @@ impl AppConfig {
         let enable_denoiser = env::var("ENABLE_DENOISER")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
+        let endpoint_silence_ms = env::var("ENDPOINT_SILENCE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 80)
+            .unwrap_or(400);
 
         // Keep in-memory audio bounded for long uninterrupted speech.
         let rolling_ingest_max_ms = env::var("ROLLING_INGEST_MAX_MS")
@@ -67,6 +73,7 @@ impl AppConfig {
             asr_num_threads,
             live_transcript_debug,
             enable_denoiser,
+            endpoint_silence_ms,
             rolling_ingest_max_ms,
             rolling_ingest_context_ms,
             autojoin_suffix,

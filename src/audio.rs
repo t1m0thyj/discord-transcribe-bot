@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -11,7 +11,6 @@ use tokio::sync::mpsc;
 use crate::app::Utterance;
 use crate::transcription::{
     transcribe_mono_pcm, AsrEngine,
-    SILENCE_TICKS_THRESHOLD,
     SsrcMap, Streams,
 };
 
@@ -78,16 +77,92 @@ pub struct VoiceTickHandler {
     pub transcription_inflight: Arc<AtomicUsize>,
     pub transcript_pending_commits: Arc<AtomicUsize>,
     pub decode_shed_total: Arc<AtomicUsize>,
+    pub resample_error_total: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
     pub decode_failure_activity: Arc<AtomicUsize>,
     pub unmapped_ssrc_activity: Arc<AtomicUsize>,
     pub asr: Arc<AsrEngine>,
     pub live_transcript_debug: bool,
+    pub silence_ticks_threshold: u32,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
 }
 
 const DECODE_QUEUE_CAPACITY: usize = 8;
+const UNKNOWN_SSRC_MAX_TRACKED: usize = 8;
+const UNKNOWN_SSRC_MAX_SAMPLES: usize = 96_000;
+const UNKNOWN_SSRC_RETENTION: Duration = Duration::from_secs(1);
+
+struct UnknownSsrcAudio {
+    samples: VecDeque<i16>,
+    last_update: Instant,
+}
+
+impl UnknownSsrcAudio {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            last_update: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, decoded: &[i16]) {
+        self.last_update = Instant::now();
+        self.samples.extend(decoded.iter().copied());
+        let overflow = self.samples.len().saturating_sub(UNKNOWN_SSRC_MAX_SAMPLES);
+        if overflow > 0 {
+            self.samples.drain(..overflow);
+        }
+    }
+
+    fn drain_vec(&mut self) -> Vec<i16> {
+        self.last_update = Instant::now();
+        self.samples.drain(..).collect()
+    }
+}
+
+fn unknown_ssrc_buffers() -> &'static Mutex<HashMap<(GuildId, u32), UnknownSsrcAudio>> {
+    static UNKNOWN_SSRC_BUFFERS: OnceLock<Mutex<HashMap<(GuildId, u32), UnknownSsrcAudio>>> = OnceLock::new();
+    UNKNOWN_SSRC_BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn push_unknown_ssrc_audio(guild_id: GuildId, ssrc: u32, decoded: &[i16]) {
+    let now = Instant::now();
+    let mut map = unknown_ssrc_buffers()
+        .lock()
+        .expect("unknown ssrc buffer mutex poisoned");
+
+    map.retain(|_, buf| now.saturating_duration_since(buf.last_update) <= UNKNOWN_SSRC_RETENTION);
+
+    if !map.contains_key(&(guild_id, ssrc)) && map.len() >= UNKNOWN_SSRC_MAX_TRACKED {
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, buf)| buf.last_update)
+            .map(|(key, _)| *key)
+        {
+            map.remove(&oldest_key);
+        }
+    }
+
+    let entry = map.entry((guild_id, ssrc)).or_insert_with(UnknownSsrcAudio::new);
+    entry.push(decoded);
+}
+
+fn take_unknown_ssrc_audio(guild_id: GuildId, ssrc: u32) -> Vec<i16> {
+    let mut map = unknown_ssrc_buffers()
+        .lock()
+        .expect("unknown ssrc buffer mutex poisoned");
+    map.remove(&(guild_id, ssrc))
+        .map(|mut buf| buf.drain_vec())
+        .unwrap_or_default()
+}
+
+pub fn clear_unknown_ssrc_audio_for_guild(guild_id: GuildId) {
+    let mut map = unknown_ssrc_buffers()
+        .lock()
+        .expect("unknown ssrc buffer mutex poisoned");
+    map.retain(|(g, _), _| *g != guild_id);
+}
 
 struct DecodeJob {
     guild_id: GuildId,
@@ -297,8 +372,16 @@ impl VoiceEventHandler for VoiceTickHandler {
                 // Decoded audio without an SSRC mapping is not usable yet.
                 // Count it as startup receive failure signal so watchdog can recover.
                 self.unmapped_ssrc_activity.fetch_add(1, Ordering::SeqCst);
+                push_unknown_ssrc_audio(self.guild_id, *ssrc, decoded);
                 continue;
             };
+
+            let mut merged_audio = take_unknown_ssrc_audio(self.guild_id, *ssrc);
+            if merged_audio.is_empty() {
+                merged_audio = decoded.clone();
+            } else {
+                merged_audio.extend_from_slice(decoded);
+            }
 
             self.decode_activity.fetch_add(1, Ordering::SeqCst);
 
@@ -307,7 +390,12 @@ impl VoiceEventHandler for VoiceTickHandler {
             let mut stream = self.streams.entry(user_key).or_default();
             let processed = stream
                 .denoiser
-                .push_stereo_pcm(decoded, self.enable_denoiser);
+                .push_stereo_pcm(&merged_audio, self.enable_denoiser);
+            let resample_errors = stream.denoiser.take_resample_error_count();
+            if resample_errors > 0 {
+                self.resample_error_total
+                    .fetch_add(resample_errors, Ordering::SeqCst);
+            }
             if processed.speech_active {
                 currently_speaking.insert(user_id);
             }
@@ -433,7 +521,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 let should_finalize = {
                     let entry = &mut stream.buffer;
                     entry.silent_ticks = entry.silent_ticks.saturating_add(1);
-                    entry.silent_ticks >= SILENCE_TICKS_THRESHOLD && !entry.pcm.is_empty()
+                    entry.silent_ticks >= self.silence_ticks_threshold && !entry.pcm.is_empty()
                 };
 
                 if !should_finalize {

@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,11 +19,11 @@ use sherpa_onnx::{
     OfflineZipformerCtcModelConfig,
 };
 use tokio::sync::{mpsc, RwLock};
+use tokio::io::AsyncWriteExt;
 use serde::Serialize;
 
 use crate::app::{CallSession, Utterance};
 
-pub const SILENCE_TICKS_THRESHOLD: u32 = 20;
 pub const REORDER_WINDOW: Duration = Duration::from_millis(1500);
 pub const RNNOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 const EARSHOT_FRAME_SIZE: usize = 256;
@@ -430,6 +429,7 @@ pub struct UserDenoiseState {
     last_snr_db: f32,
     resampler_48k_to_16k: FftFixedInOut<f32>,
     resample_pending_48k: Vec<f32>,
+    resample_error_count: usize,
     preroll_16k: VecDeque<f32>,
     vad_hangover_frames: u8,
     was_speech_last_tick: bool,
@@ -460,6 +460,7 @@ impl UserDenoiseState {
             resampler_48k_to_16k: FftFixedInOut::new(48_000, 16_000, 960, 1)
                 .expect("valid fixed 48k->16k resampler config"),
             resample_pending_48k: Vec::new(),
+            resample_error_count: 0,
             preroll_16k: VecDeque::with_capacity(VAD_PREROLL_SAMPLES_16K),
             vad_hangover_frames: 0,
             was_speech_last_tick: false,
@@ -656,6 +657,7 @@ impl UserDenoiseState {
                 )
                 .is_err()
             {
+                self.resample_error_count = self.resample_error_count.saturating_add(1);
                 continue;
             }
             out.extend_from_slice(&self.resample_out_buf);
@@ -675,13 +677,17 @@ impl UserDenoiseState {
 
         if !self.warmed_up {
             self.warmed_up = true;
-            return Vec::new();
+            return input.to_vec();
         }
 
         output
             .into_iter()
             .map(|sample| sample / i16::MAX as f32)
             .collect()
+    }
+
+    pub fn take_resample_error_count(&mut self) -> usize {
+        std::mem::take(&mut self.resample_error_count)
     }
 }
 
@@ -811,14 +817,19 @@ pub async fn transcript_writer_loop(
         text: String,
     }
 
-    fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) {
-        let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(path) else {
+    async fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) {
+        let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .await
+        else {
             return;
         };
         let Ok(line) = serde_json::to_string(item) else {
             return;
         };
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(format!("{line}\n").as_bytes()).await;
     }
 
     async fn append_utterance(
@@ -842,7 +853,7 @@ pub async fn transcript_writer_loop(
         };
 
         drop(lock);
-        append_persisted_utterance(transcript_jsonl_path, &persisted);
+        append_persisted_utterance(transcript_jsonl_path, &persisted).await;
 
         pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
     }

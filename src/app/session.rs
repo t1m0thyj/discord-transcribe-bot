@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -14,15 +13,21 @@ use serenity::all::{
 use serde::Deserialize;
 use serenity::prelude::Context;
 use songbird::events::{CoreEvent, Event};
+use tokio::fs;
 use tokio::sync::mpsc;
 
 use super::{
     AppState, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT,
     STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS, STARTUP_RECEIVE_WATCHDOG_DELAY,
-    STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, ThreadContext, Utterance,
+    STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE, Utterance,
 };
-use crate::audio::{ClientDisconnectHandler, SpeakingUpdateHandler, VoiceTickHandler};
+use crate::audio::{
+    clear_unknown_ssrc_audio_for_guild, ClientDisconnectHandler, SpeakingUpdateHandler,
+    VoiceTickHandler,
+};
 use crate::transcription::transcribe_mono_pcm;
+
+const TRANSCRIPT_ATTACHMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 pub struct VoiceHandlerAttachContext {
     pub http: Arc<serenity::http::Http>,
@@ -34,6 +39,7 @@ pub struct VoiceHandlerAttachContext {
     pub inflight: Arc<AtomicUsize>,
     pub pending_commits: Arc<AtomicUsize>,
     pub decode_shed_total: Arc<AtomicUsize>,
+    pub resample_error_total: Arc<AtomicUsize>,
     pub decode_activity: Arc<AtomicUsize>,
     pub decode_failure_activity: Arc<AtomicUsize>,
     pub unmapped_ssrc_activity: Arc<AtomicUsize>,
@@ -49,15 +55,15 @@ pub async fn finalize_call_for_guild(
         return Ok(());
     };
 
-    settle_and_flush_guild_audio(state, guild_id).await;
-    wait_for_transcription_drain(state, guild_id).await;
-    wait_for_transcript_commit_drain(state, guild_id).await;
-
     let manager = songbird::get(ctx)
         .await
         .context("songbird voice manager unavailable")?
         .clone();
     let _ = manager.remove(guild_id).await;
+
+    settle_and_flush_guild_audio(state, guild_id).await;
+    wait_for_transcription_drain(state, guild_id).await;
+    wait_for_transcript_commit_drain(state, guild_id).await;
 
     for key in state
         .ssrc_to_user
@@ -68,6 +74,7 @@ pub async fn finalize_call_for_guild(
     {
         state.ssrc_to_user.remove(&key);
     }
+    clear_unknown_ssrc_audio_for_guild(guild_id);
 
     for key in state
         .streams
@@ -79,17 +86,14 @@ pub async fn finalize_call_for_guild(
         state.streams.remove(&key);
     }
 
-    settle_and_flush_guild_audio(state, guild_id).await;
-    wait_for_transcription_drain(state, guild_id).await;
-    wait_for_transcript_commit_drain(state, guild_id).await;
-
     state.utterance_senders.remove(&guild_id);
 
     let session = session_lock.read().await;
     let transcript = load_persisted_transcript(
         &session.transcript_jsonl_path,
         session.started_mono,
-    );
+    )
+    .await;
 
     let transcript_text = format_transcript(ctx, &transcript, session.started_at).await;
     let filename = format!(
@@ -100,9 +104,10 @@ pub async fn finalize_call_for_guild(
 
     let local_dir = PathBuf::from("transcripts");
     fs::create_dir_all(&local_dir)
+        .await
         .context("failed to create local transcript directory")?;
     let local_path = local_dir.join(&filename);
-    fs::write(&local_path, &transcript_text).with_context(|| {
+    fs::write(&local_path, &transcript_text).await.with_context(|| {
         format!(
             "failed to write local transcript file {}",
             local_path.display()
@@ -136,17 +141,12 @@ pub async fn finalize_call_for_guild(
         )
         .await?;
 
-    state.transcript_threads.insert(
-        thread.id,
-        ThreadContext {
-            transcript: transcript_text,
-            history: Vec::new(),
-        },
-    );
+    super::upsert_thread_context(state, thread.id, transcript_text);
 
     state.transcription_inflight.remove(&guild_id);
     state.transcript_pending_commits.remove(&guild_id);
     state.decode_shed_total.remove(&guild_id);
+    state.resample_error_total.remove(&guild_id);
     state.recovery_locks.remove(&guild_id);
     state.decoded_audio_activity.remove(&guild_id);
     state.decode_failure_activity.remove(&guild_id);
@@ -163,8 +163,8 @@ struct PersistedUtterance {
     text: String,
 }
 
-fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> Vec<Utterance> {
-    let Ok(content) = fs::read_to_string(path) else {
+async fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> Vec<Utterance> {
+    let Ok(content) = fs::read_to_string(path).await else {
         return Vec::new();
     };
 
@@ -196,6 +196,7 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
         inflight,
         pending_commits,
         decode_shed_total,
+        resample_error_total,
         decode_activity,
         decode_failure_activity,
         unmapped_ssrc_activity,
@@ -232,11 +233,13 @@ pub async fn attach_voice_handlers(state: &Arc<AppState>, ctx: VoiceHandlerAttac
             transcription_inflight: inflight,
             transcript_pending_commits: pending_commits,
             decode_shed_total,
+            resample_error_total,
             decode_activity,
             decode_failure_activity,
             unmapped_ssrc_activity,
             asr: Arc::clone(&state.asr),
             live_transcript_debug: state.live_transcript_debug,
+            silence_ticks_threshold: state.endpoint_silence_ticks,
             rolling_ingest_max_ms: state.rolling_ingest_max_ms,
             rolling_ingest_context_ms: state.rolling_ingest_context_ms,
         },
@@ -412,6 +415,7 @@ pub async fn startup_receive_watchdog(
     {
         state.ssrc_to_user.remove(&key);
     }
+    clear_unknown_ssrc_audio_for_guild(guild_id);
 
     let user_keys: HashSet<(GuildId, UserId)> = state
         .streams
@@ -524,6 +528,19 @@ pub async fn startup_receive_watchdog(
         schedule_next_retry(ctx, state, guild_id, voice_channel, text_channel, attempt).await;
         return;
     };
+    let resample_error_total = if let Some(counter) = state
+        .resample_error_total
+        .get(&guild_id)
+        .map(|v| Arc::clone(v.value()))
+    {
+        counter
+    } else {
+        let counter = Arc::new(AtomicUsize::new(0));
+        state
+            .resample_error_total
+            .insert(guild_id, Arc::clone(&counter));
+        counter
+    };
     let Some(started_notified) = state
         .transcription_started_notified
         .get(&guild_id)
@@ -553,6 +570,7 @@ pub async fn startup_receive_watchdog(
             inflight,
             pending_commits,
             decode_shed_total,
+            resample_error_total,
             decode_activity,
             decode_failure_activity,
             unmapped_ssrc_activity,
@@ -903,14 +921,17 @@ async fn ensure_thread_context_loaded(
         return Ok(());
     };
 
+    if attachment.size as u64 > TRANSCRIPT_ATTACHMENT_MAX_BYTES {
+        tracing::warn!(
+            thread = %channel_id,
+            bytes = attachment.size,
+            "skipping transcript attachment load: attachment exceeds size cap"
+        );
+        return Ok(());
+    }
+
     let transcript_text = reqwest::get(&attachment.url).await?.text().await?;
-    state.transcript_threads.insert(
-        channel_id,
-        ThreadContext {
-            transcript: transcript_text,
-            history: Vec::new(),
-        },
-    );
+    super::upsert_thread_context(state, channel_id, transcript_text);
 
     tracing::info!(thread = %channel_id, "loaded transcript context from attachment");
     Ok(())

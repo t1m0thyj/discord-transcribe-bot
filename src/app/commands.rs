@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -8,6 +7,7 @@ use anyhow::Context as _;
 use chrono::Utc;
 use serenity::all::{ChannelId, ChannelType, CommandDataOptionValue, CommandInteraction, GuildId};
 use serenity::prelude::Context;
+use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
 
 use super::{
@@ -92,6 +92,11 @@ pub(super) async fn handle_status(
         .get(&guild_id)
         .map(|v| v.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let resample_errors = state
+        .resample_error_total
+        .get(&guild_id)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0);
     let unmapped_ssrc = state
         .unmapped_ssrc_activity
         .get(&guild_id)
@@ -125,13 +130,14 @@ pub(super) async fn handle_status(
     let ss = elapsed.as_secs() % 60;
 
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nDecode shed total: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
+        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nDecode shed total: {}\nResample errors: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
         voice_channel.get(),
         text_channel.get(),
         participants,
         decoded_frames,
         decode_failures,
         decode_shed_total,
+        resample_errors,
         unmapped_ssrc,
         if started_notified { "yes" } else { "no" },
         mapped_ssrc,
@@ -504,13 +510,14 @@ pub(super) async fn start_call_session(
     let session_started_at = Utc::now();
     let local_dir = PathBuf::from("transcripts");
     fs::create_dir_all(&local_dir)
+        .await
         .context("failed to create local transcript directory")?;
     let transcript_jsonl_path = local_dir.join(format!(
         "transcript-{}-{}.jsonl",
         guild_id.get(),
         session_started_at.format("%Y%m%d-%H%M%S")
     ));
-    fs::File::create(&transcript_jsonl_path).with_context(|| {
+    fs::File::create(&transcript_jsonl_path).await.with_context(|| {
         format!(
             "failed to create transcript journal file {}",
             transcript_jsonl_path.display()
@@ -530,6 +537,10 @@ pub(super) async fn start_call_session(
     state
         .decode_shed_total
         .insert(guild_id, Arc::clone(&decode_shed_total));
+    let resample_error_total = Arc::new(AtomicUsize::new(0));
+    state
+        .resample_error_total
+        .insert(guild_id, Arc::clone(&resample_error_total));
     let decode_activity = Arc::new(AtomicUsize::new(0));
     state
         .decoded_audio_activity
@@ -579,6 +590,7 @@ pub(super) async fn start_call_session(
             inflight,
             pending_commits,
             decode_shed_total,
+            resample_error_total,
             decode_activity,
             decode_failure_activity,
             unmapped_ssrc_activity,
