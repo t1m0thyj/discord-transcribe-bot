@@ -1,10 +1,11 @@
 use std::env;
 
+use crate::ai::AiProviderConfig;
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub discord_token: String,
-    pub gemini_api_key: String,
-    pub gemini_model: String,
+    pub ai_provider: AiProviderConfig,
     pub asr_model_dir: String,
     pub asr_num_threads: i32,
     pub live_transcript_debug: bool,
@@ -22,8 +23,7 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let discord_token = env::var("DISCORD_TOKEN")?;
-        let gemini_api_key = env::var("GEMINI_API_KEY")?;
-        let gemini_model = env::var("GEMINI_MODEL")?;
+        let ai_provider = AiProviderConfig::from_env()?;
         let asr_model_dir = env::var("ASR_MODEL_DIR").map_err(|_| {
             anyhow::anyhow!("missing ASR model directory: set ASR_MODEL_DIR")
         })?;
@@ -89,8 +89,7 @@ impl AppConfig {
 
         Ok(Self {
             discord_token,
-            gemini_api_key,
-            gemini_model,
+            ai_provider,
             asr_model_dir,
             asr_num_threads,
             live_transcript_debug,

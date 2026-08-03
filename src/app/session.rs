@@ -24,7 +24,6 @@ use crate::audio::{
     clear_unknown_ssrc_audio_for_guild, ClientDisconnectHandler, SpeakingUpdateHandler,
     VoiceTickHandler,
 };
-use crate::gemini::summarize_transcript;
 use crate::transcription::{should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
 
 const TRANSCRIPT_ATTACHMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -971,7 +970,7 @@ async fn maybe_generate_post_call_summary(
 
     match tokio::time::timeout(
         timeout,
-        summarize_transcript(&state.gemini_key, &state.gemini_model, &transcript_context),
+        state.ai.summarize_transcript(&transcript_context),
     )
     .await
     {

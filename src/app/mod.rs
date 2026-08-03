@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
 use crate::config::AppConfig;
-use crate::gemini::ask_gemini;
+use crate::ai::AiClient;
 use crate::transcription::{
     AsrEngine, SsrcMap, Streams,
 };
@@ -78,8 +78,7 @@ pub struct AppState {
     pub active_calls: DashMap<GuildId, Arc<RwLock<CallSession>>>,
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
     pub thread_context_last_used: DashMap<ChannelId, Instant>,
-    pub gemini_key: String,
-    pub gemini_model: String,
+    pub ai: Arc<AiClient>,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
     pub endpoint_silence_ticks: u32,
@@ -99,13 +98,14 @@ pub struct AppState {
 impl AppState {
     pub fn new(cfg: AppConfig) -> anyhow::Result<Self> {
         let asr = Arc::new(AsrEngine::new(&cfg.asr_model_dir, cfg.asr_num_threads)?);
+        let ai = Arc::new(AiClient::new(cfg.ai_provider.clone()));
+        tracing::info!(provider = ai.provider_label(), "AI provider configured");
 
         Ok(Self {
             active_calls: DashMap::new(),
             transcript_threads: DashMap::new(),
             thread_context_last_used: DashMap::new(),
-            gemini_key: cfg.gemini_api_key,
-            gemini_model: cfg.gemini_model,
+            ai,
             live_transcript_debug: cfg.live_transcript_debug,
             enable_denoiser: cfg.enable_denoiser,
             // Endpoint uses VAD hangover plus silence ticks; effective trailing wait
@@ -261,15 +261,11 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
         let prior_turns = thread_ctx.history.clone();
         drop(thread_ctx);
 
-        let answer = ask_gemini(
-            &state.gemini_key,
-            &state.gemini_model,
-            &transcript,
-            &question,
-            Some(&prior_turns),
-        )
+        let answer = state
+            .ai
+            .ask(&transcript, &question, Some(&prior_turns))
         .await
-        .unwrap_or_else(|e| format!("gemini error: {e}"));
+        .unwrap_or_else(|e| format!("ai error: {e}"));
 
         let _ = msg.channel_id.say(&ctx.http, &answer).await;
 

@@ -281,15 +281,11 @@ pub(super) async fn handle_ask(
 
     let transcript = super::session::format_transcript(ctx, &snapshot, started_at).await;
 
-    let answer = crate::gemini::ask_gemini(
-        &state.gemini_key,
-        &state.gemini_model,
-        &transcript,
-        &question,
-        None,
-    )
-    .await
-    .unwrap_or_else(|e| format!("gemini error: {e}"));
+    let answer = state
+        .ai
+        .ask(&transcript, &question, None)
+        .await
+        .unwrap_or_else(|e| format!("ai error: {e}"));
 
     Ok(answer)
 }

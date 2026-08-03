@@ -5,8 +5,9 @@ Discord voice transcription + live Q&A bot in Rust.
 ## Quick start
 
 1. Copy `.env.example` to `.env` and fill values.
-   - Use a currently available Gemini model, e.g. `gemini-3.6-flash`.
-   - Alternative moving target alias: `gemini-flash-latest`.
+   - Set `AI_PROVIDER=ollama|gemini` (template default: `ollama`).
+   - Ollama: run `ollama serve`, set `OLLAMA_MODEL`, optionally change `OLLAMA_BASE_URL`.
+   - Gemini: set `GEMINI_API_KEY`; `GEMINI_MODEL` is optional (default: `gemini-flash-latest`).
 2. Ensure your ASR model directory exists under `ASR_MODEL_DIR`.
 	- Example paths in this repo: `models/sherpa-onnx-moonshine-base-en-int8`, `models/sherpa-onnx-whisper-base.en`
 3. Run:
@@ -69,7 +70,7 @@ Each utterance is prefixed with speaker name and elapsed call time.
 - `/join` - bot joins your current voice channel in that guild.
 - `/status` - shows current receive/transcription health and queue state.
 - `/log` - prints recent committed transcript lines.
-- `/ask` - asks Gemini about the current committed transcript.
+- `/ask` - asks the configured AI provider about the current committed transcript.
 - `/autojoin` - marks/unmarks your current voice channel (or an explicitly mentioned voice channel) by suffix so the bot auto-starts there later (default marker: `[Transcribe]`).
 - `/leave` - bot leaves and finalizes call transcript export.
 

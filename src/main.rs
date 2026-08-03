@@ -1,7 +1,7 @@
 mod app;
+mod ai;
 mod audio;
 mod config;
-mod gemini;
 mod transcription;
 
 use std::sync::Arc;
