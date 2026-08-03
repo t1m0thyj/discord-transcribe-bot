@@ -4,11 +4,17 @@ use anyhow::Context as _;
 
 use super::{AiMessage, AiProviderConfig};
 
-pub(super) fn provider_config_from_env() -> anyhow::Result<AiProviderConfig> {
-    let api_key = read_nonempty_env("GEMINI_API_KEY").context(
-        "missing GEMINI_API_KEY (required when AI_PROVIDER=gemini)",
-    )?;
-    let model = read_nonempty_env("GEMINI_MODEL")
+pub(super) fn provider_config(
+    api_key: Option<String>,
+    model: Option<String>,
+) -> anyhow::Result<AiProviderConfig> {
+    let api_key = api_key
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .context("missing GEMINI_API_KEY (required when AI_PROVIDER=gemini)")?;
+    let model = model
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "gemini-flash-latest".to_string());
 
     Ok(AiProviderConfig::Gemini { api_key, model })
@@ -89,9 +95,3 @@ pub async fn generate_chat(
     ))
 }
 
-fn read_nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}

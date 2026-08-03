@@ -1,7 +1,9 @@
-use std::env;
-
 mod gemini;
 mod ollama;
+
+use std::time::Duration;
+
+use anyhow::Context as _;
 
 const AI_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const AI_TURN_TEXT_MAX_CHARS: usize = 4_000;
@@ -20,14 +22,16 @@ pub enum AiProviderConfig {
 }
 
 impl AiProviderConfig {
-    pub fn from_env() -> anyhow::Result<Self> {
-        let provider = read_nonempty_env("AI_PROVIDER")
-            .unwrap_or_else(|| "ollama".to_string())
-            .to_ascii_lowercase();
-
-        match provider.as_str() {
-            "gemini" => gemini::provider_config_from_env(),
-            "ollama" => ollama::provider_config_from_env(),
+    pub fn from_selection(
+        provider: &str,
+        gemini_api_key: Option<String>,
+        gemini_model: Option<String>,
+        ollama_model: Option<String>,
+        ollama_base_url: Option<String>,
+    ) -> anyhow::Result<Self> {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "gemini" => gemini::provider_config(gemini_api_key, gemini_model),
+            "ollama" => ollama::provider_config(ollama_model, ollama_base_url),
             other => Err(anyhow::anyhow!(
                 "unsupported AI_PROVIDER='{}'. Expected one of: gemini, ollama",
                 other
@@ -43,13 +47,6 @@ impl AiProviderConfig {
     }
 }
 
-fn read_nonempty_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 #[derive(Clone)]
 pub struct AiClient {
     provider: AiProviderConfig,
@@ -57,11 +54,14 @@ pub struct AiClient {
 }
 
 impl AiClient {
-    pub fn new(provider: AiProviderConfig) -> Self {
-        Self {
-            provider,
-            http: reqwest::Client::new(),
-        }
+    pub fn new(provider: AiProviderConfig, request_timeout: u64) -> anyhow::Result<Self> {
+        let timeout = Duration::from_secs(request_timeout.max(1));
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("failed to create AI HTTP client")?;
+
+        Ok(Self { provider, http })
     }
 
     pub fn provider_label(&self) -> &'static str {

@@ -20,6 +20,7 @@ use crate::transcription::{
 
 mod commands;
 mod session;
+mod summary;
 
 pub(super) const LOG_DEFAULT_UTTERANCES: i64 = 40;
 pub(super) const LOG_MAX_DISCORD_CHARS: usize = 1800;
@@ -97,27 +98,38 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(cfg: AppConfig) -> anyhow::Result<Self> {
-        let asr = Arc::new(AsrEngine::new(&cfg.asr_model_dir, cfg.asr_num_threads)?);
-        let ai = Arc::new(AiClient::new(cfg.ai_provider.clone()));
-        tracing::info!(provider = ai.provider_label(), "AI provider configured");
+        let asr = Arc::new(AsrEngine::new(
+            &cfg.asr.model_dir,
+            cfg.asr.num_threads,
+            cfg.asr.model_family.as_deref(),
+        )?);
+        let ai = Arc::new(AiClient::new(
+            cfg.ai.provider.clone(),
+            cfg.ai.request_timeout,
+        )?);
+        tracing::info!(
+            provider = ai.provider_label(),
+            request_timeout = cfg.ai.request_timeout,
+            "AI provider configured"
+        );
 
         Ok(Self {
             active_calls: DashMap::new(),
             transcript_threads: DashMap::new(),
             thread_context_last_used: DashMap::new(),
             ai,
-            live_transcript_debug: cfg.live_transcript_debug,
-            enable_denoiser: cfg.enable_denoiser,
+            live_transcript_debug: cfg.debug.log_live_transcript,
+            enable_denoiser: cfg.audio.enable_denoiser,
             // Endpoint uses VAD hangover plus silence ticks; effective trailing wait
             // is roughly (endpoint_silence_ticks * 20ms) + ~256ms.
-            endpoint_silence_ticks: ((cfg.endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1),
-            rolling_ingest_max_ms: cfg.rolling_ingest_max_ms,
-            rolling_ingest_context_ms: cfg.rolling_ingest_context_ms,
-            autojoin_suffix: cfg.autojoin_suffix,
-            post_call_summary_enabled: cfg.post_call_summary_enabled,
-            post_call_summary_post_in_thread: cfg.post_call_summary_post_in_thread,
-            post_call_summary_include_in_markdown: cfg.post_call_summary_include_in_markdown,
-            post_call_summary_timeout_secs: cfg.post_call_summary_timeout_secs,
+            endpoint_silence_ticks: ((cfg.transcription.endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1),
+            rolling_ingest_max_ms: cfg.transcription.rolling_ingest_max_ms,
+            rolling_ingest_context_ms: cfg.transcription.rolling_ingest_context_ms,
+            autojoin_suffix: cfg.discord.autojoin_suffix,
+            post_call_summary_enabled: cfg.summary.enabled,
+            post_call_summary_post_in_thread: cfg.summary.post_in_thread,
+            post_call_summary_include_in_markdown: cfg.summary.include_in_markdown,
+            post_call_summary_timeout_secs: cfg.summary.timeout_secs,
             asr,
             ssrc_to_user: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),

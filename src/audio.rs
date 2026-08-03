@@ -8,9 +8,10 @@ use serenity::all::{GuildId, UserId};
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 
 use crate::app::{GuildRuntime, Utterance};
+use crate::denoiser::compute_rms;
 use crate::transcription::{
     should_dispatch_chunk, transcribe_mono_pcm, AsrEngine,
-    compute_rms, trim_finalize_tail,
+    trim_finalize_tail,
     SsrcMap, Streams,
 };
 

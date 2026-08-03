@@ -1,0 +1,38 @@
+[ai]
+provider = "ollama"
+request_timeout = 30
+
+[ai.ollama]
+model = "llama3.1:8b-instruct"
+base_url = "http://127.0.0.1:11434"
+
+[ai.gemini]
+# Optional; defaults to gemini-flash-latest.
+model = "gemini-flash-latest"
+
+[asr]
+model_dir = "models/sherpa-onnx-moonshine-base-en-int8"
+# Only needed for single-file model.onnx families that cannot be inferred.
+# One of: paraformer, sense_voice, nemo_ctc, zipformer_ctc, tdnn
+# model_family = "nemo_ctc"
+num_threads = 3
+
+[audio]
+enable_denoiser = false
+
+[debug]
+log_live_transcript = false
+
+[transcription]
+endpoint_silence_ms = 400
+rolling_ingest_max_ms = 12000
+rolling_ingest_context_ms = 1500
+
+[discord]
+autojoin_suffix = "[Transcribe]"
+
+[summary]
+enabled = false
+post_in_thread = true
+include_in_markdown = false
+timeout_secs = 30

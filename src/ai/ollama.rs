@@ -4,11 +4,16 @@ use anyhow::Context as _;
 
 use super::{AiMessage, AiProviderConfig};
 
-pub(super) fn provider_config_from_env() -> anyhow::Result<AiProviderConfig> {
-    let model = read_nonempty_env("OLLAMA_MODEL")
+pub(super) fn provider_config(
+    model: Option<String>,
+    base_url: Option<String>,
+) -> anyhow::Result<AiProviderConfig> {
+    let model = model
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .context("missing OLLAMA_MODEL (required when AI_PROVIDER=ollama)")?;
     Ok(AiProviderConfig::Ollama {
-        base_url: resolve_ollama_base_url(),
+        base_url: resolve_ollama_base_url(base_url),
         model,
     })
 }
@@ -70,17 +75,13 @@ pub async fn generate_chat(
     Ok(text)
 }
 
-fn resolve_ollama_base_url() -> String {
-    if let Some(base_url) = read_nonempty_env("OLLAMA_BASE_URL") {
+fn resolve_ollama_base_url(base_url: Option<String>) -> String {
+    if let Some(base_url) = base_url
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
         return base_url.trim_end_matches('/').to_string();
     }
 
     "http://127.0.0.1:11434".to_string()
-}
-
-fn read_nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
 }

@@ -2,6 +2,7 @@ mod app;
 mod ai;
 mod audio;
 mod config;
+mod denoiser;
 mod transcription;
 
 use std::sync::Arc;
@@ -59,12 +60,20 @@ impl EventHandler for Handler {
 }
 
 fn main() -> anyhow::Result<()> {
+    init_rustls_crypto_provider();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(run())
+}
+
+fn init_rustls_crypto_provider() {
+    // Required when reqwest uses rustls-no-provider.
+    // Ignore "already installed" in case dependencies initialize first.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn run() -> anyhow::Result<()> {

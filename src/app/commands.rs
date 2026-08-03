@@ -279,7 +279,7 @@ pub(super) async fn handle_ask(
         );
     }
 
-    let transcript = super::session::format_transcript(ctx, &snapshot, started_at).await;
+    let transcript = super::summary::format_transcript(ctx, &snapshot, started_at).await;
 
     let answer = state
         .ai
@@ -330,7 +330,7 @@ pub(super) async fn handle_log(
         .len()
         .saturating_sub(requested_utterances);
     let mut transcript =
-        super::session::format_transcript(ctx, &snapshot[start..], started_at).await;
+        super::summary::format_transcript(ctx, &snapshot[start..], started_at).await;
 
     if transcript.chars().count() > LOG_MAX_DISCORD_CHARS {
         let keep = LOG_MAX_DISCORD_CHARS.saturating_sub(48);

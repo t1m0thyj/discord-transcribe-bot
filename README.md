@@ -5,12 +5,16 @@ Discord voice transcription + live Q&A bot in Rust.
 ## Quick start
 
 1. Copy `.env.example` to `.env` and fill values.
-   - Set `AI_PROVIDER=ollama|gemini` (template default: `ollama`).
-   - Ollama: run `ollama serve`, set `OLLAMA_MODEL`, optionally change `OLLAMA_BASE_URL`.
-   - Gemini: set `GEMINI_API_KEY`; `GEMINI_MODEL` is optional (default: `gemini-flash-latest`).
-2. Ensure your ASR model directory exists under `ASR_MODEL_DIR`.
-	- Example paths in this repo: `models/sherpa-onnx-moonshine-base-en-int8`, `models/sherpa-onnx-whisper-base.en`
-3. Run:
+   - Keep secrets here: `DISCORD_TOKEN`, `GEMINI_API_KEY` (only needed if using Gemini).
+   - Optional: `APP_CONFIG_PATH` can point to a custom TOML path (default: `config.toml`).
+2. Copy `config.example.toml` to `config.toml` and edit settings.
+   - Set `[ai].provider = "ollama" | "gemini"` for AI summaries.
+   - Ollama: run `ollama serve`, set `[ai.ollama].model`, optionally change `[ai.ollama].base_url`.
+   - Gemini: set `[ai].provider = "gemini"`; `[ai.gemini].model` is optional (default: `gemini-flash-latest`).
+3. Ensure the ASR model directory in `[asr].model_dir` exists.
+   - Recommended: run `python scripts/download_model.py <repo_id>` to fetch a model from Hugging Face into `models/`.
+   - Example local paths: `models/sherpa-onnx-moonshine-base-en-int8`, `models/sherpa-onnx-whisper-base.en`
+4. Run:
 
 ```bash
 cargo run
@@ -20,7 +24,7 @@ cargo run
 
 To print live transcription lines to the console:
 
-1. Set `LIVE_TRANSCRIPT_DEBUG=true` in `.env`.
+1. Set `[debug].log_live_transcript = true` in `config.toml`.
 2. Run with debug logs enabled, for example:
 
 ```bash
@@ -60,10 +64,10 @@ Each utterance is prefixed with speaker name and elapsed call time.
 - The bot creates a thread from that transcript message.
 - Questions posted in that thread are answered using the transcript context.
 - If the bot restarts and thread context is not in memory, it lazily reloads the transcript from the starter message attachment on the first follow-up message.
-- Optional auto-summary is available via env vars (off by default for privacy).
-- `POST_CALL_SUMMARY_ENABLED=true`
-- `POST_CALL_SUMMARY_POST_IN_THREAD=true` (default)
-- `POST_CALL_SUMMARY_INCLUDE_IN_MARKDOWN=false` (default)
+- Optional auto-summary is configured under `[summary]` in `config.toml` (off by default).
+- `enabled = true`
+- `post_in_thread = true` (default)
+- `include_in_markdown = false` (default)
 
 ## Commands
 
@@ -80,7 +84,7 @@ Each utterance is prefixed with speaker name and elapsed call time.
 - After `/join`, the bot posts a short "Listening and waiting for speech..." message.
 - `/autojoin` renames the voice channel with a configurable suffix (default: ` [Transcribe]`); when a non-bot user joins that marked channel, the bot auto-starts transcription.
 - For autojoin sessions, status/transcript messages go to the first text channel in the same category as the voice channel.
-- Set `AUTOJOIN_SUFFIX` in `.env` to customize the marker text (for example: `[Transcribe]` or `🎙️`).
+- Set `[discord].autojoin_suffix` in `config.toml` to customize the marker text (for example: `[Transcribe]` or `🎙️`).
 - Once first usable speech is decoded, it posts "Started transcribing in <#voice-channel>." (once per call).
 - If receive starts unhealthy (no decoded audio after join), the bot attempts automatic voice receive recovery and posts concise retry status.
 
