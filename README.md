@@ -59,6 +59,10 @@ Each utterance is prefixed with speaker name and elapsed call time.
 - The bot creates a thread from that transcript message.
 - Questions posted in that thread are answered using the transcript context.
 - If the bot restarts and thread context is not in memory, it lazily reloads the transcript from the starter message attachment on the first follow-up message.
+- Optional auto-summary is available via env vars (off by default for privacy).
+- `POST_CALL_SUMMARY_ENABLED=true`
+- `POST_CALL_SUMMARY_POST_IN_THREAD=true` (default)
+- `POST_CALL_SUMMARY_INCLUDE_IN_MARKDOWN=false` (default)
 
 ## Commands
 

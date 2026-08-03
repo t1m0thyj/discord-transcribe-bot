@@ -24,9 +24,11 @@ use crate::audio::{
     clear_unknown_ssrc_audio_for_guild, ClientDisconnectHandler, SpeakingUpdateHandler,
     VoiceTickHandler,
 };
+use crate::gemini::summarize_transcript;
 use crate::transcription::{should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
 
 const TRANSCRIPT_ATTACHMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const THREAD_SUMMARY_MAX_CHARS: usize = 1_800;
 
 pub struct VoiceHandlerAttachContext {
     pub http: Arc<serenity::http::Http>,
@@ -86,6 +88,20 @@ pub async fn finalize_call_for_guild(
 
     let transcript_title = format_call_title(session.started_at);
     let call_duration = session.started_mono.elapsed();
+    let should_generate_summary = state.post_call_summary_enabled;
+    let include_summary_in_markdown =
+        should_generate_summary && state.post_call_summary_include_in_markdown;
+    let mut auto_summary = if include_summary_in_markdown {
+        maybe_generate_post_call_summary(
+            ctx,
+            state,
+            &transcript,
+            session.started_at,
+        )
+        .await
+    } else {
+        None
+    };
     let transcript_text =
         format_export_markdown(
             ctx,
@@ -93,6 +109,8 @@ pub async fn finalize_call_for_guild(
             session.started_at,
             call_duration,
             &transcript_title,
+            auto_summary.as_deref(),
+            include_summary_in_markdown,
         )
         .await;
     let filename = format!("transcript-{}.md", session.started_at.format("%Y%m%d-%H%M%S"));
@@ -130,6 +148,25 @@ pub async fn finalize_call_for_guild(
             serenity::builder::CreateThread::new(transcript_title),
         )
         .await?;
+
+    if should_generate_summary && state.post_call_summary_post_in_thread {
+        if auto_summary.is_none() {
+            auto_summary = maybe_generate_post_call_summary(
+                ctx,
+                state,
+                &transcript,
+                session.started_at,
+            )
+            .await;
+        }
+
+        if let Some(summary) = auto_summary.as_deref() {
+            let summary_message = format_summary_thread_message(summary);
+            if let Err(e) = thread.say(&ctx.http, summary_message).await {
+                tracing::warn!(guild = %guild_id, "failed to post auto-summary in thread: {e:#}");
+            }
+        }
+    }
 
     super::upsert_thread_context(state, thread.id, transcript_text);
 
@@ -871,6 +908,8 @@ async fn format_export_markdown(
     started_at: chrono::DateTime<chrono::Utc>,
     call_duration: Duration,
     title: &str,
+    summary: Option<&str>,
+    include_summary_in_markdown: bool,
 ) -> String {
     let by_user = resolve_display_names(ctx, transcript).await;
     let attendees = attendees_in_order(transcript, &by_user);
@@ -895,6 +934,12 @@ async fn format_export_markdown(
     }
     out.push("---".to_string());
     out.push(String::new());
+    if include_summary_in_markdown {
+        if let Some(summary_text) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(summary_text.to_string());
+            out.push(String::new());
+        }
+    }
     out.push("## Transcript".to_string());
     out.push(String::new());
     out.extend(build_transcript_lines(transcript, &by_user));
@@ -905,6 +950,64 @@ async fn format_export_markdown(
 
 fn format_call_title(started_at: chrono::DateTime<chrono::Utc>) -> String {
     format!("Transcript {}", started_at.format("%Y-%m-%d %H:%M:%S UTC"))
+}
+
+async fn maybe_generate_post_call_summary(
+    ctx: &Context,
+    state: &Arc<AppState>,
+    transcript: &[Utterance],
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if !state.post_call_summary_enabled {
+        return None;
+    }
+
+    if transcript.is_empty() {
+        return None;
+    }
+
+    let transcript_context = format_transcript(ctx, transcript, started_at).await;
+    let timeout = Duration::from_secs(state.post_call_summary_timeout_secs.max(5));
+
+    match tokio::time::timeout(
+        timeout,
+        summarize_transcript(&state.gemini_key, &state.gemini_model, &transcript_context),
+    )
+    .await
+    {
+        Ok(Ok(summary)) => {
+            let summary = summary.trim().to_string();
+            if summary.is_empty() {
+                tracing::warn!("auto-summary returned empty text");
+                None
+            } else {
+                Some(summary)
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("auto-summary failed: {e:#}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(timeout_secs = state.post_call_summary_timeout_secs, "auto-summary timed out");
+            None
+        }
+    }
+}
+
+fn format_summary_thread_message(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut message = trimmed.to_string();
+    if message.chars().count() > THREAD_SUMMARY_MAX_CHARS {
+        let keep = THREAD_SUMMARY_MAX_CHARS.saturating_sub(18);
+        let truncated: String = message.chars().take(keep).collect();
+        message = format!("{truncated}\n\n(truncated)");
+    }
+    message
 }
 
 async fn resolve_display_names(ctx: &Context, transcript: &[Utterance]) -> HashMap<UserId, String> {

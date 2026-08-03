@@ -13,6 +13,10 @@ pub struct AppConfig {
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
     pub autojoin_suffix: String,
+    pub post_call_summary_enabled: bool,
+    pub post_call_summary_post_in_thread: bool,
+    pub post_call_summary_include_in_markdown: bool,
+    pub post_call_summary_timeout_secs: u64,
 }
 
 impl AppConfig {
@@ -65,6 +69,24 @@ impl AppConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "[Transcribe]".to_string());
 
+        let post_call_summary_enabled = env::var("POST_CALL_SUMMARY_ENABLED")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        let post_call_summary_post_in_thread = env::var("POST_CALL_SUMMARY_POST_IN_THREAD")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let post_call_summary_include_in_markdown = env::var("POST_CALL_SUMMARY_INCLUDE_IN_MARKDOWN")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        let post_call_summary_timeout_secs = env::var("POST_CALL_SUMMARY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 5)
+            .unwrap_or(25);
+
         Ok(Self {
             discord_token,
             gemini_api_key,
@@ -77,6 +99,10 @@ impl AppConfig {
             rolling_ingest_max_ms,
             rolling_ingest_context_ms,
             autojoin_suffix,
+            post_call_summary_enabled,
+            post_call_summary_post_in_thread,
+            post_call_summary_include_in_markdown,
+            post_call_summary_timeout_secs,
         })
     }
 }
