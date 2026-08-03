@@ -84,12 +84,18 @@ pub async fn finalize_call_for_guild(
     )
     .await;
 
-    let transcript_text = format_transcript(ctx, &transcript, session.started_at).await;
-    let filename = format!(
-        "transcript-{}-{}.txt",
-        guild_id.get(),
-        session.started_at.format("%Y%m%d-%H%M%S")
-    );
+    let transcript_title = format_call_title(session.started_at);
+    let call_duration = session.started_mono.elapsed();
+    let transcript_text =
+        format_export_markdown(
+            ctx,
+            &transcript,
+            session.started_at,
+            call_duration,
+            &transcript_title,
+        )
+        .await;
+    let filename = format!("transcript-{}.md", session.started_at.format("%Y%m%d-%H%M%S"));
 
     let local_dir = PathBuf::from("transcripts");
     fs::create_dir_all(&local_dir)
@@ -116,17 +122,12 @@ pub async fn finalize_call_for_guild(
         )
         .await?;
 
-    let thread_name = format!(
-        "Transcript {}",
-        session.started_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
     let thread = session
         .text_channel
         .create_thread_from_message(
             &ctx.http,
             msg.id,
-            serenity::builder::CreateThread::new(thread_name),
+            serenity::builder::CreateThread::new(transcript_title),
         )
         .await?;
 
@@ -762,7 +763,7 @@ async fn ensure_thread_context_loaded(
     let Some(attachment) = starter
         .attachments
         .iter()
-        .find(|a| a.filename.starts_with("transcript-") && a.filename.ends_with(".txt"))
+        .find(|a| a.filename.starts_with("transcript-") && a.filename.ends_with(".md"))
     else {
         return Ok(());
     };
@@ -845,47 +846,151 @@ pub async fn format_transcript(
     transcript: &[Utterance],
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    if transcript.is_empty() {
-        return format!(
-            "Meeting transcript\nStarted: {} UTC\n\n(no captured speech)",
+    let by_user = resolve_display_names(ctx, transcript).await;
+    let mut lines = build_transcript_lines(transcript, &by_user);
+
+    lines.insert(0, String::new());
+    lines.insert(0, "## Transcript".to_string());
+    lines.insert(0, String::new());
+    lines.insert(
+        0,
+        format!(
+            "**Started:** {} UTC",
             started_at.format("%Y-%m-%d %H:%M:%S")
-        );
+        ),
+    );
+    lines.insert(0, String::new());
+    lines.insert(0, "# Meeting Transcript".to_string());
+
+    lines.join("\n")
+}
+
+async fn format_export_markdown(
+    ctx: &Context,
+    transcript: &[Utterance],
+    started_at: chrono::DateTime<chrono::Utc>,
+    call_duration: Duration,
+    title: &str,
+) -> String {
+    let by_user = resolve_display_names(ctx, transcript).await;
+    let attendees = attendees_in_order(transcript, &by_user);
+    let duration = format_duration(call_duration);
+
+    let mut out = Vec::new();
+    out.push("---".to_string());
+    out.push(format!("title: \"{}\"", yaml_escape_double_quoted(title)));
+    out.push("type: meeting".to_string());
+    out.push(format!(
+        "date: {}",
+        started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    ));
+    out.push(format!("duration: \"{}\"", duration));
+    out.push("source: discord".to_string());
+    out.push("status: complete".to_string());
+    if !attendees.is_empty() {
+        out.push("attendees:".to_string());
+        for attendee in attendees {
+            out.push(format!("  - {}", yaml_single_line_scalar(&attendee)));
+        }
+    }
+    out.push("---".to_string());
+    out.push(String::new());
+    out.push("## Transcript".to_string());
+    out.push(String::new());
+    out.extend(build_transcript_lines(transcript, &by_user));
+    out.push(String::new());
+
+    out.join("\n")
+}
+
+fn format_call_title(started_at: chrono::DateTime<chrono::Utc>) -> String {
+    format!("Transcript {}", started_at.format("%Y-%m-%d %H:%M:%S UTC"))
+}
+
+async fn resolve_display_names(ctx: &Context, transcript: &[Utterance]) -> HashMap<UserId, String> {
+    let mut by_user = HashMap::<UserId, String>::new();
+    for utt in transcript {
+        if by_user.contains_key(&utt.user_id) {
+            continue;
+        }
+        let name = match utt.user_id.to_user(&ctx.http).await {
+            Ok(u) => u.display_name().to_string(),
+            Err(_) => format!("{}", utt.user_id.get()),
+        };
+        by_user.insert(utt.user_id, name);
+    }
+    by_user
+}
+
+fn attendees_in_order(transcript: &[Utterance], by_user: &HashMap<UserId, String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut attendees = Vec::new();
+    for utt in transcript {
+        if !seen.insert(utt.user_id) {
+            continue;
+        }
+        if let Some(name) = by_user.get(&utt.user_id) {
+            attendees.push(name.clone());
+        }
+    }
+    attendees
+}
+
+fn build_transcript_lines(transcript: &[Utterance], by_user: &HashMap<UserId, String>) -> Vec<String> {
+    if transcript.is_empty() {
+        return vec!["_No captured speech._".to_string()];
     }
 
-    let mut by_user = HashMap::<UserId, String>::new();
     let mut lines = Vec::with_capacity(transcript.len());
     let first = transcript[0].start_ts;
 
-    lines.push("Meeting transcript".to_string());
-    lines.push(format!(
-        "Started: {} UTC",
-        started_at.format("%Y-%m-%d %H:%M:%S")
-    ));
-    lines.push("Format: [HH:MM:SS] Speaker: text".to_string());
-    lines.push(String::new());
-
     for utt in transcript {
-        let display = if let Some(name) = by_user.get(&utt.user_id) {
-            name.clone()
-        } else {
-            let name = match utt.user_id.to_user(&ctx.http).await {
-                Ok(u) => u.display_name().to_string(),
-                Err(_) => format!("{}", utt.user_id.get()),
-            };
-            by_user.insert(utt.user_id, name.clone());
-            name
-        };
+        let display = by_user
+            .get(&utt.user_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{}", utt.user_id.get()));
 
         let delta = utt.start_ts.saturating_duration_since(first);
-        let total = delta.as_secs();
-        let hh = total / 3600;
-        let mm = (total % 3600) / 60;
-        let ss = total % 60;
-
-        lines.push(format!("[{hh:02}:{mm:02}:{ss:02}] {display}: {}", utt.text));
+        let stamp = format_transcript_stamp(delta);
+        lines.push(format!("[{display} {stamp}] {}", utt.text));
     }
 
-    lines.join("\n")
+    lines
+}
+
+fn format_transcript_stamp(delta: Duration) -> String {
+    let total = delta.as_secs();
+    let mm = total / 60;
+    let ss = total % 60;
+    format!("{mm}:{ss:02}")
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn yaml_escape_double_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn yaml_single_line_scalar(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", yaml_escape_double_quoted(value))
+    }
 }
 
 pub(super) async fn maybe_load_thread_context(

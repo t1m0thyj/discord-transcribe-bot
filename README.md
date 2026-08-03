@@ -33,19 +33,29 @@ You will see `live transcription` log lines in the terminal as utterances are tr
 Transcript exports are chronological and Zoom-like:
 
 ```text
-Meeting transcript
-Started: 2026-07-25 20:15:04 UTC
-Format: [HH:MM:SS] Speaker: text
+---
+title: "Transcript 2026-07-25 20:15:04 UTC"
+type: meeting
+date: 2026-07-25T20:15:04Z
+duration: "48m 12s"
+source: discord
+status: complete
+attendees:
+   - Alice
+   - Bob
+---
 
-[00:00:02] Alice: Let us begin.
-[00:00:05] Bob: Sounds good.
+## Transcript
+
+[Alice 0:03] Are we ready to deploy?
+[Bob 0:08] I will run the final tests tonight.
 ```
 
-`HH:MM:SS` is elapsed call time from the first captured utterance.
+Each utterance is prefixed with speaker name and elapsed call time.
 
 ## After the call ends
 
-- The bot posts the full transcript as a `.txt` file attachment.
+- The bot posts the full transcript as a Markdown (`.md`) file attachment.
 - The bot creates a thread from that transcript message.
 - Questions posted in that thread are answered using the transcript context.
 - If the bot restarts and thread context is not in memory, it lazily reloads the transcript from the starter message attachment on the first follow-up message.
