@@ -14,6 +14,7 @@ use super::{
     AppState, CallSession, GuildRuntime, LOG_DEFAULT_UTTERANCES,
     LOG_MAX_DISCORD_CHARS, Utterance,
 };
+use crate::audio::{decode_queue_capacity, decode_queue_depth};
 use crate::transcription::transcript_writer_loop;
 
 pub(super) async fn handle_join(
@@ -57,7 +58,6 @@ pub(super) async fn handle_status(
 
     let session = session_lock.read().await;
     let voice_channel = session.voice_channel;
-    let text_channel = session.text_channel;
     let utterance_count = session.transcript.len();
     let elapsed = session.started_mono.elapsed();
     drop(session);
@@ -71,10 +71,6 @@ pub(super) async fn handle_status(
         .as_ref()
         .map(|v| v.decoded_audio_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let started_notified = runtime
-        .as_ref()
-        .map(|v| v.transcription_started_notified.load(Ordering::SeqCst))
-        .unwrap_or(false);
     let inflight = runtime
         .as_ref()
         .map(|v| v.transcription_inflight.load(Ordering::SeqCst))
@@ -87,33 +83,34 @@ pub(super) async fn handle_status(
         .as_ref()
         .map(|v| v.decode_failure_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let decode_jobs_total = runtime
+        .as_ref()
+        .map(|v| v.decode_jobs_total.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let decode_jobs_with_text = runtime
+        .as_ref()
+        .map(|v| v.decode_jobs_with_text.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let decode_audio_total_ms = runtime
+        .as_ref()
+        .map(|v| v.decode_audio_total_ms.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let decode_total_ms = runtime
+        .as_ref()
+        .map(|v| v.decode_total_ms.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let decode_queue_wait_total_ms = runtime
+        .as_ref()
+        .map(|v| v.decode_queue_wait_total_ms.load(Ordering::SeqCst))
+        .unwrap_or(0);
     let decode_shed_total = runtime
         .as_ref()
         .map(|v| v.decode_shed_total.load(Ordering::SeqCst))
-        .unwrap_or(0);
-    let dispatch_gate_total = runtime
-        .as_ref()
-        .map(|v| v.dispatch_gate_total.load(Ordering::SeqCst))
-        .unwrap_or(0);
-    let resample_errors = runtime
-        .as_ref()
-        .map(|v| v.resample_error_total.load(Ordering::SeqCst))
         .unwrap_or(0);
     let unmapped_ssrc = runtime
         .as_ref()
         .map(|v| v.unmapped_ssrc_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let mapped_ssrc = state
-        .ssrc_to_user
-        .iter()
-        .filter(|e| e.key().0 == guild_id)
-        .count();
-    let buffered_users = state
-        .streams
-        .iter()
-        .filter(|e| e.key().0 == guild_id && !e.value().buffer.pcm.is_empty())
-        .count();
-
     let participants = ctx
         .cache
         .guild(guild_id)
@@ -130,23 +127,105 @@ pub(super) async fn handle_status(
     let mm = (elapsed.as_secs() % 3600) / 60;
     let ss = elapsed.as_secs() % 60;
 
+    let queue_depth = decode_queue_depth();
+    let queue_capacity = decode_queue_capacity();
+    let decode_failure_pct = {
+        let denom = decoded_frames.saturating_add(decode_failures);
+        if denom == 0 {
+            0.0
+        } else {
+            (decode_failures as f64 * 100.0) / denom as f64
+        }
+    };
+    let rtf = if decode_audio_total_ms == 0 {
+        0.0
+    } else {
+        decode_total_ms as f64 / decode_audio_total_ms as f64
+    };
+    let avg_decode_ms = if decode_jobs_total == 0 {
+        0.0
+    } else {
+        decode_total_ms as f64 / decode_jobs_total as f64
+    };
+    let avg_queue_wait_ms = if decode_jobs_total == 0 {
+        0.0
+    } else {
+        decode_queue_wait_total_ms as f64 / decode_jobs_total as f64
+    };
+    let decode_shed_per_min = {
+        let elapsed_min = (elapsed.as_secs_f64() / 60.0).max(1e-6);
+        decode_shed_total as f64 / elapsed_min
+    };
+
+    let queue_alert = if queue_depth > 8 {
+        "critical"
+    } else if queue_depth > 4 {
+        "warn"
+    } else {
+        "ok"
+    };
+    let rtf_alert = if rtf > 0.8 {
+        "critical"
+    } else if rtf > 0.5 {
+        "warn"
+    } else {
+        "ok"
+    };
+    let failure_alert = if decode_failure_pct > 5.0 {
+        "critical"
+    } else if decode_failure_pct > 1.0 {
+        "warn"
+    } else {
+        "ok"
+    };
+    let shed_alert = if decode_shed_per_min > 1.0 {
+        "critical"
+    } else if decode_shed_total > 0 {
+        "warn"
+    } else {
+        "ok"
+    };
+    let unmapped_alert = if elapsed.as_secs() > 30 && unmapped_ssrc > 0 {
+        "warn"
+    } else {
+        "ok"
+    };
+
+    tracing::info!(
+        guild = %guild_id,
+        queue_depth,
+        queue_capacity,
+        decode_jobs_total,
+        decode_jobs_with_text,
+        decode_failure_pct = format!("{decode_failure_pct:.2}"),
+        rtf = format!("{rtf:.3}"),
+        avg_decode_ms = format!("{avg_decode_ms:.1}"),
+        avg_queue_wait_ms = format!("{avg_queue_wait_ms:.1}"),
+        decode_shed_per_min = format!("{decode_shed_per_min:.2}"),
+        "status metrics snapshot"
+    );
+
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nText channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nDecoded audio frames seen: {}\nDecode failures: {}\nDecode shed total: {}\nDispatch gate drops: {}\nResample errors: {}\nUnmapped SSRC events: {}\nStarted transcribing: {}\nMapped SSRC entries: {}\nUsers with buffered audio: {}\nTranscript utterances: {}\nASR in-flight tasks: {}\nPending transcript commits: {}",
+        "Transcription status\nVoice channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nQueue depth: {}/{} [{}]\nASR in-flight: {}\nPending commits: {}\nDecode failure: {:.2}% [{}]\nRTF (decode/audio): {:.3} [{}]\nDecode wait/decode ms (avg): {:.1}/{:.1}\nDecode shed: {} ({:.2}/min) [{}]\nUnmapped SSRC: {} [{}]\nTranscript utterances: {}",
         voice_channel.get(),
-        text_channel.get(),
         participants,
-        decoded_frames,
-        decode_failures,
-        decode_shed_total,
-        dispatch_gate_total,
-        resample_errors,
-        unmapped_ssrc,
-        if started_notified { "yes" } else { "no" },
-        mapped_ssrc,
-        buffered_users,
-        utterance_count,
+        queue_depth,
+        queue_capacity,
+        queue_alert,
         inflight,
         pending_commits,
+        decode_failure_pct,
+        failure_alert,
+        rtf,
+        rtf_alert,
+        avg_queue_wait_ms,
+        avg_decode_ms,
+        decode_shed_total,
+        decode_shed_per_min,
+        shed_alert,
+        unmapped_ssrc,
+        unmapped_alert,
+        utterance_count,
     ))
 }
 
@@ -530,6 +609,13 @@ pub(super) async fn start_call_session(
         utterance_tx: utterance_tx.clone(),
         transcription_inflight: Arc::new(AtomicUsize::new(0)),
         transcript_pending_commits: Arc::new(AtomicUsize::new(0)),
+        decode_jobs_total: Arc::new(AtomicUsize::new(0)),
+        decode_jobs_with_text: Arc::new(AtomicUsize::new(0)),
+        decode_audio_total_ms: Arc::new(AtomicUsize::new(0)),
+        decode_total_ms: Arc::new(AtomicUsize::new(0)),
+        decode_queue_wait_total_ms: Arc::new(AtomicUsize::new(0)),
+        decode_last_ms: Arc::new(AtomicUsize::new(0)),
+        decode_queue_wait_last_ms: Arc::new(AtomicUsize::new(0)),
         decode_shed_total: Arc::new(AtomicUsize::new(0)),
         dispatch_gate_total: Arc::new(AtomicUsize::new(0)),
         resample_error_total: Arc::new(AtomicUsize::new(0)),

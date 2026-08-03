@@ -156,6 +156,7 @@ struct DecodeJob {
     start_ts: Instant,
     stage: &'static str,
     pcm: Vec<f32>,
+    enqueued_at: Instant,
     runtime: Arc<GuildRuntime>,
     asr: Arc<AsrEngine>,
     live_transcript_debug: bool,
@@ -198,6 +199,19 @@ impl DecodeDispatcher {
     }
 }
 
+pub fn decode_queue_depth() -> usize {
+    let dispatcher = DecodeDispatcher::global();
+    let queue = dispatcher
+        .queue
+        .lock()
+        .expect("decode queue mutex poisoned");
+    queue.len()
+}
+
+pub fn decode_queue_capacity() -> usize {
+    DECODE_QUEUE_CAPACITY
+}
+
 fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
     tokio::spawn(async move {
         loop {
@@ -223,7 +237,30 @@ fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
 }
 
 async fn process_decode_job(job: DecodeJob) {
-    if let Some(text) = transcribe_utterance_blocking(&job.asr, job.pcm).await {
+    let queue_wait_ms = job.enqueued_at.elapsed().as_millis() as usize;
+    let audio_ms = (job.pcm.len().saturating_mul(1000)) / 16_000;
+    let decode_started = Instant::now();
+    let decode_result = transcribe_utterance_blocking(&job.asr, job.pcm).await;
+    let decode_ms = decode_started.elapsed().as_millis() as usize;
+
+    job.runtime.decode_jobs_total.fetch_add(1, Ordering::SeqCst);
+    job.runtime
+        .decode_audio_total_ms
+        .fetch_add(audio_ms, Ordering::SeqCst);
+    job.runtime
+        .decode_total_ms
+        .fetch_add(decode_ms, Ordering::SeqCst);
+    job.runtime
+        .decode_queue_wait_total_ms
+        .fetch_add(queue_wait_ms, Ordering::SeqCst);
+    job.runtime
+        .decode_last_ms
+        .store(decode_ms, Ordering::SeqCst);
+    job.runtime
+        .decode_queue_wait_last_ms
+        .store(queue_wait_ms, Ordering::SeqCst);
+
+    if let Some(text) = decode_result {
         if job.live_transcript_debug {
             tracing::debug!(
                 user = %job.user_id,
@@ -232,6 +269,10 @@ async fn process_decode_job(job: DecodeJob) {
                 "final transcription"
             );
         }
+
+        job.runtime
+            .decode_jobs_with_text
+            .fetch_add(1, Ordering::SeqCst);
 
         job.runtime
             .transcript_pending_commits
@@ -449,6 +490,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                     start_ts,
                     stage: "rollover",
                     pcm,
+                    enqueued_at: Instant::now(),
                     runtime: Arc::clone(&self.runtime),
                     asr: Arc::clone(&self.asr),
                     live_transcript_debug: self.live_transcript_debug,
@@ -523,6 +565,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                     start_ts,
                     stage: "silence",
                     pcm,
+                    enqueued_at: Instant::now(),
                     runtime: Arc::clone(&self.runtime),
                     asr: Arc::clone(&self.asr),
                     live_transcript_debug: self.live_transcript_debug,
