@@ -48,16 +48,25 @@ impl DecodeDispatcher {
             .queue
             .lock()
             .expect("decode queue mutex poisoned");
-        let dropped = if queue.len() >= self.capacity {
-            queue.pop_front()
-        } else {
-            None
-        };
-        queue.push_back(job);
+        let dropped = push_bounded(&mut queue, job, self.capacity);
         drop(queue);
         self.notify.notify_one();
         dropped
     }
+}
+
+fn push_bounded<T>(queue: &mut VecDeque<T>, item: T, capacity: usize) -> Option<T> {
+    if capacity == 0 {
+        return Some(item);
+    }
+
+    let dropped = if queue.len() >= capacity {
+        queue.pop_front()
+    } else {
+        None
+    };
+    queue.push_back(item);
+    dropped
 }
 
 pub fn decode_queue_depth() -> usize {
@@ -184,4 +193,33 @@ async fn transcribe_utterance_blocking(
     pcm_mono: Vec<f32>,
 ) -> Option<String> {
     transcribe_mono_pcm(Arc::clone(asr), pcm_mono).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::push_bounded;
+
+    #[test]
+    fn bounded_queue_keeps_fifo_order_until_full() {
+        let mut queue = VecDeque::new();
+        assert_eq!(push_bounded(&mut queue, 1, 2), None);
+        assert_eq!(push_bounded(&mut queue, 2, 2), None);
+        assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn bounded_queue_sheds_oldest_item_when_full() {
+        let mut queue = VecDeque::from([1, 2]);
+        assert_eq!(push_bounded(&mut queue, 3, 2), Some(1));
+        assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn zero_capacity_sheds_new_item_without_mutating_queue() {
+        let mut queue = VecDeque::new();
+        assert_eq!(push_bounded(&mut queue, 1, 0), Some(1));
+        assert!(queue.is_empty());
+    }
 }

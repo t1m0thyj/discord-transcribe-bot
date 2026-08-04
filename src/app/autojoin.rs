@@ -77,34 +77,63 @@ pub(super) fn pick_autojoin_text_channel(
     guild: &serenity::model::guild::Guild,
     voice_channel_id: ChannelId,
 ) -> Option<ChannelId> {
-    let voice_parent_id = guild
+    let channels: Vec<ChannelSummary> = guild
         .channels
-        .get(&voice_channel_id)
-        .and_then(|ch| ch.parent_id);
+        .iter()
+        .map(|(id, channel)| ChannelSummary {
+            id: *id,
+            kind: channel.kind,
+            parent_id: channel.parent_id,
+            position: channel.position,
+        })
+        .collect();
+
+    pick_autojoin_text_channel_from_channels(
+        &channels,
+        voice_channel_id,
+        guild.system_channel_id,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ChannelSummary {
+    id: ChannelId,
+    kind: ChannelType,
+    parent_id: Option<ChannelId>,
+    position: u16,
+}
+
+fn pick_autojoin_text_channel_from_channels(
+    channels: &[ChannelSummary],
+    voice_channel_id: ChannelId,
+    system_channel_id: Option<ChannelId>,
+) -> Option<ChannelId> {
+    let voice_parent_id = channels
+        .iter()
+        .find(|channel| channel.id == voice_channel_id)
+        .and_then(|channel| channel.parent_id);
 
     if let Some(parent_id) = voice_parent_id {
-        let same_category = guild
-            .channels
+        let same_category = channels
             .iter()
-            .filter(|(_, ch)| ch.kind == ChannelType::Text && ch.parent_id == Some(parent_id))
-            .min_by_key(|(_, ch)| (ch.position, ch.id.get()))
-            .map(|(id, _)| *id);
+            .filter(|channel| channel.kind == ChannelType::Text && channel.parent_id == Some(parent_id))
+            .min_by_key(|channel| (channel.position, channel.id.get()))
+            .map(|channel| channel.id);
 
         if same_category.is_some() {
             return same_category;
         }
     }
 
-    if let Some(system_id) = guild.system_channel_id {
+    if let Some(system_id) = system_channel_id {
         return Some(system_id);
     }
 
-    guild
-        .channels
+    channels
         .iter()
-        .filter(|(_, ch)| ch.kind == ChannelType::Text)
-        .min_by_key(|(_, ch)| (ch.position, ch.id.get()))
-        .map(|(id, _)| *id)
+        .filter(|channel| channel.kind == ChannelType::Text)
+        .min_by_key(|channel| (channel.position, channel.id.get()))
+        .map(|channel| channel.id)
 }
 
 pub(super) fn normalized_autojoin_suffix(suffix: &str) -> String {
@@ -121,7 +150,26 @@ pub(super) fn strip_known_autojoin_suffix(name: &str, suffix: &str) -> Option<St
 
 #[cfg(test)]
 mod tests {
-    use super::{normalized_autojoin_suffix, strip_known_autojoin_suffix};
+    use serenity::all::{ChannelId, ChannelType};
+
+    use super::{
+        ChannelSummary, normalized_autojoin_suffix, pick_autojoin_text_channel_from_channels,
+        strip_known_autojoin_suffix,
+    };
+
+    fn channel(
+        id: u64,
+        kind: ChannelType,
+        parent_id: Option<u64>,
+        position: u16,
+    ) -> ChannelSummary {
+        ChannelSummary {
+            id: ChannelId::new(id),
+            kind,
+            parent_id: parent_id.map(ChannelId::new),
+            position,
+        }
+    }
 
     #[test]
     fn normalized_suffix_uses_default_when_blank() {
@@ -142,6 +190,39 @@ mod tests {
         assert_eq!(
             strip_known_autojoin_suffix("General", " [Transcribe]"),
             None
+        );
+    }
+
+    #[test]
+    fn suffix_helpers_handle_leading_space_and_suffix_only_name() {
+        assert_eq!(normalized_autojoin_suffix(" [Live]"), " [Live]");
+        assert_eq!(
+            strip_known_autojoin_suffix(" [Transcribe]", " [Transcribe]"),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn autojoin_text_channel_prefers_category_then_system_then_global_tiebreak() {
+        let channels = [
+            channel(1, ChannelType::Voice, Some(10), 0),
+            channel(4, ChannelType::Text, Some(10), 2),
+            channel(3, ChannelType::Text, Some(10), 2),
+            channel(2, ChannelType::Text, None, 0),
+        ];
+        assert_eq!(
+            pick_autojoin_text_channel_from_channels(&channels, ChannelId::new(1), Some(ChannelId::new(2))),
+            Some(ChannelId::new(3))
+        );
+
+        let no_category_text = [channel(1, ChannelType::Voice, Some(10), 0), channel(2, ChannelType::Text, None, 3)];
+        assert_eq!(
+            pick_autojoin_text_channel_from_channels(&no_category_text, ChannelId::new(1), Some(ChannelId::new(99))),
+            Some(ChannelId::new(99))
+        );
+        assert_eq!(
+            pick_autojoin_text_channel_from_channels(&no_category_text, ChannelId::new(1), None),
+            Some(ChannelId::new(2))
         );
     }
 }

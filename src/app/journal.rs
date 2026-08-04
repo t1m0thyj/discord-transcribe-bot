@@ -3,11 +3,19 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serenity::all::UserId;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
 
 use super::{CallSession, GuildRuntime, Utterance};
+
+#[derive(Deserialize, Serialize)]
+struct PersistedUtterance {
+    user_id: u64,
+    start_offset_ms: u64,
+    text: String,
+}
 
 pub async fn transcript_writer_loop(
     session: Arc<RwLock<CallSession>>,
@@ -15,13 +23,6 @@ pub async fn transcript_writer_loop(
     runtime: Arc<GuildRuntime>,
     transcript_jsonl_path: PathBuf,
 ) {
-    #[derive(Serialize)]
-    struct PersistedUtterance {
-        user_id: u64,
-        start_offset_ms: u64,
-        text: String,
-    }
-
     async fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) {
         let Ok(mut file) = tokio::fs::OpenOptions::new()
             .append(true)
@@ -74,6 +75,29 @@ pub async fn transcript_writer_loop(
         )
         .await;
     }
+}
+
+pub(super) async fn load_persisted_transcript(
+    path: &Path,
+    started_mono: std::time::Instant,
+) -> Vec<Utterance> {
+    let Ok(content) = tokio::fs::read_to_string(path).await else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let Ok(item) = serde_json::from_str::<PersistedUtterance>(line) else {
+            continue;
+        };
+        out.push(Utterance {
+            user_id: UserId::new(item.user_id),
+            start_ts: started_mono + Duration::from_millis(item.start_offset_ms),
+            text: item.text,
+        });
+    }
+    out.sort_by_key(|utterance| utterance.start_ts);
+    out
 }
 
 pub async fn prune_old_transcripts(dir: &Path, retention: Duration) -> usize {
@@ -132,11 +156,32 @@ pub async fn prune_old_transcripts(dir: &Path, retention: Duration) -> usize {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use super::prune_old_transcripts;
+    use chrono::Utc;
+    use serenity::all::{ChannelId, UserId};
+    use tokio::sync::{mpsc, RwLock};
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    use super::{load_persisted_transcript, prune_old_transcripts, transcript_writer_loop};
+    use crate::app::{CallSession, GuildRuntime, Utterance};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(name: &str) -> TempDir {
         let unique = format!(
             "transcribe-bot-tests-{}-{}-{}",
             name,
@@ -148,26 +193,88 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(unique);
         fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        TempDir(dir)
     }
 
     #[tokio::test]
     async fn prune_old_transcripts_only_deletes_matching_jsonl_files() {
         let dir = temp_dir("prune");
-        let keep_non_transcript = dir.join("notes.jsonl");
-        let keep_wrong_ext = dir.join("transcript-demo.txt");
-        let prune_target = dir.join("transcript-demo.jsonl");
+        let keep_non_transcript = dir.path().join("notes.jsonl");
+        let keep_wrong_ext = dir.path().join("transcript-demo.txt");
+        let prune_target = dir.path().join("transcript-demo.jsonl");
 
         fs::write(&keep_non_transcript, b"x").expect("write notes");
         fs::write(&keep_wrong_ext, b"x").expect("write txt");
         fs::write(&prune_target, b"x").expect("write transcript");
 
-        let deleted = prune_old_transcripts(&dir, Duration::ZERO).await;
+        let deleted = prune_old_transcripts(dir.path(), Duration::ZERO).await;
         assert_eq!(deleted, 1);
         assert!(keep_non_transcript.exists());
         assert!(keep_wrong_ext.exists());
         assert!(!prune_target.exists());
 
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn journal_round_trips_through_writer_and_loader() {
+        let dir = temp_dir("journal-roundtrip");
+        let path = dir.path().join("transcript.jsonl");
+        let started_mono = Instant::now();
+        let session = Arc::new(RwLock::new(CallSession {
+            voice_channel: ChannelId::new(1),
+            text_channel: ChannelId::new(2),
+            transcript: Vec::new(),
+            transcript_jsonl_path: path.clone(),
+            started_at: Utc::now(),
+            started_mono,
+        }));
+        let (runtime_tx, _runtime_rx) = mpsc::channel(1);
+        let runtime = Arc::new(GuildRuntime::new(runtime_tx));
+        let (tx, rx) = mpsc::channel(8);
+        let writer = tokio::spawn(transcript_writer_loop(
+            Arc::clone(&session),
+            rx,
+            Arc::clone(&runtime),
+            path.clone(),
+        ));
+
+        for (offset_ms, text) in [(2_000, "second \"quoted\""), (500, "first\nline")] {
+            runtime
+                .transcript_pending_commits
+                .fetch_add(1, Ordering::SeqCst);
+            tx.send(Utterance {
+                user_id: UserId::new(42),
+                start_ts: started_mono + Duration::from_millis(offset_ms),
+                text: text.to_string(),
+            })
+            .await
+            .expect("enqueue utterance");
+        }
+        drop(tx);
+        writer.await.expect("writer task completes");
+
+        assert_eq!(runtime.transcript_pending_commits.load(Ordering::SeqCst), 0);
+        let loaded = load_persisted_transcript(&path, started_mono).await;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].text, "first\nline");
+        assert_eq!(loaded[1].text, "second \"quoted\"");
+    }
+
+    #[tokio::test]
+    async fn journal_loader_skips_malformed_lines_and_saturates_negative_offsets() {
+        let dir = temp_dir("journal-malformed");
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(
+            &path,
+            "{\"user_id\":7,\"start_offset_ms\":0,\"text\":\"first\"}\nnot-json\n{\"user_id\":8,\"start_offset_ms\":20,\"text\":\"second\"}\n",
+        )
+        .expect("write journal");
+
+        let started_mono = Instant::now();
+        let loaded = load_persisted_transcript(&path, started_mono).await;
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].user_id, UserId::new(7));
+        assert_eq!(loaded[0].start_ts, started_mono);
+        assert_eq!(loaded[1].user_id, UserId::new(8));
     }
 }

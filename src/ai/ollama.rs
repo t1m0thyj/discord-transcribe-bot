@@ -54,6 +54,13 @@ pub async fn generate_chat(
     let status = http_resp.status();
     let resp: serde_json::Value = http_resp.json().await?;
 
+    parse_ollama_response(status, &resp)
+}
+
+fn parse_ollama_response(
+    status: reqwest::StatusCode,
+    resp: &serde_json::Value,
+) -> anyhow::Result<String> {
     if !status.is_success() {
         let message = resp["error"]
             .as_str()
@@ -88,7 +95,9 @@ fn resolve_ollama_base_url(base_url: Option<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_config, resolve_ollama_base_url};
+    use serde_json::json;
+
+    use super::{parse_ollama_response, provider_config, resolve_ollama_base_url};
     use crate::ai::AiProviderConfig;
 
     #[test]
@@ -129,5 +138,26 @@ mod tests {
             }
             _ => panic!("expected ollama provider"),
         }
+    }
+
+    #[test]
+    fn parser_returns_trimmed_ollama_content() {
+        let response = json!({ "message": { "content": "  hello  " } });
+        assert_eq!(
+            parse_ollama_response(reqwest::StatusCode::OK, &response).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn parser_surfaces_http_errors_and_rejects_missing_content() {
+        let unavailable = json!({ "error": "model unavailable" });
+        let err = parse_ollama_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &unavailable)
+            .expect_err("http error should fail");
+        assert!(err.to_string().contains("model unavailable"));
+
+        let err = parse_ollama_response(reqwest::StatusCode::OK, &json!({ "message": {} }))
+            .expect_err("missing content should fail");
+        assert!(err.to_string().contains("returned no text"));
     }
 }

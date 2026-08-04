@@ -36,6 +36,10 @@ pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(3
 pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const THREAD_AI_COOLDOWN: Duration = Duration::from_secs(3);
 
+fn endpoint_silence_ticks(endpoint_silence_ms: u64) -> u32 {
+    ((endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1)
+}
+
 #[derive(Clone)]
 pub struct Utterance {
     pub user_id: UserId,
@@ -76,6 +80,31 @@ pub struct GuildRuntime {
     pub unmapped_ssrc_activity: AtomicUsize,
     pub transcription_started_notified: AtomicBool,
     pub recovery_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl GuildRuntime {
+    pub fn new(utterance_tx: mpsc::Sender<Utterance>) -> Self {
+        Self {
+            utterance_tx,
+            transcription_inflight: AtomicUsize::new(0),
+            transcript_pending_commits: AtomicUsize::new(0),
+            decode_jobs_total: AtomicUsize::new(0),
+            decode_jobs_with_text: AtomicUsize::new(0),
+            decode_audio_total_ms: AtomicUsize::new(0),
+            decode_total_ms: AtomicUsize::new(0),
+            decode_queue_wait_total_ms: AtomicUsize::new(0),
+            decode_last_ms: AtomicUsize::new(0),
+            decode_queue_wait_last_ms: AtomicUsize::new(0),
+            decode_shed_total: AtomicUsize::new(0),
+            dispatch_gate_total: AtomicUsize::new(0),
+            resample_error_total: AtomicUsize::new(0),
+            decoded_audio_activity: AtomicUsize::new(0),
+            decode_failure_activity: AtomicUsize::new(0),
+            unmapped_ssrc_activity: AtomicUsize::new(0),
+            transcription_started_notified: AtomicBool::new(false),
+            recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 }
 
 pub struct AppState {
@@ -130,7 +159,7 @@ impl AppState {
             enable_denoiser: cfg.audio.enable_denoiser,
             // Endpoint uses VAD hangover plus silence ticks; effective trailing wait
             // is roughly (endpoint_silence_ticks * 20ms) + ~256ms.
-            endpoint_silence_ticks: ((cfg.transcription.endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1),
+            endpoint_silence_ticks: endpoint_silence_ticks(cfg.transcription.endpoint_silence_ms),
             rolling_ingest_max_ms: cfg.transcription.rolling_ingest_max_ms,
             rolling_ingest_context_ms: cfg.transcription.rolling_ingest_context_ms,
             transcript_retention_days: cfg.transcription.retention_days,
@@ -325,3 +354,16 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
 
 pub use autojoin::maybe_autojoin_on_voice_state;
 pub use session::maybe_finalize_on_empty_voice_channel;
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_silence_ticks;
+
+    #[test]
+    fn endpoint_silence_ticks_rounds_up_and_never_zero() {
+        assert_eq!(endpoint_silence_ticks(400), 20);
+        assert_eq!(endpoint_silence_ticks(401), 21);
+        assert_eq!(endpoint_silence_ticks(80), 4);
+        assert_eq!(endpoint_silence_ticks(1), 1);
+    }
+}

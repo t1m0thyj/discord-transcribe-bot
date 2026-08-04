@@ -336,14 +336,28 @@ fn try_single_file_family(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sherpa_onnx::OfflineRecognizerConfig;
 
     use super::{ForcedFamily, configure_model};
 
-    fn test_temp_dir(name: &str) -> PathBuf {
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_temp_dir(name: &str) -> TempDir {
         let unique = format!(
             "transcribe-bot-tests-{}-{}-{}",
             name,
@@ -355,7 +369,18 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(unique);
         fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        TempDir(dir)
+    }
+
+    fn write_files(dir: &Path, names: &[&str]) {
+        for name in names {
+            fs::write(dir.join(name), b"").expect("write model fixture");
+        }
+    }
+
+    fn configured_label(dir: &Path) -> &'static str {
+        let mut cfg = OfflineRecognizerConfig::default();
+        configure_model(&mut cfg, dir, None).expect("model should configure")
     }
 
     #[test]
@@ -380,31 +405,74 @@ mod tests {
     #[test]
     fn configure_model_supports_single_file_with_forced_family() {
         let dir = test_temp_dir("single-file-forced-family");
-        fs::write(dir.join("model.onnx"), b"").expect("write model");
-        fs::write(dir.join("tokens.txt"), b"").expect("write tokens");
+        write_files(dir.path(), &["model.onnx", "tokens.txt"]);
 
         let mut cfg = OfflineRecognizerConfig::default();
-        let label = configure_model(&mut cfg, &dir, Some("paraformer"))
+        let label = configure_model(&mut cfg, dir.path(), Some("paraformer"))
             .expect("model should configure");
 
         assert_eq!(label, "paraformer");
         assert!(cfg.model_config.paraformer.model.is_some());
         assert!(cfg.model_config.tokens.is_some());
 
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn configure_model_single_file_without_family_errors() {
         let dir = test_temp_dir("single-file-missing-family");
-        fs::write(dir.join("model.int8.onnx"), b"").expect("write model");
-        fs::write(dir.join("tokens.txt"), b"").expect("write tokens");
+        write_files(dir.path(), &["model.int8.onnx", "tokens.txt"]);
 
         let mut cfg = OfflineRecognizerConfig::default();
-        let err = configure_model(&mut cfg, &dir, None)
+        let err = configure_model(&mut cfg, dir.path(), None)
             .expect_err("single-file config should fail without family hint");
         assert!(err.to_string().contains("can't tell which family"));
+    }
 
-        let _ = fs::remove_dir_all(&dir);
+    #[test]
+    fn autodetects_transducer_and_prefers_int8_variants() {
+        let dir = test_temp_dir("transducer");
+        write_files(
+            dir.path(),
+            &["encoder.onnx", "encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
+        );
+        let mut cfg = OfflineRecognizerConfig::default();
+        let label = configure_model(&mut cfg, dir.path(), None).expect("transducer config");
+
+        assert_eq!(label, "transducer (Zipformer / NeMo Parakeet-style)");
+        assert!(cfg.model_config.transducer.encoder.unwrap().contains("int8"));
+    }
+
+    #[test]
+    fn autodetects_moonshine_split_and_merged_layouts() {
+        let split = test_temp_dir("moonshine-split");
+        write_files(
+            split.path(),
+            &["preprocess.onnx", "encode.onnx", "uncached_decode.onnx", "cached_decode.onnx", "tokens.txt"],
+        );
+        assert_eq!(configured_label(split.path()), "moonshine (split)");
+
+        let merged = test_temp_dir("moonshine-merged");
+        write_files(merged.path(), &["encode.onnx", "merged_decoder.onnx", "tokens.txt"]);
+        assert_eq!(configured_label(merged.path()), "moonshine (merged)");
+    }
+
+    #[test]
+    fn qwen3_layout_wins_over_ambiguous_whisper_heuristic() {
+        let dir = test_temp_dir("qwen3-precedence");
+        write_files(dir.path(), &["conv_frontend.onnx", "encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"]);
+        fs::create_dir_all(dir.path().join("tokenizer")).expect("create tokenizer dir");
+
+        assert_eq!(configured_label(dir.path()), "qwen3_asr");
+    }
+
+    #[test]
+    fn autodetects_whisper_layout() {
+        let dir = test_temp_dir("whisper");
+        write_files(
+            dir.path(),
+            &["base.en-encoder.onnx", "base.en-decoder.onnx", "base.en-tokens.txt"],
+        );
+        assert_eq!(configured_label(dir.path()), "whisper");
+
     }
 }

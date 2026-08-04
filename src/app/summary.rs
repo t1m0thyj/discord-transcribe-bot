@@ -44,6 +44,26 @@ pub(super) async fn format_export_markdown(
     include_summary_in_markdown: bool,
 ) -> String {
     let by_user = resolve_display_names(ctx, transcript).await;
+    format_export_markdown_with_names(
+        transcript,
+        &by_user,
+        started_at,
+        call_duration,
+        title,
+        summary,
+        include_summary_in_markdown,
+    )
+}
+
+fn format_export_markdown_with_names(
+    transcript: &[Utterance],
+    by_user: &HashMap<UserId, String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    call_duration: Duration,
+    title: &str,
+    summary: Option<&str>,
+    include_summary_in_markdown: bool,
+) -> String {
     let attendees = attendees_in_order(transcript, &by_user);
     let duration = format_duration(call_duration);
 
@@ -209,7 +229,11 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn yaml_escape_double_quoted(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }
 
 fn yaml_single_line_scalar(value: &str) -> String {
@@ -225,16 +249,78 @@ fn yaml_single_line_scalar(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
+    use std::time::Instant;
+
+    use serenity::all::UserId;
 
     use super::{
-        format_call_title, format_duration, format_summary_thread_message,
-        format_transcript_stamp, yaml_escape_double_quoted, yaml_single_line_scalar,
+        build_transcript_lines, format_call_title, format_duration, format_export_markdown_with_names,
+        format_summary_thread_message, format_transcript_stamp, yaml_escape_double_quoted,
+        yaml_single_line_scalar,
     };
+    use crate::app::Utterance;
 
     #[test]
     fn transcript_stamp_formats_minutes_seconds() {
         assert_eq!(format_transcript_stamp(Duration::from_secs(65)), "1:05");
+    }
+
+    #[test]
+    fn transcript_lines_use_display_names_timestamps_and_id_fallbacks() {
+        let started = Instant::now();
+        let transcript = vec![
+            Utterance {
+                user_id: UserId::new(123),
+                start_ts: started,
+                text: "Hello".to_string(),
+            },
+            Utterance {
+                user_id: UserId::new(456),
+                start_ts: started + Duration::from_secs(65),
+                text: "Hi there".to_string(),
+            },
+        ];
+        let names = HashMap::from([(UserId::new(123), "Alice".to_string())]);
+
+        assert_eq!(
+            build_transcript_lines(&transcript, &names),
+            vec!["[Alice 0:00] Hello", "[456 1:05] Hi there"]
+        );
+        assert_eq!(
+            build_transcript_lines(&[], &names),
+            vec!["_No captured speech._"]
+        );
+    }
+
+    #[test]
+    fn export_markdown_escapes_hostile_attendees_inside_frontmatter() {
+        let started_mono = Instant::now();
+        let transcript = vec![Utterance {
+            user_id: UserId::new(123),
+            start_ts: started_mono,
+            text: "Hello".to_string(),
+        }];
+        let names = HashMap::from([(UserId::new(123), "Eve\n---\nstatus: draft".to_string())]);
+        let started_at = chrono::DateTime::parse_from_rfc3339("2026-08-04T12:34:56Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let markdown = format_export_markdown_with_names(
+            &transcript,
+            &names,
+            started_at,
+            Duration::from_secs(65),
+            "Call",
+            Some("Summary"),
+            true,
+        );
+
+        assert_eq!(markdown.matches("\n---\n").count(), 2);
+        assert!(markdown.contains("  - \"Eve\\n---\\nstatus: draft\""));
+        assert!(markdown.contains("Summary\n\n## Transcript"));
+        assert!(!markdown.contains("\nstatus: draft\n"));
     }
 
     #[test]
@@ -256,14 +342,18 @@ mod tests {
         assert_eq!(yaml_escape_double_quoted("a\\b\"c"), "a\\\\b\\\"c");
         assert_eq!(yaml_single_line_scalar("Alice-1"), "Alice-1");
         assert_eq!(yaml_single_line_scalar("Alice:1"), "\"Alice:1\"");
+        assert_eq!(
+            yaml_single_line_scalar("Alice\n---\ntype: evil"),
+            "\"Alice\\n---\\ntype: evil\""
+        );
     }
 
     #[test]
-    fn call_title_contains_utc_suffix() {
+    fn call_title_has_stable_full_format() {
         let started = chrono::DateTime::parse_from_rfc3339("2026-08-04T12:34:56Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         let title = format_call_title(started);
-        assert!(title.contains("UTC"));
+        assert_eq!(title, "Transcript 2026-08-04 12:34:56 UTC");
     }
 }

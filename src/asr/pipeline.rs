@@ -222,6 +222,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_gate_accepts_exact_voiced_tick_threshold() {
+        let pcm = vec![0.02; 3_200];
+        assert!(should_dispatch_chunk(&pcm, 8, 0.002).is_ok());
+    }
+
+    #[test]
+    fn dispatch_gate_enforces_absolute_noise_floor() {
+        let pcm = vec![0.001; 3_200];
+        let rejection = should_dispatch_chunk(&pcm, 12, 0.0).unwrap_err();
+        assert_eq!(rejection.reason, "below_noise_floor");
+        assert_eq!(rejection.floor, 0.0025);
+    }
+
+    #[test]
+    fn dispatch_gate_empty_input_fails_without_panicking() {
+        let rejection = should_dispatch_chunk(&[], 0, 0.0).unwrap_err();
+        assert_eq!(rejection.reason, "insufficient_voiced_ticks");
+    }
+
+    #[test]
     fn trim_finalize_tail_noop_when_silence_ticks_zero() {
         let mut pcm = vec![0.5; 10_000];
         let before = pcm.len();
@@ -237,6 +257,13 @@ mod tests {
     }
 
     #[test]
+    fn trim_finalize_tail_keeps_short_utterance_intact() {
+        let mut pcm = vec![0.5; 2_000];
+        trim_finalize_tail(&mut pcm, 1_000);
+        assert_eq!(pcm.len(), 2_000);
+    }
+
+    #[test]
     fn decode_rejection_blocks_known_hallucination_phrase() {
         assert_eq!(
             decode_rejection_reason("Thank you!!!", 1.0),
@@ -245,10 +272,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejection_normalizes_punctuation_but_keeps_real_speech() {
+        assert_eq!(
+            decode_rejection_reason("Thanks for watching.", 1.0),
+            Some("blocklist")
+        );
+        assert_eq!(
+            decode_rejection_reason("thank you for the update", 3.0),
+            None
+        );
+    }
+
+    #[test]
     fn decode_rejection_blocks_implausible_character_rate() {
         let text = "a".repeat(100);
         assert_eq!(
             decode_rejection_reason(&text, 2.0),
+            Some("implausible_char_rate")
+        );
+    }
+
+    #[test]
+    fn decode_rejection_allows_exact_character_rate_threshold() {
+        let text = "a".repeat(50);
+        assert_eq!(decode_rejection_reason(&text, 2.0), None);
+    }
+
+    #[test]
+    fn decode_rejection_handles_zero_audio_duration() {
+        assert_eq!(
+            decode_rejection_reason("speech", 0.0),
             Some("implausible_char_rate")
         );
     }

@@ -307,8 +307,12 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::f32::consts::PI;
+
     use super::{
-        IngestFrontend, RNNOISE_FRAME_SIZE, compute_rms, downmix_stereo_to_mono_i16_scale,
+        DENOISER_BYPASS_HYSTERESIS_DB, DENOISER_BYPASS_SNR_DB, EARSHOT_FRAME_SIZE,
+        IngestFrontend, RNNOISE_FRAME_SIZE, VAD_PREROLL_SAMPLES_16K, compute_rms,
+        downmix_stereo_to_mono_i16_scale,
         downmix_stereo_to_mono_unit_scale,
     };
 
@@ -345,5 +349,86 @@ mod tests {
 
         let second_out = state.push_mono_pcm(&tail);
         assert_eq!(second_out.len(), RNNOISE_FRAME_SIZE);
+    }
+
+    #[test]
+    fn push_stereo_pcm_handles_empty_and_odd_length_input() {
+        let mut state = IngestFrontend::new();
+        let empty = state.push_stereo_pcm(&[], false);
+        assert!(empty.pcm_16k.is_empty());
+        assert!(!empty.speech_active);
+
+        let odd = state.push_stereo_pcm(&[1, 2, 3], false);
+        assert!(odd.pcm_16k.len() <= 1);
+    }
+
+    #[test]
+    fn frontend_resamples_48k_stereo_ticks_to_16k_mono() {
+        let mut state = IngestFrontend::new();
+        let tick = vec![1_000i16; 1_920];
+        let emitted: usize = (0..50)
+            .map(|_| state.push_stereo_pcm(&tick, false).pcm_16k.len())
+            .sum();
+
+        assert_eq!(emitted, 16_000);
+    }
+
+    #[test]
+    fn vad_hangover_keeps_one_silent_frame_active() {
+        let mut state = IngestFrontend::new();
+        state.vad_hangover_frames = 1;
+
+        assert!(state.passes_vad_earshot(&vec![0.0; EARSHOT_FRAME_SIZE]));
+        assert_eq!(state.vad_hangover_frames, 0);
+    }
+
+    #[test]
+    fn preroll_keeps_the_most_recent_fixed_window() {
+        let mut state = IngestFrontend::new();
+        let samples: Vec<f32> = (0..VAD_PREROLL_SAMPLES_16K + 2)
+            .map(|sample| sample as f32)
+            .collect();
+
+        state.push_preroll_16k(&samples);
+
+        assert_eq!(state.preroll_16k.len(), VAD_PREROLL_SAMPLES_16K);
+        assert_eq!(state.preroll_16k.front(), Some(&2.0));
+        assert_eq!(
+            state.preroll_16k.back(),
+            Some(&((VAD_PREROLL_SAMPLES_16K + 1) as f32))
+        );
+    }
+
+    #[test]
+    fn denoiser_bypass_uses_hysteresis_and_latches_during_speech() {
+        let mut state = IngestFrontend::new();
+        state.last_snr_db = DENOISER_BYPASS_SNR_DB + DENOISER_BYPASS_HYSTERESIS_DB;
+        assert!(!state.select_denoiser_mode(true));
+
+        state.last_snr_db = DENOISER_BYPASS_SNR_DB;
+        assert!(!state.select_denoiser_mode(true));
+
+        state.last_snr_db = DENOISER_BYPASS_SNR_DB - DENOISER_BYPASS_HYSTERESIS_DB;
+        assert!(state.select_denoiser_mode(true));
+
+        state.was_speech_last_tick = true;
+        state.last_snr_db = DENOISER_BYPASS_SNR_DB + 20.0;
+        assert!(state.select_denoiser_mode(true));
+    }
+
+    #[test]
+    fn highpass_rejects_dc_and_preserves_audible_tone() {
+        let mut dc_state = IngestFrontend::new();
+        let mut dc = vec![0.5; 4_800];
+        dc_state.apply_highpass(&mut dc);
+        assert!(dc.last().copied().unwrap().abs() < 0.01);
+
+        let mut tone_state = IngestFrontend::new();
+        let mut tone: Vec<f32> = (0..4_800)
+            .map(|index| (2.0 * PI * 1_000.0 * index as f32 / 48_000.0).sin())
+            .collect();
+        tone_state.apply_highpass(&mut tone);
+        let peak = tone.iter().map(|sample| sample.abs()).fold(0.0, f32::max);
+        assert!(peak > 0.95);
     }
 }

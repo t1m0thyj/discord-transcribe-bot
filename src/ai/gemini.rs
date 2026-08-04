@@ -54,6 +54,13 @@ pub async fn generate_chat(
     let status = http_resp.status();
     let resp: serde_json::Value = http_resp.json().await?;
 
+    parse_gemini_response(status, &resp)
+}
+
+fn parse_gemini_response(
+    status: reqwest::StatusCode,
+    resp: &serde_json::Value,
+) -> anyhow::Result<String> {
     if !status.is_success() {
         let message = resp["error"]["message"]
             .as_str()
@@ -97,7 +104,9 @@ pub async fn generate_chat(
 
 #[cfg(test)]
 mod tests {
-    use super::provider_config;
+    use serde_json::json;
+
+    use super::{parse_gemini_response, provider_config};
     use crate::ai::AiProviderConfig;
 
     #[test]
@@ -118,6 +127,30 @@ mod tests {
             }
             _ => panic!("expected gemini provider"),
         }
+    }
+
+    #[test]
+    fn parser_joins_successful_gemini_parts() {
+        let response = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "first" }, { "text": "second" }] } }]
+        });
+        assert_eq!(
+            parse_gemini_response(reqwest::StatusCode::OK, &response).unwrap(),
+            "first\nsecond"
+        );
+    }
+
+    #[test]
+    fn parser_surfaces_http_and_safety_errors() {
+        let rate_limited = json!({ "error": { "message": "slow down" } });
+        let err = parse_gemini_response(reqwest::StatusCode::TOO_MANY_REQUESTS, &rate_limited)
+            .expect_err("http error should fail");
+        assert!(err.to_string().contains("slow down"));
+
+        let blocked = json!({ "promptFeedback": { "blockReason": "SAFETY" }, "candidates": [] });
+        let err = parse_gemini_response(reqwest::StatusCode::OK, &blocked)
+            .expect_err("missing text should fail");
+        assert!(err.to_string().contains("SAFETY"));
     }
 }
 

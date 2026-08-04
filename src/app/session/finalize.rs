@@ -4,13 +4,11 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use serde::Deserialize;
 use serenity::all::{CreateAttachment, CreateMessage, GuildId, UserId, VoiceState};
 use serenity::prelude::Context;
-use tokio::fs;
 
 use super::super::{AppState, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT, Utterance};
-use crate::app::journal::prune_old_transcripts;
+use crate::app::journal::{load_persisted_transcript, prune_old_transcripts};
 use crate::app::summary;
 use crate::asr::{clear_unknown_ssrc_audio_for_guild, should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
 
@@ -196,35 +194,6 @@ pub async fn maybe_finalize_on_empty_voice_channel(
     finalize_call_for_guild(ctx, state, guild_id).await?;
 
     Ok(())
-}
-
-#[derive(Deserialize)]
-struct PersistedUtterance {
-    user_id: u64,
-    start_offset_ms: u64,
-    text: String,
-}
-
-async fn load_persisted_transcript(path: &std::path::Path, started_mono: Instant) -> Vec<Utterance> {
-    let Ok(content) = fs::read_to_string(path).await else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let Ok(item) = serde_json::from_str::<PersistedUtterance>(line) else {
-            continue;
-        };
-        out.push(Utterance {
-            user_id: UserId::new(item.user_id),
-            start_ts: started_mono + Duration::from_millis(item.start_offset_ms),
-            text: item.text,
-        });
-    }
-
-    out.sort_by_key(|u| u.start_ts);
-
-    out
 }
 
 async fn settle_and_flush_guild_audio(state: &Arc<AppState>, guild_id: GuildId) {

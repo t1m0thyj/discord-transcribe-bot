@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -71,26 +70,7 @@ pub(super) async fn start_call_session(
         )
     })?;
 
-    let runtime = Arc::new(GuildRuntime {
-        utterance_tx: utterance_tx.clone(),
-        transcription_inflight: AtomicUsize::new(0),
-        transcript_pending_commits: AtomicUsize::new(0),
-        decode_jobs_total: AtomicUsize::new(0),
-        decode_jobs_with_text: AtomicUsize::new(0),
-        decode_audio_total_ms: AtomicUsize::new(0),
-        decode_total_ms: AtomicUsize::new(0),
-        decode_queue_wait_total_ms: AtomicUsize::new(0),
-        decode_last_ms: AtomicUsize::new(0),
-        decode_queue_wait_last_ms: AtomicUsize::new(0),
-        decode_shed_total: AtomicUsize::new(0),
-        dispatch_gate_total: AtomicUsize::new(0),
-        resample_error_total: AtomicUsize::new(0),
-        decoded_audio_activity: AtomicUsize::new(0),
-        decode_failure_activity: AtomicUsize::new(0),
-        unmapped_ssrc_activity: AtomicUsize::new(0),
-        transcription_started_notified: AtomicBool::new(false),
-        recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
-    });
+    let runtime = Arc::new(GuildRuntime::new(utterance_tx.clone()));
     state.guild_runtimes.insert(guild_id, Arc::clone(&runtime));
 
     let session = Arc::new(RwLock::new(CallSession {

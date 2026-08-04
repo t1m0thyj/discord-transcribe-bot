@@ -97,27 +97,11 @@ impl AppConfig {
             .filter(|v| *v >= 5)
             .unwrap_or(30);
 
-        let asr_model_dir = file_cfg
-            .asr
-            .as_ref()
-            .and_then(|asr| asr.model_dir.clone())
-            .ok_or_else(|| anyhow::anyhow!("missing ASR model directory: set [asr].model_dir in config.toml"))?;
-        let asr_model_family = file_cfg
-            .asr
-            .as_ref()
-            .and_then(|asr| asr.model_family.clone());
         let detected_cores = std::thread::available_parallelism()
             .map(|n| n.get() as i32)
             .unwrap_or(4)
             .clamp(1, 8);
-        let default_asr_num_threads = if detected_cores >= 4 { 3 } else { detected_cores };
-        let asr_num_threads = file_cfg
-            .asr
-            .as_ref()
-            .and_then(|asr| asr.num_threads)
-            .filter(|v| *v >= 1)
-            .unwrap_or(default_asr_num_threads)
-            .clamp(1, 8);
+        let asr = resolve_asr_runtime_config(file_cfg.asr.as_ref(), detected_cores)?;
         let log_live_transcript = file_cfg
             .debug
             .as_ref()
@@ -128,41 +112,8 @@ impl AppConfig {
             .as_ref()
             .and_then(|a| a.enable_denoiser)
             .unwrap_or(false);
-        let endpoint_silence_ms = file_cfg
-            .transcription
-            .as_ref()
-            .and_then(|t| t.endpoint_silence_ms)
-            .filter(|v| *v >= 80)
-            .unwrap_or(400);
-
-        // Keep in-memory audio bounded for long uninterrupted speech.
-        let rolling_ingest_max_ms = file_cfg
-            .transcription
-            .as_ref()
-            .and_then(|t| t.rolling_ingest_max_ms)
-            .filter(|v| *v >= 4_000)
-            .unwrap_or(12_000);
-
-        let rolling_ingest_context_ms = file_cfg
-            .transcription
-            .as_ref()
-            .and_then(|t| t.rolling_ingest_context_ms)
-            .filter(|v| *v >= 250)
-            .unwrap_or(1_500);
-
-        let retention_days = file_cfg
-            .transcription
-            .as_ref()
-            .and_then(|t| t.retention_days)
-            .filter(|v| *v >= 1)
-            .unwrap_or(30);
-
-        let autojoin_suffix = file_cfg
-            .discord
-            .as_ref()
-            .and_then(|d| d.autojoin_suffix.clone())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "[Transcribe]".to_string());
+        let transcription = resolve_transcription_runtime_config(file_cfg.transcription.as_ref());
+        let autojoin_suffix = resolve_autojoin_suffix(file_cfg.discord.as_ref());
 
         let post_call_summary_enabled = file_cfg
             .summary
@@ -195,21 +146,12 @@ impl AppConfig {
                 provider: ai_provider,
                 request_timeout: ai_request_timeout,
             },
-            asr: AsrRuntimeConfig {
-                model_dir: asr_model_dir,
-                model_family: asr_model_family,
-                num_threads: asr_num_threads,
-            },
+            asr,
             audio: AudioRuntimeConfig { enable_denoiser },
             debug: DebugRuntimeConfig {
                 log_live_transcript,
             },
-            transcription: TranscriptionRuntimeConfig {
-                endpoint_silence_ms,
-                rolling_ingest_max_ms,
-                rolling_ingest_context_ms,
-                retention_days,
-            },
+            transcription,
             discord: DiscordRuntimeConfig { autojoin_suffix },
             summary: SummaryRuntimeConfig {
                 enabled: post_call_summary_enabled,
@@ -289,6 +231,57 @@ struct SummarySection {
     timeout_secs: Option<u64>,
 }
 
+fn resolve_asr_runtime_config(
+    section: Option<&AsrSection>,
+    detected_cores: i32,
+) -> anyhow::Result<AsrRuntimeConfig> {
+    let model_dir = section
+        .and_then(|asr| asr.model_dir.clone())
+        .ok_or_else(|| anyhow::anyhow!("missing ASR model directory: set [asr].model_dir in config.toml"))?;
+    let default_threads = if detected_cores >= 4 { 3 } else { detected_cores };
+    let num_threads = section
+        .and_then(|asr| asr.num_threads)
+        .filter(|threads| *threads >= 1)
+        .unwrap_or(default_threads)
+        .clamp(1, 8);
+
+    Ok(AsrRuntimeConfig {
+        model_dir,
+        model_family: section.and_then(|asr| asr.model_family.clone()),
+        num_threads,
+    })
+}
+
+fn resolve_transcription_runtime_config(
+    section: Option<&TranscriptionSection>,
+) -> TranscriptionRuntimeConfig {
+    TranscriptionRuntimeConfig {
+        endpoint_silence_ms: section
+            .and_then(|transcription| transcription.endpoint_silence_ms)
+            .filter(|milliseconds| *milliseconds >= 80)
+            .unwrap_or(400),
+        rolling_ingest_max_ms: section
+            .and_then(|transcription| transcription.rolling_ingest_max_ms)
+            .filter(|milliseconds| *milliseconds >= 4_000)
+            .unwrap_or(12_000),
+        rolling_ingest_context_ms: section
+            .and_then(|transcription| transcription.rolling_ingest_context_ms)
+            .filter(|milliseconds| *milliseconds >= 250)
+            .unwrap_or(1_500),
+        retention_days: section
+            .and_then(|transcription| transcription.retention_days)
+            .filter(|days| *days >= 1)
+            .unwrap_or(30),
+    }
+}
+
+fn resolve_autojoin_suffix(section: Option<&DiscordSection>) -> String {
+    section
+        .and_then(|discord| discord.autojoin_suffix.clone())
+        .filter(|suffix| !suffix.trim().is_empty())
+        .unwrap_or_else(|| "[Transcribe]".to_string())
+}
+
 fn load_file_config() -> anyhow::Result<FileConfig> {
     let config_path = resolve_config_path();
     let path = PathBuf::from(config_path);
@@ -321,7 +314,11 @@ fn read_nonempty_env(name: &str) -> Option<String> {
 mod tests {
     use std::env;
 
-    use super::{read_nonempty_env, resolve_config_path};
+    use super::{
+        AsrSection, DiscordSection, TranscriptionSection, read_nonempty_env,
+        resolve_asr_runtime_config, resolve_autojoin_suffix, resolve_config_path,
+        resolve_transcription_runtime_config,
+    };
 
     struct EnvGuard {
         key: &'static str,
@@ -348,23 +345,69 @@ mod tests {
     }
 
     #[test]
-    fn read_nonempty_env_trims_and_filters_empty() {
-        let _guard = EnvGuard::new("TRANSCRIBE_BOT_TEST_ENV");
+    fn environment_helpers_trim_filter_and_resolve_path() {
+        let _value_guard = EnvGuard::new("TRANSCRIBE_BOT_TEST_ENV");
+        let _path_guard = EnvGuard::new("APP_CONFIG_PATH");
         env::set_var("TRANSCRIBE_BOT_TEST_ENV", "   value   ");
         assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), Some("value".to_string()));
 
         env::set_var("TRANSCRIBE_BOT_TEST_ENV", "    ");
         assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), None);
-    }
 
-    #[test]
-    fn resolve_config_path_prefers_env_override() {
-        let _guard = EnvGuard::new("APP_CONFIG_PATH");
         env::set_var("APP_CONFIG_PATH", "custom.toml");
         assert_eq!(resolve_config_path(), "custom.toml");
 
         env::remove_var("APP_CONFIG_PATH");
         assert_eq!(resolve_config_path(), "config.toml");
+    }
+
+    #[test]
+    fn transcription_config_enforces_safety_floors_and_boundaries() {
+        let rejected = TranscriptionSection {
+            endpoint_silence_ms: Some(10),
+            rolling_ingest_max_ms: Some(100),
+            rolling_ingest_context_ms: Some(100),
+            retention_days: Some(0),
+        };
+        let cfg = resolve_transcription_runtime_config(Some(&rejected));
+        assert_eq!(cfg.endpoint_silence_ms, 400);
+        assert_eq!(cfg.rolling_ingest_max_ms, 12_000);
+        assert_eq!(cfg.rolling_ingest_context_ms, 1_500);
+        assert_eq!(cfg.retention_days, 30);
+
+        let boundaries = TranscriptionSection {
+            endpoint_silence_ms: Some(80),
+            rolling_ingest_max_ms: Some(4_000),
+            rolling_ingest_context_ms: Some(250),
+            retention_days: Some(1),
+        };
+        let cfg = resolve_transcription_runtime_config(Some(&boundaries));
+        assert_eq!(cfg.endpoint_silence_ms, 80);
+        assert_eq!(cfg.rolling_ingest_max_ms, 4_000);
+        assert_eq!(cfg.rolling_ingest_context_ms, 250);
+        assert_eq!(cfg.retention_days, 1);
+    }
+
+    #[test]
+    fn asr_config_requires_model_dir_and_clamps_thread_count() {
+        let err = resolve_asr_runtime_config(None, 4).expect_err("missing model dir should fail");
+        assert!(err.to_string().contains("config.toml"));
+
+        let high = AsrSection {
+            model_dir: Some("models/test".to_string()),
+            model_family: None,
+            num_threads: Some(99),
+        };
+        assert_eq!(resolve_asr_runtime_config(Some(&high), 4).unwrap().num_threads, 8);
+
+        let invalid = AsrSection { num_threads: Some(0), ..high };
+        assert_eq!(resolve_asr_runtime_config(Some(&invalid), 2).unwrap().num_threads, 2);
+    }
+
+    #[test]
+    fn autojoin_suffix_uses_default_for_blank_values() {
+        let blank = DiscordSection { autojoin_suffix: Some("   ".to_string()) };
+        assert_eq!(resolve_autojoin_suffix(Some(&blank)), "[Transcribe]");
     }
 }
 

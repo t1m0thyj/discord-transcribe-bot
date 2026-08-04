@@ -421,6 +421,10 @@ pub(super) async fn handle_autojoin(
         old_name.clone()
     };
 
+    if new_name.trim().is_empty() {
+        anyhow::bail!("cannot remove the autojoin suffix because it would leave an empty channel name");
+    }
+
     if new_name != old_name {
         voice_channel_id
             .edit(&ctx.http, serenity::builder::EditChannel::new().name(new_name))

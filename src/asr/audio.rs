@@ -9,14 +9,36 @@ use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use crate::app::GuildRuntime;
 
 use super::decoder::{queue_decode_job, DecodeJob};
-use super::frontend::compute_rms;
+use super::frontend::{ProcessedSpeechChunk, compute_rms};
 use super::pipeline::{
-    should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams,
+    UserAudioBuffer, should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams,
 };
 
 const UNKNOWN_SSRC_MAX_TRACKED: usize = 8;
 const UNKNOWN_SSRC_MAX_SAMPLES: usize = 96_000;
 const UNKNOWN_SSRC_RETENTION: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct IngestParams {
+    max_ingest_samples: usize,
+    keep_context_samples: usize,
+    silence_ticks_threshold: u32,
+}
+
+enum IngestOutcome {
+    None,
+    Rollover {
+        start_ts: Instant,
+        pcm: Vec<f32>,
+        voiced_ticks: u32,
+    },
+    Endpoint {
+        start_ts: Instant,
+        pcm: Vec<f32>,
+        voiced_ticks: u32,
+        silent_ticks: u32,
+    },
+}
 
 pub struct SpeakingUpdateHandler {
     pub guild_id: GuildId,
@@ -159,8 +181,11 @@ impl VoiceEventHandler for VoiceTickHandler {
         };
 
         let mut currently_speaking = std::collections::HashSet::<UserId>::new();
-        let max_ingest_samples = (self.rolling_ingest_max_ms as usize) * 16;
-        let base_keep_context_samples = (self.rolling_ingest_context_ms as usize) * 16;
+        let ingest_params = IngestParams {
+            max_ingest_samples: (self.rolling_ingest_max_ms as usize) * 16,
+            keep_context_samples: (self.rolling_ingest_context_ms as usize) * 16,
+            silence_ticks_threshold: self.silence_ticks_threshold,
+        };
 
         for (ssrc, data) in &tick.speaking {
             if data.decoded_voice.is_none() && data.packet.is_some() {
@@ -235,61 +260,28 @@ impl VoiceEventHandler for VoiceTickHandler {
             }
 
             let cleaned = processed.pcm_16k;
+            let cleaned_len = cleaned.len();
             let noise_rms_ema = stream.frontend.noise_rms_ema();
-
-            let entry = &mut stream.buffer;
-            if entry.utterance_start.is_none() {
-                entry.utterance_start = Some(Instant::now());
-            }
-            if processed.speech_active {
-                entry.silent_ticks = 0;
-            }
-            entry.pcm.extend_from_slice(&cleaned);
-
-            if processed.speech_active {
-                entry.voiced_ticks = entry.voiced_ticks.saturating_add(1);
-            }
-
-            let mut maybe_rollover_final = None;
-            if entry.pcm.len() >= max_ingest_samples {
-                let max_keep_without_starving = max_ingest_samples.saturating_sub(1_600);
-                let keep = base_keep_context_samples
-                    .min(max_keep_without_starving)
-                    .min(entry.pcm.len());
-                let split_at = choose_rollover_split_index(
-                    &entry.pcm,
-                    keep,
-                    max_keep_without_starving,
-                );
-                if split_at >= 1_600 {
-                    let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
-                    let source_len = entry.pcm.len();
-
-                    let tail = entry.pcm.split_off(split_at);
-                    let chunk = std::mem::replace(&mut entry.pcm, tail);
-                    let carried_tail_ms = (entry.pcm.len() as u64) / 16;
-                    let chunk_voiced = if source_len == 0 {
-                        0
-                    } else {
-                        ((entry.voiced_ticks as u64 * split_at as u64) / source_len as u64) as u32
-                    };
-                    entry.voiced_ticks = entry.voiced_ticks.saturating_sub(chunk_voiced);
-
-                    entry.utterance_start = Some(
-                        Instant::now()
-                            .checked_sub(Duration::from_millis(carried_tail_ms))
-                            .unwrap_or_else(Instant::now),
-                    );
-
-                    maybe_rollover_final = Some((start_ts, chunk, chunk_voiced, noise_rms_ema));
+            let maybe_rollover_final = match append_processed_chunk(
+                &mut stream.buffer,
+                ProcessedSpeechChunk {
+                    pcm_16k: cleaned,
+                    speech_active: processed.speech_active,
+                },
+                ingest_params,
+                Instant::now(),
+            ) {
+                IngestOutcome::Rollover { start_ts, pcm, voiced_ticks, .. } => {
+                    Some((start_ts, pcm, voiced_ticks, noise_rms_ema))
                 }
-            }
+                _ => None,
+            };
 
             tracing::trace!(
                 guild = %self.guild_id,
                 user = %user_id,
                 ssrc = %ssrc,
-                samples = cleaned.len(),
+                samples = cleaned_len,
                 "processed 16k pcm tick"
             );
 
@@ -339,25 +331,17 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             let mut maybe_job = None;
             if let Some(mut stream) = self.streams.get_mut(&user_key) {
-                let should_finalize = {
-                    let entry = &mut stream.buffer;
-                    entry.silent_ticks = entry.silent_ticks.saturating_add(1);
-                    entry.silent_ticks >= self.silence_ticks_threshold && !entry.pcm.is_empty()
-                };
-
-                if !should_finalize {
-                    continue;
+                if let IngestOutcome::Endpoint {
+                    start_ts,
+                    mut pcm,
+                    voiced_ticks,
+                    silent_ticks,
+                } = advance_silence(&mut stream.buffer, ingest_params, Instant::now())
+                {
+                    trim_finalize_tail(&mut pcm, silent_ticks);
+                    let noise_rms_ema = stream.frontend.noise_rms_ema();
+                    maybe_job = Some((start_ts, pcm, voiced_ticks, noise_rms_ema));
                 }
-
-                let entry = &mut stream.buffer;
-                let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
-                let mut pcm = std::mem::take(&mut entry.pcm);
-                let voiced_ticks = std::mem::take(&mut entry.voiced_ticks);
-                let final_silent_ticks = entry.silent_ticks;
-                entry.silent_ticks = 0;
-                trim_finalize_tail(&mut pcm, final_silent_ticks);
-                let noise_rms_ema = stream.frontend.noise_rms_ema();
-                maybe_job = Some((start_ts, pcm, voiced_ticks, noise_rms_ema));
             }
 
             if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_job {
@@ -395,6 +379,80 @@ impl VoiceEventHandler for VoiceTickHandler {
         }
 
         None
+    }
+}
+
+fn append_processed_chunk(
+    buffer: &mut UserAudioBuffer,
+    chunk: ProcessedSpeechChunk,
+    params: IngestParams,
+    now: Instant,
+) -> IngestOutcome {
+    if chunk.pcm_16k.is_empty() || (buffer.utterance_start.is_none() && !chunk.speech_active) {
+        return IngestOutcome::None;
+    }
+
+    if buffer.utterance_start.is_none() {
+        buffer.utterance_start = Some(now);
+    }
+    if chunk.speech_active {
+        buffer.silent_ticks = 0;
+        buffer.voiced_ticks = buffer.voiced_ticks.saturating_add(1);
+    }
+    buffer.pcm.extend(chunk.pcm_16k);
+
+    if buffer.pcm.len() < params.max_ingest_samples {
+        return IngestOutcome::None;
+    }
+
+    let max_keep_without_starving = params.max_ingest_samples.saturating_sub(1_600);
+    let keep = params
+        .keep_context_samples
+        .min(max_keep_without_starving)
+        .min(buffer.pcm.len());
+    let split_at = choose_rollover_split_index(&buffer.pcm, keep, max_keep_without_starving);
+    if split_at < 1_600 {
+        return IngestOutcome::None;
+    }
+
+    let start_ts = buffer.utterance_start.take().unwrap_or(now);
+    let source_len = buffer.pcm.len();
+    let tail = buffer.pcm.split_off(split_at);
+    let pcm = std::mem::replace(&mut buffer.pcm, tail);
+    let carried_tail_ms = (buffer.pcm.len() as u64) / 16;
+    let voiced_ticks = ((buffer.voiced_ticks as u64 * split_at as u64) / source_len as u64) as u32;
+    buffer.voiced_ticks = buffer.voiced_ticks.saturating_sub(voiced_ticks);
+    buffer.utterance_start = Some(
+        now.checked_sub(Duration::from_millis(carried_tail_ms))
+            .unwrap_or(now),
+    );
+
+    IngestOutcome::Rollover {
+        start_ts,
+        pcm,
+        voiced_ticks,
+    }
+}
+
+fn advance_silence(
+    buffer: &mut UserAudioBuffer,
+    params: IngestParams,
+    now: Instant,
+) -> IngestOutcome {
+    buffer.silent_ticks = buffer.silent_ticks.saturating_add(1);
+    if buffer.silent_ticks < params.silence_ticks_threshold || buffer.pcm.is_empty() {
+        return IngestOutcome::None;
+    }
+
+    let start_ts = buffer.utterance_start.take().unwrap_or(now);
+    let pcm = std::mem::take(&mut buffer.pcm);
+    let voiced_ticks = std::mem::take(&mut buffer.voiced_ticks);
+    let silent_ticks = std::mem::take(&mut buffer.silent_ticks);
+    IngestOutcome::Endpoint {
+        start_ts,
+        pcm,
+        voiced_ticks,
+        silent_ticks,
     }
 }
 
@@ -450,7 +508,27 @@ fn choose_rollover_split_index(
 
 #[cfg(test)]
 mod tests {
-    use super::choose_rollover_split_index;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        IngestOutcome, IngestParams, advance_silence, append_processed_chunk,
+        choose_rollover_split_index, ProcessedSpeechChunk, UserAudioBuffer,
+    };
+
+    fn params() -> IngestParams {
+        IngestParams {
+            max_ingest_samples: 3_200,
+            keep_context_samples: 1_600,
+            silence_ticks_threshold: 3,
+        }
+    }
+
+    fn chunk(samples: usize, speech_active: bool) -> ProcessedSpeechChunk {
+        ProcessedSpeechChunk {
+            pcm_16k: vec![0.1; samples],
+            speech_active,
+        }
+    }
 
     #[test]
     fn rollover_short_buffer_uses_nominal_tail_keep() {
@@ -487,5 +565,98 @@ mod tests {
 
         let split = choose_rollover_split_index(&pcm, 3_000, 5_000);
         assert!(split >= 5_400 && split <= 6_600);
+    }
+
+    #[test]
+    fn append_preserves_intra_utterance_silence_after_speech_starts() {
+        let mut buffer = UserAudioBuffer::default();
+        let now = Instant::now();
+
+        assert!(matches!(
+            append_processed_chunk(&mut buffer, chunk(320, false), params(), now),
+            IngestOutcome::None
+        ));
+        append_processed_chunk(&mut buffer, chunk(320, true), params(), now);
+        append_processed_chunk(&mut buffer, chunk(320, false), params(), now);
+        append_processed_chunk(&mut buffer, chunk(320, true), params(), now);
+
+        assert_eq!(buffer.pcm.len(), 960);
+        assert_eq!(buffer.voiced_ticks, 2);
+    }
+
+    #[test]
+    fn rollover_reports_actual_carried_tail_duration_and_prorates_ticks() {
+        let mut buffer = UserAudioBuffer {
+            pcm: vec![0.1; 2_880],
+            silent_ticks: 0,
+            voiced_ticks: 9,
+            utterance_start: Some(Instant::now()),
+        };
+        let now = Instant::now() + Duration::from_secs(1);
+        let outcome = append_processed_chunk(&mut buffer, chunk(320, true), params(), now);
+
+        let IngestOutcome::Rollover {
+            pcm,
+            voiced_ticks,
+            ..
+        } = outcome else {
+            panic!("expected rollover");
+        };
+        assert_eq!(voiced_ticks + buffer.voiced_ticks, 10);
+        assert_eq!(pcm.len() + buffer.pcm.len(), 3_200);
+    }
+
+    #[test]
+    fn endpoint_fires_once_at_exact_silence_threshold() {
+        let mut buffer = UserAudioBuffer {
+            pcm: vec![0.1; 640],
+            silent_ticks: 0,
+            voiced_ticks: 2,
+            utterance_start: Some(Instant::now()),
+        };
+        let now = Instant::now();
+
+        assert!(matches!(advance_silence(&mut buffer, params(), now), IngestOutcome::None));
+        assert!(matches!(advance_silence(&mut buffer, params(), now), IngestOutcome::None));
+        assert!(matches!(
+            advance_silence(&mut buffer, params(), now),
+            IngestOutcome::Endpoint { .. }
+        ));
+        assert!(matches!(advance_silence(&mut buffer, params(), now), IngestOutcome::None));
+    }
+
+    #[test]
+    fn repeated_rollovers_conserve_all_pcm_samples() {
+        let mut buffer = UserAudioBuffer::default();
+        let mut emitted_samples = 0usize;
+        let now = Instant::now();
+
+        for tick in 0..300 {
+            let outcome = append_processed_chunk(
+                &mut buffer,
+                chunk(320, true),
+                params(),
+                now + Duration::from_millis(tick * 20),
+            );
+            if let IngestOutcome::Rollover { pcm, .. } = outcome {
+                emitted_samples += pcm.len();
+            }
+        }
+
+        assert_eq!(emitted_samples + buffer.pcm.len(), 300 * 320);
+    }
+
+    #[test]
+    fn rollover_split_is_panic_free_across_degenerate_bounds() {
+        for len in [3_200, 10_000, 64_000, 192_000] {
+            for keep in [0, 800, 24_000, len + 1] {
+                for max_keep in [0, 1_600, 62_400] {
+                    let pcm = vec![0.1; len];
+                    let split = choose_rollover_split_index(&pcm, keep, max_keep);
+                    assert!((1_600..=len - 1_600).contains(&split));
+                    assert!(len - split >= 1_600);
+                }
+            }
+        }
     }
 }
