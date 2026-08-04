@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, SystemTime};
 
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serenity::all::UserId;
 use tokio::io::AsyncWriteExt;
@@ -22,28 +23,29 @@ pub async fn transcript_writer_loop(
     mut rx: mpsc::Receiver<Utterance>,
     runtime: Arc<GuildRuntime>,
     transcript_jsonl_path: PathBuf,
-) {
-    async fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) {
-        let Ok(mut file) = tokio::fs::OpenOptions::new()
+) -> Result<()> {
+    async fn append_persisted_utterance(path: &Path, item: &PersistedUtterance) -> Result<()> {
+        let mut file = tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
             .await
-        else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(item) else {
-            return;
-        };
-        let _ = file.write_all(format!("{line}\n").as_bytes()).await;
+            .with_context(|| format!("failed to open transcript journal {}", path.display()))?;
+        let line = serde_json::to_string(item).context("failed to serialize transcript utterance")?;
+        file.write_all(format!("{line}\n").as_bytes())
+            .await
+            .with_context(|| format!("failed to append transcript journal {}", path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("failed to flush transcript journal {}", path.display()))?;
+        Ok(())
     }
 
     async fn append_utterance(
         session: &Arc<RwLock<CallSession>>,
-        runtime: &Arc<GuildRuntime>,
         transcript_jsonl_path: &Path,
         utterance: Utterance,
-    ) {
+    ) -> Result<()> {
         let mut lock = session.write().await;
 
         let start_offset_ms = utterance
@@ -59,21 +61,31 @@ pub async fn transcript_writer_loop(
         };
 
         drop(lock);
-        append_persisted_utterance(transcript_jsonl_path, &persisted).await;
-
-        runtime
-            .transcript_pending_commits
-            .fetch_sub(1, AtomicOrdering::SeqCst);
+        append_persisted_utterance(transcript_jsonl_path, &persisted).await
     }
 
+    let mut first_error = None;
     while let Some(item) = rx.recv().await {
-        append_utterance(
+        let result = append_utterance(
             &session,
-            &runtime,
             &transcript_jsonl_path,
             item,
         )
         .await;
+        runtime
+            .transcript_pending_commits
+            .fetch_sub(1, AtomicOrdering::SeqCst);
+        if let Err(error) = result {
+            tracing::error!("failed to persist transcript utterance: {error:#}");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -251,7 +263,10 @@ mod tests {
             .expect("enqueue utterance");
         }
         drop(tx);
-        writer.await.expect("writer task completes");
+        writer
+            .await
+            .expect("writer task completes")
+            .expect("writer persists all utterances");
 
         assert_eq!(runtime.transcript_pending_commits.load(Ordering::SeqCst), 0);
         let loaded = load_persisted_transcript(&path, started_mono).await;

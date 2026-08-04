@@ -85,6 +85,10 @@ pub(super) async fn handle_status(
         .as_ref()
         .map(|v| v.decode_jobs_with_text.load(Ordering::SeqCst))
         .unwrap_or(0);
+    let asr_decode_errors = runtime
+        .as_ref()
+        .map(|v| v.asr_decode_error_total.load(Ordering::SeqCst))
+        .unwrap_or(0);
     let decode_audio_total_ms = runtime
         .as_ref()
         .map(|v| v.decode_audio_total_ms.load(Ordering::SeqCst))
@@ -191,6 +195,7 @@ pub(super) async fn handle_status(
         queue_capacity,
         decode_jobs_total,
         decode_jobs_with_text,
+        asr_decode_errors,
         decode_failure_pct = format!("{decode_failure_pct:.2}"),
         rtf = format!("{rtf:.3}"),
         avg_decode_ms = format!("{avg_decode_ms:.1}"),
@@ -200,7 +205,7 @@ pub(super) async fn handle_status(
     );
 
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nQueue depth: {}/{} [{}]\nASR in-flight: {}\nPending commits: {}\nDecode failure: {:.2}% [{}]\nRTF (decode/audio): {:.3} [{}]\nDecode wait/decode ms (avg): {:.1}/{:.1}\nDecode shed: {} ({:.2}/min) [{}]\nUnmapped SSRC: {} [{}]\nTranscript utterances: {}",
+        "Transcription status\nVoice channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nQueue depth: {}/{} [{}]\nASR in-flight: {}\nPending commits: {}\nASR decode errors: {}\nDecode failure: {:.2}% [{}]\nRTF (decode/audio): {:.3} [{}]\nDecode wait/decode ms (avg): {:.1}/{:.1}\nDecode shed: {} ({:.2}/min) [{}]\nUnmapped SSRC: {} [{}]\nTranscript utterances: {}",
         voice_channel.get(),
         participants,
         queue_depth,
@@ -208,6 +213,7 @@ pub(super) async fn handle_status(
         queue_alert,
         inflight,
         pending_commits,
+        asr_decode_errors,
         decode_failure_pct,
         failure_alert,
         rtf,

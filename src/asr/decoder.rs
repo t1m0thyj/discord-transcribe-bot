@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use serenity::all::{GuildId, UserId};
@@ -44,15 +44,23 @@ impl DecodeDispatcher {
     }
 
     fn enqueue(&self, job: DecodeJob) -> Option<DecodeJob> {
-        let mut queue = self
-            .queue
-            .lock()
-            .expect("decode queue mutex poisoned");
+        let mut queue = self.lock_queue();
         let dropped = push_bounded(&mut queue, job, self.capacity);
         drop(queue);
         self.notify.notify_one();
         dropped
     }
+
+    fn lock_queue(&self) -> MutexGuard<'_, VecDeque<DecodeJob>> {
+        recover_mutex_lock(&self.queue, "decode queue")
+    }
+}
+
+fn recover_mutex_lock<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("{name} mutex was poisoned; recovering state");
+        poisoned.into_inner()
+    })
 }
 
 fn push_bounded<T>(queue: &mut VecDeque<T>, item: T, capacity: usize) -> Option<T> {
@@ -71,10 +79,7 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, item: T, capacity: usize) -> Option<
 
 pub fn decode_queue_depth() -> usize {
     let dispatcher = DecodeDispatcher::global();
-    let queue = dispatcher
-        .queue
-        .lock()
-        .expect("decode queue mutex poisoned");
+    let queue = dispatcher.lock_queue();
     queue.len()
 }
 
@@ -106,10 +111,7 @@ fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
         loop {
             let job = loop {
                 let maybe_job = {
-                    let mut queue = dispatcher
-                        .queue
-                        .lock()
-                        .expect("decode queue mutex poisoned");
+                    let mut queue = dispatcher.lock_queue();
                     queue.pop_front()
                 };
 
@@ -149,7 +151,21 @@ async fn process_decode_job(job: DecodeJob) {
         .decode_queue_wait_last_ms
         .store(queue_wait_ms, Ordering::SeqCst);
 
-    if let Some(text) = decode_result {
+    if let Some(text) = match decode_result {
+        Ok(text) => text,
+        Err(error) => {
+            job.runtime
+                .asr_decode_error_total
+                .fetch_add(1, Ordering::SeqCst);
+            tracing::warn!(
+                guild = %job.guild_id,
+                user = %job.user_id,
+                stage = job.stage,
+                "ASR decode failed; continuing with later chunks: {error:#}"
+            );
+            None
+        }
+    } {
         if job.live_transcript_debug {
             tracing::debug!(
                 user = %job.user_id,
@@ -180,6 +196,11 @@ async fn process_decode_job(job: DecodeJob) {
             job.runtime
                 .transcript_pending_commits
                 .fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(
+                guild = %job.guild_id,
+                user = %job.user_id,
+                "journal writer unavailable; dropped decoded utterance"
+            );
         }
     }
 
@@ -191,15 +212,17 @@ async fn process_decode_job(job: DecodeJob) {
 async fn transcribe_utterance_blocking(
     asr: &Arc<AsrEngine>,
     pcm_mono: Vec<f32>,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     transcribe_mono_pcm(Arc::clone(asr), pcm_mono).await
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Mutex;
 
-    use super::push_bounded;
+    use super::{push_bounded, recover_mutex_lock};
 
     #[test]
     fn bounded_queue_keeps_fifo_order_until_full() {
@@ -221,5 +244,15 @@ mod tests {
         let mut queue = VecDeque::new();
         assert_eq!(push_bounded(&mut queue, 1, 0), Some(1));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn poisoned_decode_queue_lock_recovers_existing_jobs() {
+        let queue = Mutex::new(VecDeque::from([1]));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _lock = queue.lock().expect("lock before induced panic");
+            panic!("induce poison");
+        }));
+        assert_eq!(recover_mutex_lock(&queue, "test queue").pop_front(), Some(1));
     }
 }

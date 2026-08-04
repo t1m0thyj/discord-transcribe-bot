@@ -391,14 +391,25 @@ async fn flush_pending_buffers_for_export(
             continue;
         }
 
-        if let Some(text) = transcribe_finalized_mono_pcm(state, pcm).await {
-            out.push(Utterance { user_id, start_ts, text });
+        match transcribe_finalized_mono_pcm(state, pcm).await {
+            Ok(Some(text)) => out.push(Utterance { user_id, start_ts, text }),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    guild = %guild_id,
+                    user = %user_id,
+                    "ASR decode failed for final buffered audio; continuing export: {error:#}"
+                );
+            }
         }
     }
 
     out
 }
 
-async fn transcribe_finalized_mono_pcm(state: &Arc<AppState>, pcm: Vec<f32>) -> Option<String> {
+async fn transcribe_finalized_mono_pcm(
+    state: &Arc<AppState>,
+    pcm: Vec<f32>,
+) -> anyhow::Result<Option<String>> {
     transcribe_mono_pcm(Arc::clone(&state.asr), pcm).await
 }

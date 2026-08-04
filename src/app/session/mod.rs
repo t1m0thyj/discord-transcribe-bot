@@ -83,12 +83,19 @@ pub(super) async fn start_call_session(
     }));
     state.active_calls.insert(guild_id, session.clone());
 
-    tokio::spawn(transcript_writer_loop(
-        session,
-        utterance_rx,
-        Arc::clone(&runtime),
-        transcript_jsonl_path,
-    ));
+    let writer_runtime = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        if let Err(error) = transcript_writer_loop(
+            session,
+            utterance_rx,
+            writer_runtime,
+            transcript_jsonl_path,
+        )
+        .await
+        {
+            tracing::error!("transcript writer stopped: {error:#}");
+        }
+    });
 
     attach_voice_handlers(
         state,

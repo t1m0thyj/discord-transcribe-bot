@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context as _;
 use dashmap::DashMap;
 use serenity::all::{GuildId, UserId};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
@@ -9,7 +10,7 @@ use super::frontend::{compute_rms, IngestFrontend};
 use super::models::{configure_model, resolve_model_dir};
 
 const VAD_HANGOVER_MS: u32 = 256;
-const DISPATCH_GATE_MIN_VOICED_TICKS: u32 = 8;
+const DISPATCH_GATE_MIN_VOICED_TICKS: u32 = 5;
 const FINALIZE_TAIL_KEEP_MS: u32 = 200;
 
 pub struct DispatchGateRejection {
@@ -138,54 +139,35 @@ pub struct UserStreamState {
 pub async fn transcribe_mono_pcm(
     asr: Arc<AsrEngine>,
     pcm_mono: Vec<f32>,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     let sample_count = pcm_mono.len();
     if sample_count < 1600 {
-        return None;
+        return Ok(None);
     }
 
     let decode_started = Instant::now();
     let text = tokio::task::spawn_blocking(move || asr.transcribe_16k_mono(&pcm_mono))
         .await
-        .ok()?;
+        .context("ASR decode task failed")?;
     let decode_ms = decode_started.elapsed().as_millis() as u64;
 
     tracing::debug!(samples = sample_count, decode_ms, "asr decode completed");
 
     let text = text.trim().to_string();
     if text.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let audio_secs = (sample_count as f32 / 16_000.0).max(0.001);
     if let Some(reason) = decode_rejection_reason(&text, audio_secs) {
         tracing::warn!(reason, samples = sample_count, "rejected decoded utterance");
-        return None;
+        return Ok(None);
     }
 
-    Some(text)
+    Ok(Some(text))
 }
 
 fn decode_rejection_reason(text: &str, audio_secs: f32) -> Option<&'static str> {
-    let normalized = text
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace())
-        .collect::<String>();
-
-    const HALLUCINATION_BLOCKLIST: &[&str] = &[
-        "thank you",
-        "thanks for watching",
-        "thank you for watching",
-        "subtitles by",
-        "captions by",
-    ];
-
-    if HALLUCINATION_BLOCKLIST.iter().any(|phrase| normalized == *phrase) {
-        return Some("blocklist");
-    }
-
     let chars_per_second = text.chars().count() as f32 / audio_secs;
     if chars_per_second > 25.0 {
         return Some("implausible_char_rate");
@@ -224,7 +206,7 @@ mod tests {
     #[test]
     fn dispatch_gate_accepts_exact_voiced_tick_threshold() {
         let pcm = vec![0.02; 3_200];
-        assert!(should_dispatch_chunk(&pcm, 8, 0.002).is_ok());
+        assert!(should_dispatch_chunk(&pcm, 5, 0.002).is_ok());
     }
 
     #[test]
@@ -264,21 +246,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejection_blocks_known_hallucination_phrase() {
-        assert_eq!(
-            decode_rejection_reason("Thank you!!!", 1.0),
-            Some("blocklist")
-        );
-    }
-
-    #[test]
-    fn decode_rejection_normalizes_punctuation_but_keeps_real_speech() {
+    fn decode_rejection_keeps_legitimate_short_and_common_phrases() {
+        assert_eq!(decode_rejection_reason("yeah", 1.0), None);
         assert_eq!(
             decode_rejection_reason("Thanks for watching.", 1.0),
-            Some("blocklist")
-        );
-        assert_eq!(
-            decode_rejection_reason("thank you for the update", 3.0),
             None
         );
     }
