@@ -45,6 +45,7 @@ pub struct TranscriptionRuntimeConfig {
     pub endpoint_silence_ms: u64,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
+    pub retention_days: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +150,13 @@ impl AppConfig {
             .filter(|v| *v >= 250)
             .unwrap_or(1_500);
 
+        let retention_days = file_cfg
+            .transcription
+            .as_ref()
+            .and_then(|t| t.retention_days)
+            .filter(|v| *v >= 1)
+            .unwrap_or(30);
+
         let autojoin_suffix = file_cfg
             .discord
             .as_ref()
@@ -200,6 +208,7 @@ impl AppConfig {
                 endpoint_silence_ms,
                 rolling_ingest_max_ms,
                 rolling_ingest_context_ms,
+                retention_days,
             },
             discord: DiscordRuntimeConfig { autojoin_suffix },
             summary: SummaryRuntimeConfig {
@@ -259,6 +268,7 @@ struct TranscriptionSection {
     endpoint_silence_ms: Option<u64>,
     rolling_ingest_max_ms: Option<u64>,
     rolling_ingest_context_ms: Option<u64>,
+    retention_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -9,7 +9,7 @@ use super::{
     AppState, LOG_DEFAULT_UTTERANCES, LOG_MAX_DISCORD_CHARS,
 };
 use super::autojoin::{normalized_autojoin_suffix, strip_known_autojoin_suffix};
-use crate::audio::{decode_queue_capacity, decode_queue_depth};
+use crate::asr::{decode_queue_capacity, decode_queue_depth};
 
 pub(super) async fn handle_join(
     ctx: &Context,

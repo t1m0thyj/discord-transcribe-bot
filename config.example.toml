@@ -27,6 +27,7 @@ log_live_transcript = false
 endpoint_silence_ms = 400
 rolling_ingest_max_ms = 12000
 rolling_ingest_context_ms = 1500
+retention_days = 30
 
 [discord]
 autojoin_suffix = "[Transcribe]"

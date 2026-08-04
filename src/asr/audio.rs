@@ -1,19 +1,22 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use serenity::http::Http;
 use serenity::all::{GuildId, UserId};
+use serenity::http::Http;
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 
-use crate::app::{GuildRuntime, Utterance};
-use crate::denoiser::compute_rms;
-use crate::transcription::{
-    should_dispatch_chunk, transcribe_mono_pcm, AsrEngine,
-    trim_finalize_tail,
-    SsrcMap, Streams,
+use crate::app::GuildRuntime;
+
+use super::decoder::{queue_decode_job, DecodeJob};
+use super::denoiser::compute_rms;
+use super::transcription::{
+    should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams,
 };
+
+const UNKNOWN_SSRC_MAX_TRACKED: usize = 8;
+const UNKNOWN_SSRC_MAX_SAMPLES: usize = 96_000;
+const UNKNOWN_SSRC_RETENTION: Duration = Duration::from_secs(1);
 
 pub struct SpeakingUpdateHandler {
     pub guild_id: GuildId,
@@ -81,10 +84,7 @@ pub struct VoiceTickHandler {
     pub rolling_ingest_context_ms: u64,
 }
 
-const DECODE_QUEUE_CAPACITY: usize = 8;
-const UNKNOWN_SSRC_MAX_TRACKED: usize = 8;
-const UNKNOWN_SSRC_MAX_SAMPLES: usize = 96_000;
-const UNKNOWN_SSRC_RETENTION: Duration = Duration::from_secs(1);
+pub use super::decoder::{decode_queue_capacity, decode_queue_depth};
 
 struct UnknownSsrcAudio {
     samples: VecDeque<i16>,
@@ -151,174 +151,6 @@ pub fn clear_unknown_ssrc_audio_for_guild(guild_id: GuildId) {
     map.retain(|(g, _), _| *g != guild_id);
 }
 
-struct DecodeJob {
-    guild_id: GuildId,
-    user_id: UserId,
-    start_ts: Instant,
-    stage: &'static str,
-    pcm: Vec<f32>,
-    enqueued_at: Instant,
-    runtime: Arc<GuildRuntime>,
-    asr: Arc<AsrEngine>,
-    live_transcript_debug: bool,
-}
-
-struct DecodeDispatcher {
-    queue: Mutex<VecDeque<DecodeJob>>,
-    notify: tokio::sync::Notify,
-    capacity: usize,
-}
-
-impl DecodeDispatcher {
-    fn global() -> Arc<Self> {
-        static INSTANCE: OnceLock<Arc<DecodeDispatcher>> = OnceLock::new();
-        Arc::clone(INSTANCE.get_or_init(|| {
-            let dispatcher = Arc::new(DecodeDispatcher {
-                queue: Mutex::new(VecDeque::new()),
-                notify: tokio::sync::Notify::new(),
-                capacity: DECODE_QUEUE_CAPACITY,
-            });
-            spawn_decode_worker(Arc::clone(&dispatcher));
-            dispatcher
-        }))
-    }
-
-    fn enqueue(&self, job: DecodeJob) -> Option<DecodeJob> {
-        let mut queue = self
-            .queue
-            .lock()
-            .expect("decode queue mutex poisoned");
-        let dropped = if queue.len() >= self.capacity {
-            queue.pop_front()
-        } else {
-            None
-        };
-        queue.push_back(job);
-        drop(queue);
-        self.notify.notify_one();
-        dropped
-    }
-}
-
-pub fn decode_queue_depth() -> usize {
-    let dispatcher = DecodeDispatcher::global();
-    let queue = dispatcher
-        .queue
-        .lock()
-        .expect("decode queue mutex poisoned");
-    queue.len()
-}
-
-pub fn decode_queue_capacity() -> usize {
-    DECODE_QUEUE_CAPACITY
-}
-
-fn spawn_decode_worker(dispatcher: Arc<DecodeDispatcher>) {
-    tokio::spawn(async move {
-        loop {
-            let job = loop {
-                let maybe_job = {
-                    let mut queue = dispatcher
-                        .queue
-                        .lock()
-                        .expect("decode queue mutex poisoned");
-                    queue.pop_front()
-                };
-
-                if let Some(job) = maybe_job {
-                    break job;
-                }
-
-                dispatcher.notify.notified().await;
-            };
-
-            process_decode_job(job).await;
-        }
-    });
-}
-
-async fn process_decode_job(job: DecodeJob) {
-    let queue_wait_ms = job.enqueued_at.elapsed().as_millis() as usize;
-    let audio_ms = (job.pcm.len().saturating_mul(1000)) / 16_000;
-    let decode_started = Instant::now();
-    let decode_result = transcribe_utterance_blocking(&job.asr, job.pcm).await;
-    let decode_ms = decode_started.elapsed().as_millis() as usize;
-
-    job.runtime.decode_jobs_total.fetch_add(1, Ordering::SeqCst);
-    job.runtime
-        .decode_audio_total_ms
-        .fetch_add(audio_ms, Ordering::SeqCst);
-    job.runtime
-        .decode_total_ms
-        .fetch_add(decode_ms, Ordering::SeqCst);
-    job.runtime
-        .decode_queue_wait_total_ms
-        .fetch_add(queue_wait_ms, Ordering::SeqCst);
-    job.runtime
-        .decode_last_ms
-        .store(decode_ms, Ordering::SeqCst);
-    job.runtime
-        .decode_queue_wait_last_ms
-        .store(queue_wait_ms, Ordering::SeqCst);
-
-    if let Some(text) = decode_result {
-        if job.live_transcript_debug {
-            tracing::debug!(
-                user = %job.user_id,
-                transcript = %text,
-                stage = job.stage,
-                "final transcription"
-            );
-        }
-
-        job.runtime
-            .decode_jobs_with_text
-            .fetch_add(1, Ordering::SeqCst);
-
-        job.runtime
-            .transcript_pending_commits
-            .fetch_add(1, Ordering::SeqCst);
-        if job
-            .runtime
-            .utterance_tx
-            .send(Utterance {
-                user_id: job.user_id,
-                start_ts: job.start_ts,
-                text,
-            })
-            .await
-            .is_err()
-        {
-            job.runtime
-                .transcript_pending_commits
-                .fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    job.runtime
-        .transcription_inflight
-        .fetch_sub(1, Ordering::SeqCst);
-}
-
-fn queue_decode_job(job: DecodeJob) {
-    let dispatcher = DecodeDispatcher::global();
-    if let Some(dropped) = dispatcher.enqueue(job) {
-        dropped
-            .runtime
-            .decode_shed_total
-            .fetch_add(1, Ordering::SeqCst);
-        dropped
-            .runtime
-            .transcription_inflight
-            .fetch_sub(1, Ordering::SeqCst);
-        tracing::warn!(
-            guild = %dropped.guild_id,
-            user = %dropped.user_id,
-            "decode queue full; dropped oldest queued chunk"
-        );
-    }
-}
-
 #[serenity::async_trait]
 impl VoiceEventHandler for VoiceTickHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
@@ -327,15 +159,14 @@ impl VoiceEventHandler for VoiceTickHandler {
         };
 
         let mut currently_speaking = std::collections::HashSet::<UserId>::new();
-        let max_ingest_samples =
-            ((self.rolling_ingest_max_ms as usize) * 16).max(1_600);
+        let max_ingest_samples = ((self.rolling_ingest_max_ms as usize) * 16).max(1_600);
         let base_keep_context_samples = (self.rolling_ingest_context_ms as usize) * 16;
 
         for (ssrc, data) in &tick.speaking {
             if data.decoded_voice.is_none() && data.packet.is_some() {
                 self.runtime
                     .decode_failure_activity
-                    .fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
 
             let Some(decoded) = &data.decoded_voice else {
@@ -347,18 +178,16 @@ impl VoiceEventHandler for VoiceTickHandler {
                 .get(&(self.guild_id, *ssrc))
                 .map(|v| *v)
             else {
-                // Decoded audio without an SSRC mapping is not usable yet.
-                // Count it as startup receive failure signal so watchdog can recover.
                 self.runtime
                     .unmapped_ssrc_activity
-                    .fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 push_unknown_ssrc_audio(self.guild_id, *ssrc, decoded);
                 continue;
             };
 
             self.runtime
                 .decoded_audio_activity
-                .fetch_add(1, Ordering::SeqCst);
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let user_key = (self.guild_id, user_id);
 
@@ -368,15 +197,13 @@ impl VoiceEventHandler for VoiceTickHandler {
                 stream.denoiser.push_stereo_pcm(decoded, self.enable_denoiser)
             } else {
                 replay.extend_from_slice(decoded);
-                stream
-                    .denoiser
-                    .push_stereo_pcm(&replay, self.enable_denoiser)
+                stream.denoiser.push_stereo_pcm(&replay, self.enable_denoiser)
             };
             let resample_errors = stream.denoiser.take_resample_error_count();
             if resample_errors > 0 {
                 self.runtime
                     .resample_error_total
-                    .fetch_add(resample_errors, Ordering::SeqCst);
+                    .fetch_add(resample_errors, std::sync::atomic::Ordering::SeqCst);
             }
             if processed.speech_active {
                 currently_speaking.insert(user_id);
@@ -393,7 +220,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 if self
                     .runtime
                     .transcription_started_notified
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
                     .is_ok()
                 {
                     let http = Arc::clone(&self.http);
@@ -469,7 +296,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
                     self.runtime
                         .dispatch_gate_total
-                        .fetch_add(1, Ordering::SeqCst);
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tracing::debug!(
                         guild = %self.guild_id,
                         user = %user_id,
@@ -484,7 +311,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 }
                 self.runtime
                     .transcription_inflight
-                    .fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 queue_decode_job(DecodeJob {
                     guild_id: self.guild_id,
                     user_id,
@@ -499,8 +326,7 @@ impl VoiceEventHandler for VoiceTickHandler {
             }
         }
 
-        let tracked_users: Vec<(GuildId, UserId)> =
-            self.streams.iter().map(|e| *e.key()).collect();
+        let tracked_users: Vec<(GuildId, UserId)> = self.streams.iter().map(|e| *e.key()).collect();
         for user_key in tracked_users {
             if user_key.0 != self.guild_id {
                 continue;
@@ -544,7 +370,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
                     self.runtime
                         .dispatch_gate_total
-                        .fetch_add(1, Ordering::SeqCst);
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tracing::debug!(
                         guild = %self.guild_id,
                         user = %user_id,
@@ -559,7 +385,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 }
                 self.runtime
                     .transcription_inflight
-                    .fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 queue_decode_job(DecodeJob {
                     guild_id: self.guild_id,
                     user_id,
@@ -599,8 +425,8 @@ fn choose_rollover_split_index(
     let search_start = nominal.saturating_sub(search_radius).max(min_split);
     let search_end = nominal.saturating_add(search_radius).min(max_split);
 
-    let frame = 800usize; // 50 ms at 16 kHz
-    let hop = 160usize; // 10 ms at 16 kHz
+    let frame = 800usize;
+    let hop = 160usize;
     let mut best = nominal;
     let mut best_rms = f32::INFINITY;
 
@@ -627,11 +453,3 @@ fn choose_rollover_split_index(
 
     best.clamp(min_split, max_split)
 }
-
-async fn transcribe_utterance_blocking(
-    asr: &Arc<AsrEngine>,
-    pcm_mono: Vec<f32>,
-) -> Option<String> {
-    transcribe_mono_pcm(Arc::clone(asr), pcm_mono).await
-}
-

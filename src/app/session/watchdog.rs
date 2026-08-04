@@ -11,7 +11,7 @@ use super::super::{
     AppState, GuildRuntime, STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS, STARTUP_RECEIVE_WATCHDOG_DELAY,
     STEADY_STATE_NO_PROGRESS_TIMEOUT, STEADY_STATE_WATCHDOG_CADENCE,
 };
-use crate::audio::{
+use crate::asr::{
     clear_unknown_ssrc_audio_for_guild, ClientDisconnectHandler, SpeakingUpdateHandler,
     VoiceTickHandler,
 };

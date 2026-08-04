@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::config::AppConfig;
 use crate::ai::AiClient;
-use crate::transcription::{
+use crate::asr::{
     AsrEngine, SsrcMap, Streams,
 };
 
@@ -86,6 +86,7 @@ pub struct AppState {
     pub endpoint_silence_ticks: u32,
     pub rolling_ingest_max_ms: u64,
     pub rolling_ingest_context_ms: u64,
+    pub transcript_retention_days: u64,
     pub autojoin_suffix: String,
     pub post_call_summary_enabled: bool,
     pub post_call_summary_post_in_thread: bool,
@@ -126,6 +127,7 @@ impl AppState {
             endpoint_silence_ticks: ((cfg.transcription.endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1),
             rolling_ingest_max_ms: cfg.transcription.rolling_ingest_max_ms,
             rolling_ingest_context_ms: cfg.transcription.rolling_ingest_context_ms,
+            transcript_retention_days: cfg.transcription.retention_days,
             autojoin_suffix: cfg.discord.autojoin_suffix,
             post_call_summary_enabled: cfg.summary.enabled,
             post_call_summary_post_in_thread: cfg.summary.post_in_thread,

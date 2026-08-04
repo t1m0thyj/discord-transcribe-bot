@@ -1,9 +1,7 @@
 mod app;
 mod ai;
-mod audio;
+mod asr;
 mod config;
-mod denoiser;
-mod transcription;
 
 use std::sync::Arc;
 

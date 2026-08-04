@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -10,10 +10,7 @@ use serenity::prelude::Context;
 use tokio::fs;
 
 use super::super::{AppState, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT, Utterance};
-use crate::audio::clear_unknown_ssrc_audio_for_guild;
-use crate::transcription::{should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
-
-const LOCAL_TRANSCRIPT_RETENTION_DAYS: u64 = 30;
+use crate::asr::{clear_unknown_ssrc_audio_for_guild, prune_old_transcripts, should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
 
 pub async fn finalize_call_for_guild(
     ctx: &Context,
@@ -81,22 +78,6 @@ pub async fn finalize_call_for_guild(
     let filename = format!("transcript-{}.md", session.started_at.format("%Y%m%d-%H%M%S"));
 
     let local_dir = PathBuf::from("transcripts");
-    fs::create_dir_all(&local_dir)
-        .await
-        .context("failed to create local transcript directory")?;
-    let local_path = local_dir.join(&filename);
-    fs::write(&local_path, &transcript_text).await.with_context(|| {
-        format!("failed to write local transcript file {}", local_path.display())
-    })?;
-
-    let deleted = prune_old_local_transcripts(
-        &local_dir,
-        Duration::from_secs(LOCAL_TRANSCRIPT_RETENTION_DAYS * 24 * 60 * 60),
-    )
-    .await;
-    if deleted > 0 {
-        tracing::info!(deleted, "pruned old local transcript files");
-    }
 
     let attachment = CreateAttachment::bytes(transcript_text.clone().into_bytes(), filename.clone());
     let msg = session
@@ -139,6 +120,19 @@ pub async fn finalize_call_for_guild(
     }
 
     super::super::upsert_thread_context(state, thread.id, transcript_text);
+
+    let prune_dir = local_dir.clone();
+    let retention_days = state.transcript_retention_days.max(1);
+    tokio::spawn(async move {
+        let deleted = prune_old_transcripts(
+            &prune_dir,
+            Duration::from_secs(retention_days * 24 * 60 * 60),
+        )
+        .await;
+        if deleted > 0 {
+            tracing::info!(deleted, "pruned old local transcript files");
+        }
+    });
 
     state.guild_runtimes.remove(&guild_id);
 
@@ -200,59 +194,6 @@ pub async fn maybe_finalize_on_empty_voice_channel(
     finalize_call_for_guild(ctx, state, guild_id).await?;
 
     Ok(())
-}
-
-async fn prune_old_local_transcripts(dir: &Path, retention: Duration) -> usize {
-    let Some(cutoff) = SystemTime::now().checked_sub(retention) else {
-        return 0;
-    };
-
-    let mut deleted = 0usize;
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(e) => {
-            tracing::warn!(dir = %dir.display(), "failed to scan transcript directory for cleanup: {e:#}");
-            return 0;
-        }
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("transcript-") {
-            continue;
-        }
-
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        if !matches!(ext, "md" | "jsonl") {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata().await else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        if modified > cutoff {
-            continue;
-        }
-
-        match fs::remove_file(&path).await {
-            Ok(()) => {
-                deleted = deleted.saturating_add(1);
-            }
-            Err(e) => {
-                tracing::warn!(file = %path.display(), "failed to remove old transcript file: {e:#}");
-            }
-        }
-    }
-
-    deleted
 }
 
 #[derive(Deserialize)]
