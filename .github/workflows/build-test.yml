@@ -9,7 +9,6 @@ permissions:
 jobs:
   build:
     name: Build (${{ matrix.artifact }})
-    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
