@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
-const AI_TRANSCRIPT_MAX_CHARS: usize = 120_000;
+const AI_TRANSCRIPT_MAX_CHARS: usize = 40_000;
 const AI_TURN_TEXT_MAX_CHARS: usize = 4_000;
 const AI_QUESTION_MAX_CHARS: usize = 4_000;
 

@@ -125,17 +125,6 @@ impl UserDenoiseState {
         out
     }
 
-    pub fn flush_pending(&mut self) -> Vec<f32> {
-        if self.pending.is_empty() {
-            return Vec::new();
-        }
-
-        let mut frame = std::mem::take(&mut self.pending);
-        frame.resize(RNNOISE_FRAME_SIZE, 0.0);
-        let cleaned = self.denoise_frame(&frame);
-        self.resample_48k_to_16k_stream(&cleaned)
-    }
-
     pub fn noise_rms_ema(&self) -> f32 {
         self.noise_rms_ema
     }

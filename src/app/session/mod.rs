@@ -31,6 +31,13 @@ pub(super) async fn start_call_session(
     voice_channel: ChannelId,
     text_channel: ChannelId,
 ) -> anyhow::Result<()> {
+    let session_start_lock = state
+        .session_start_locks
+        .entry(guild_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _session_start_guard = session_start_lock.lock().await;
+
     if state.active_calls.contains_key(&guild_id) {
         anyhow::bail!("an active call session already exists for this guild");
     }

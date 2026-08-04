@@ -10,7 +10,7 @@ use crate::app::GuildRuntime;
 
 use super::decoder::{queue_decode_job, DecodeJob};
 use super::denoiser::compute_rms;
-use super::transcription::{
+use super::pipeline::{
     should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams,
 };
 
@@ -159,7 +159,7 @@ impl VoiceEventHandler for VoiceTickHandler {
         };
 
         let mut currently_speaking = std::collections::HashSet::<UserId>::new();
-        let max_ingest_samples = ((self.rolling_ingest_max_ms as usize) * 16).max(1_600);
+        let max_ingest_samples = (self.rolling_ingest_max_ms as usize) * 16;
         let base_keep_context_samples = (self.rolling_ingest_context_ms as usize) * 16;
 
         for (ssrc, data) in &tick.speaking {
@@ -267,6 +267,7 @@ impl VoiceEventHandler for VoiceTickHandler {
 
                     let tail = entry.pcm.split_off(split_at);
                     let chunk = std::mem::replace(&mut entry.pcm, tail);
+                    let carried_tail_ms = (entry.pcm.len() as u64) / 16;
                     let chunk_voiced = if source_len == 0 {
                         0
                     } else {
@@ -276,7 +277,7 @@ impl VoiceEventHandler for VoiceTickHandler {
 
                     entry.utterance_start = Some(
                         Instant::now()
-                            .checked_sub(Duration::from_millis(self.rolling_ingest_context_ms))
+                            .checked_sub(Duration::from_millis(carried_tail_ms))
                             .unwrap_or_else(Instant::now),
                     );
 
@@ -348,14 +349,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                     continue;
                 }
 
-                let flushed = if self.enable_denoiser {
-                    stream.denoiser.flush_pending()
-                } else {
-                    Vec::new()
-                };
-
                 let entry = &mut stream.buffer;
-                entry.pcm.extend(flushed);
                 let start_ts = entry.utterance_start.take().unwrap_or_else(Instant::now);
                 let mut pcm = std::mem::take(&mut entry.pcm);
                 let voiced_ticks = std::mem::take(&mut entry.voiced_ticks);
@@ -417,7 +411,7 @@ fn choose_rollover_split_index(
     let min_split = len.saturating_sub(max_keep_without_starving).max(1_600);
     let max_split = len.saturating_sub(1_600);
     if min_split >= max_split {
-        return len.saturating_sub(keep_samples).clamp(min_split, max_split);
+        return max_split;
     }
 
     let nominal = len.saturating_sub(keep_samples).clamp(min_split, max_split);

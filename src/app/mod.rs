@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use serenity::all::{
     ChannelId, Command, CommandInteraction, CommandOptionType, CreateCommand,
     CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
-    EditInteractionResponse, GuildId, Message, UserId,
+    EditInteractionResponse, GuildId, Message, Permissions, UserId,
 };
 use serenity::prelude::Context;
 use tokio::sync::mpsc;
@@ -33,6 +33,7 @@ pub(super) const STARTUP_RECEIVE_WATCHDOG_DELAY: Duration = Duration::from_secs(
 pub(super) const STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(30);
 pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const THREAD_AI_COOLDOWN: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct Utterance {
@@ -78,8 +79,10 @@ pub struct GuildRuntime {
 
 pub struct AppState {
     pub active_calls: DashMap<GuildId, Arc<RwLock<CallSession>>>,
+    pub session_start_locks: DashMap<GuildId, Arc<tokio::sync::Mutex<()>>>,
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
     pub thread_context_last_used: DashMap<ChannelId, Instant>,
+    pub thread_ai_last_reply: DashMap<ChannelId, Instant>,
     pub ai: Arc<AiClient>,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
@@ -117,8 +120,10 @@ impl AppState {
 
         Ok(Self {
             active_calls: DashMap::new(),
+            session_start_locks: DashMap::new(),
             transcript_threads: DashMap::new(),
             thread_context_last_used: DashMap::new(),
+            thread_ai_last_reply: DashMap::new(),
             ai,
             live_transcript_debug: cfg.debug.log_live_transcript,
             enable_denoiser: cfg.audio.enable_denoiser,
@@ -162,6 +167,7 @@ fn evict_thread_contexts_if_needed(state: &Arc<AppState>) {
 
         state.transcript_threads.remove(&channel_id);
         state.thread_context_last_used.remove(&channel_id);
+        state.thread_ai_last_reply.remove(&channel_id);
     }
 }
 
@@ -183,11 +189,18 @@ pub(super) fn upsert_thread_context(
 
 pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
     let cmds = vec![
-        CreateCommand::new("join").description("Join your current voice channel in this guild"),
-        CreateCommand::new("leave").description("Leave voice and finalize transcript export"),
-        CreateCommand::new("status").description("Show live transcription status for this guild"),
+        CreateCommand::new("join")
+            .description("Join your current voice channel in this guild")
+            .default_member_permissions(Permissions::MOVE_MEMBERS),
+        CreateCommand::new("leave")
+            .description("Leave voice and finalize transcript export")
+            .default_member_permissions(Permissions::MOVE_MEMBERS),
+        CreateCommand::new("status")
+            .description("Show live transcription status for this guild")
+            .default_member_permissions(Permissions::MOVE_MEMBERS),
         CreateCommand::new("log")
             .description("Show recent committed transcript lines for the active call")
+            .default_member_permissions(Permissions::MOVE_MEMBERS)
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::Integer,
@@ -198,12 +211,14 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
             ),
         CreateCommand::new("ask")
             .description("Ask about the current call transcript")
+            .default_member_permissions(Permissions::MOVE_MEMBERS)
             .add_option(
                 CreateCommandOption::new(CommandOptionType::String, "question", "Question to ask")
                     .required(true),
             ),
         CreateCommand::new("autojoin")
             .description("Mark your current voice channel for automatic future joins")
+            .default_member_permissions(Permissions::MANAGE_CHANNELS)
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::Channel,
@@ -271,6 +286,15 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
 
     if let Some(thread_ctx) = state.transcript_threads.get(&msg.channel_id) {
         touch_thread_context(state, msg.channel_id);
+
+        let now = Instant::now();
+        if let Some(last) = state.thread_ai_last_reply.get(&msg.channel_id) {
+            if now.saturating_duration_since(*last.value()) < THREAD_AI_COOLDOWN {
+                return;
+            }
+        }
+        state.thread_ai_last_reply.insert(msg.channel_id, now);
+
         let question = msg.content.clone();
         let transcript = thread_ctx.transcript.clone();
         let prior_turns = thread_ctx.history.clone();

@@ -7,7 +7,7 @@ use serenity::all::{GuildId, UserId};
 
 use crate::app::{GuildRuntime, Utterance};
 
-use super::transcription::{transcribe_mono_pcm, AsrEngine};
+use super::pipeline::{transcribe_mono_pcm, AsrEngine};
 
 const DECODE_QUEUE_CAPACITY: usize = 8;
 

@@ -385,10 +385,8 @@ async fn flush_pending_buffers_for_export(
         let mut noise_rms_ema = 0.0f32;
 
         if let Some(mut stream) = state.streams.get_mut(&user_key) {
-            let flushed = stream.denoiser.flush_pending();
             noise_rms_ema = stream.denoiser.noise_rms_ema();
             let entry = &mut stream.buffer;
-            entry.pcm.extend(flushed);
 
             if entry.pcm.is_empty() {
                 continue;
