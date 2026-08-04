@@ -9,7 +9,7 @@ use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use crate::app::GuildRuntime;
 
 use super::decoder::{queue_decode_job, DecodeJob};
-use super::denoiser::compute_rms;
+use super::frontend::compute_rms;
 use super::pipeline::{
     should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams,
 };
@@ -194,12 +194,12 @@ impl VoiceEventHandler for VoiceTickHandler {
             let mut stream = self.streams.entry(user_key).or_default();
             let mut replay = take_unknown_ssrc_audio(self.guild_id, *ssrc);
             let processed = if replay.is_empty() {
-                stream.denoiser.push_stereo_pcm(decoded, self.enable_denoiser)
+                stream.frontend.push_stereo_pcm(decoded, self.enable_denoiser)
             } else {
                 replay.extend_from_slice(decoded);
-                stream.denoiser.push_stereo_pcm(&replay, self.enable_denoiser)
+                stream.frontend.push_stereo_pcm(&replay, self.enable_denoiser)
             };
-            let resample_errors = stream.denoiser.take_resample_error_count();
+            let resample_errors = stream.frontend.take_resample_error_count();
             if resample_errors > 0 {
                 self.runtime
                     .resample_error_total
@@ -235,7 +235,7 @@ impl VoiceEventHandler for VoiceTickHandler {
             }
 
             let cleaned = processed.pcm_16k;
-            let noise_rms_ema = stream.denoiser.noise_rms_ema();
+            let noise_rms_ema = stream.frontend.noise_rms_ema();
 
             let entry = &mut stream.buffer;
             if entry.utterance_start.is_none() {
@@ -356,7 +356,7 @@ impl VoiceEventHandler for VoiceTickHandler {
                 let final_silent_ticks = entry.silent_ticks;
                 entry.silent_ticks = 0;
                 trim_finalize_tail(&mut pcm, final_silent_ticks);
-                let noise_rms_ema = stream.denoiser.noise_rms_ema();
+                let noise_rms_ema = stream.frontend.noise_rms_ema();
                 maybe_job = Some((start_ts, pcm, voiced_ticks, noise_rms_ema));
             }
 

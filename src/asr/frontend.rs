@@ -4,7 +4,7 @@ use earshot::Detector;
 use nnnoiseless::DenoiseState;
 use rubato::{FftFixedInOut, Resampler};
 
-pub const RNNOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
+const RNNOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 const EARSHOT_FRAME_SIZE: usize = 256;
 const EARSHOT_VAD_THRESHOLD: f32 = 0.5;
 const VAD_HANGOVER_FRAMES: u8 = 16;
@@ -13,7 +13,7 @@ const DENOISER_BYPASS_SNR_DB: f32 = 18.0;
 const DENOISER_BYPASS_HYSTERESIS_DB: f32 = 3.0;
 const HIGHPASS_ALPHA_48K: f32 = 0.991;
 
-pub struct UserDenoiseState {
+pub struct IngestFrontend {
     denoiser: Box<DenoiseState<'static>>,
     vad: Detector,
     pending: Vec<f32>,
@@ -40,7 +40,7 @@ pub struct ProcessedSpeechChunk {
     pub speech_active: bool,
 }
 
-impl UserDenoiseState {
+impl IngestFrontend {
     pub fn new() -> Self {
         Self {
             denoiser: DenoiseState::new(),
@@ -113,7 +113,7 @@ impl UserDenoiseState {
         }
     }
 
-    pub fn push_mono_pcm(&mut self, input: &[f32]) -> Vec<f32> {
+    fn push_mono_pcm(&mut self, input: &[f32]) -> Vec<f32> {
         self.pending.extend_from_slice(input);
         let mut out = Vec::new();
 
@@ -271,13 +271,13 @@ impl UserDenoiseState {
     }
 }
 
-impl Default for UserDenoiseState {
+impl Default for IngestFrontend {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub fn downmix_stereo_to_mono_i16_scale(input: &[i16]) -> Vec<f32> {
+fn downmix_stereo_to_mono_i16_scale(input: &[i16]) -> Vec<f32> {
     let mut out = Vec::with_capacity(input.len() / 2);
     let mut i = 0;
     while i + 1 < input.len() {
@@ -308,7 +308,7 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        RNNOISE_FRAME_SIZE, UserDenoiseState, compute_rms, downmix_stereo_to_mono_i16_scale,
+        IngestFrontend, RNNOISE_FRAME_SIZE, compute_rms, downmix_stereo_to_mono_i16_scale,
         downmix_stereo_to_mono_unit_scale,
     };
 
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn push_mono_pcm_buffers_until_full_frame() {
-        let mut state = UserDenoiseState::new();
+        let mut state = IngestFrontend::new();
         let almost_frame = vec![0.1f32; RNNOISE_FRAME_SIZE - 10];
         let tail = vec![0.1f32; 10];
 

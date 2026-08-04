@@ -16,7 +16,7 @@ Practical architecture overview for the Discord live transcription bot, with eno
 - serenity + songbird for Discord events and voice receive.
 - sherpa-onnx for local ASR.
 - Optional nnnoiseless denoiser.
-- Gemini (via reqwest) for transcript Q&A.
+- AI provider abstraction (Gemini or Ollama via reqwest) for transcript Q&A and summaries.
 
 ## Runtime flow
 
@@ -30,9 +30,10 @@ Practical architecture overview for the Discord live transcription bot, with eno
 
 ## Audio and transcription path
 
-- Per-user ingest state combines denoiser + rolling buffer.
+- Per-user ingest frontend combines DSP/VAD state + rolling buffer.
 - Pipeline stages: downmix, high-pass, optional denoise, 48k->16k resample, VAD, endpointing.
 - Rolling ingest bounds long speech segments and dispatches chunks through a bounded decode queue.
+- Rollover chooses a split near the context boundary using a min-RMS search window to avoid cutting through louder speech.
 - Decode rejection and dispatch gating drop implausible/low-value chunks early.
 
 ## Ordering and consistency
@@ -53,11 +54,13 @@ Practical architecture overview for the Discord live transcription bot, with eno
 
 Autojoin is suffix-based: channels ending with the configured marker (default [Transcribe]) are auto-joined when a non-bot user enters.
 
+Status reports include decode queue depth, in-flight jobs, pending commits, decode failure rate, realtime factor (RTF), average queue wait/decode times, shed rate, and unmapped SSRC activity.
+
 ## Core state
 
 - CallSession: transcript, channel IDs, session timestamps.
 - GuildRuntime: per-guild sender, health counters, recovery lock.
-- UserStreamState: per-user DSP state and rolling audio buffer.
+- UserStreamState: per-user ingest frontend state and rolling audio buffer.
 - ThreadContext: transcript snapshot and bounded Q&A turn history.
 
 ## Reliability behavior
@@ -71,12 +74,18 @@ Autojoin is suffix-based: channels ending with the configured marker (default [T
 
 - src/main.rs: startup, intents, event routing.
 - src/config.rs: env/config parsing.
-- src/audio.rs: voice ingest, DSP path, segmentation, decode dispatch.
-- src/transcription.rs: ASR engine setup, DSP helpers, transcript writer.
+- src/ai/mod.rs + src/ai/{gemini,ollama}.rs: provider abstraction and AI API calls.
+- src/asr/audio.rs: voice ingest, segmentation, and decode dispatch.
+- src/asr/frontend.rs: ingest DSP frontend (high-pass, denoise bypass, resample, VAD, preroll).
+- src/asr/pipeline.rs: ASR engine setup, dispatch gate, finalize-tail trim, stream state types.
+- src/asr/models.rs: model autodetect and recognizer model config wiring.
+- src/asr/decoder.rs: bounded decode queue and worker.
 - src/app/mod.rs: shared app state and command/message routing.
 - src/app/commands.rs: slash command handlers and session start.
-- src/app/session.rs: finalize/recovery/watchdogs/export/thread context.
-- src/gemini.rs: transcript Q&A API calls.
+- src/app/autojoin.rs: autojoin detection and suffix/channel helpers.
+- src/app/summary.rs: transcript/export formatting and post-call summary handling.
+- src/app/journal.rs: transcript JSONL persistence and retention cleanup.
+- src/app/session/{mod,watchdog,finalize}.rs: start/finalize/recovery/watchdogs/export/thread context.
 
 ## Important config knobs
 

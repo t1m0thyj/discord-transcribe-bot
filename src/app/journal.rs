@@ -1,18 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::app::{CallSession, Utterance};
+use super::{CallSession, GuildRuntime, Utterance};
 
 pub async fn transcript_writer_loop(
     session: Arc<RwLock<CallSession>>,
     mut rx: mpsc::Receiver<Utterance>,
-    pending_commits: Arc<AtomicUsize>,
+    runtime: Arc<GuildRuntime>,
     transcript_jsonl_path: PathBuf,
 ) {
     #[derive(Serialize)]
@@ -39,7 +39,7 @@ pub async fn transcript_writer_loop(
 
     async fn append_utterance(
         session: &Arc<RwLock<CallSession>>,
-        pending_commits: &Arc<AtomicUsize>,
+        runtime: &Arc<GuildRuntime>,
         transcript_jsonl_path: &Path,
         utterance: Utterance,
     ) {
@@ -60,13 +60,15 @@ pub async fn transcript_writer_loop(
         drop(lock);
         append_persisted_utterance(transcript_jsonl_path, &persisted).await;
 
-        pending_commits.fetch_sub(1, AtomicOrdering::SeqCst);
+        runtime
+            .transcript_pending_commits
+            .fetch_sub(1, AtomicOrdering::SeqCst);
     }
 
     while let Some(item) = rx.recv().await {
         append_utterance(
             &session,
-            &pending_commits,
+            &runtime,
             &transcript_jsonl_path,
             item,
         )

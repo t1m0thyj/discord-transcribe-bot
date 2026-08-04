@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use serenity::all::{GuildId, UserId};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 
-use super::denoiser::{compute_rms, UserDenoiseState};
+use super::frontend::{compute_rms, IngestFrontend};
 use super::models::{configure_model, resolve_model_dir};
 
 const VAD_HANGOVER_MS: u32 = 256;
@@ -121,7 +121,7 @@ impl AsrEngine {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct UserAudioBuffer {
     pub pcm: Vec<f32>,
     pub silent_ticks: u32,
@@ -131,7 +131,7 @@ pub struct UserAudioBuffer {
 
 #[derive(Default)]
 pub struct UserStreamState {
-    pub denoiser: UserDenoiseState,
+    pub frontend: IngestFrontend,
     pub buffer: UserAudioBuffer,
 }
 

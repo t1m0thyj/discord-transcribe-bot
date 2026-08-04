@@ -20,6 +20,7 @@ use crate::asr::{
 
 mod autojoin;
 mod commands;
+mod journal;
 mod session;
 mod summary;
 
@@ -58,22 +59,22 @@ pub struct ThreadContext {
 
 pub struct GuildRuntime {
     pub utterance_tx: mpsc::Sender<Utterance>,
-    pub transcription_inflight: Arc<AtomicUsize>,
-    pub transcript_pending_commits: Arc<AtomicUsize>,
-    pub decode_jobs_total: Arc<AtomicUsize>,
-    pub decode_jobs_with_text: Arc<AtomicUsize>,
-    pub decode_audio_total_ms: Arc<AtomicUsize>,
-    pub decode_total_ms: Arc<AtomicUsize>,
-    pub decode_queue_wait_total_ms: Arc<AtomicUsize>,
-    pub decode_last_ms: Arc<AtomicUsize>,
-    pub decode_queue_wait_last_ms: Arc<AtomicUsize>,
-    pub decode_shed_total: Arc<AtomicUsize>,
-    pub dispatch_gate_total: Arc<AtomicUsize>,
-    pub resample_error_total: Arc<AtomicUsize>,
-    pub decoded_audio_activity: Arc<AtomicUsize>,
-    pub decode_failure_activity: Arc<AtomicUsize>,
-    pub unmapped_ssrc_activity: Arc<AtomicUsize>,
-    pub transcription_started_notified: Arc<AtomicBool>,
+    pub transcription_inflight: AtomicUsize,
+    pub transcript_pending_commits: AtomicUsize,
+    pub decode_jobs_total: AtomicUsize,
+    pub decode_jobs_with_text: AtomicUsize,
+    pub decode_audio_total_ms: AtomicUsize,
+    pub decode_total_ms: AtomicUsize,
+    pub decode_queue_wait_total_ms: AtomicUsize,
+    pub decode_last_ms: AtomicUsize,
+    pub decode_queue_wait_last_ms: AtomicUsize,
+    pub decode_shed_total: AtomicUsize,
+    pub dispatch_gate_total: AtomicUsize,
+    pub resample_error_total: AtomicUsize,
+    pub decoded_audio_activity: AtomicUsize,
+    pub decode_failure_activity: AtomicUsize,
+    pub unmapped_ssrc_activity: AtomicUsize,
+    pub transcription_started_notified: AtomicBool,
     pub recovery_lock: Arc<tokio::sync::Mutex<()>>,
 }
 

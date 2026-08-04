@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
 
 use super::{AppState, CallSession, GuildRuntime, Utterance};
-use crate::asr::transcript_writer_loop;
+use super::journal::transcript_writer_loop;
 
 mod finalize;
 mod watchdog;
@@ -73,22 +73,22 @@ pub(super) async fn start_call_session(
 
     let runtime = Arc::new(GuildRuntime {
         utterance_tx: utterance_tx.clone(),
-        transcription_inflight: Arc::new(AtomicUsize::new(0)),
-        transcript_pending_commits: Arc::new(AtomicUsize::new(0)),
-        decode_jobs_total: Arc::new(AtomicUsize::new(0)),
-        decode_jobs_with_text: Arc::new(AtomicUsize::new(0)),
-        decode_audio_total_ms: Arc::new(AtomicUsize::new(0)),
-        decode_total_ms: Arc::new(AtomicUsize::new(0)),
-        decode_queue_wait_total_ms: Arc::new(AtomicUsize::new(0)),
-        decode_last_ms: Arc::new(AtomicUsize::new(0)),
-        decode_queue_wait_last_ms: Arc::new(AtomicUsize::new(0)),
-        decode_shed_total: Arc::new(AtomicUsize::new(0)),
-        dispatch_gate_total: Arc::new(AtomicUsize::new(0)),
-        resample_error_total: Arc::new(AtomicUsize::new(0)),
-        decoded_audio_activity: Arc::new(AtomicUsize::new(0)),
-        decode_failure_activity: Arc::new(AtomicUsize::new(0)),
-        unmapped_ssrc_activity: Arc::new(AtomicUsize::new(0)),
-        transcription_started_notified: Arc::new(AtomicBool::new(false)),
+        transcription_inflight: AtomicUsize::new(0),
+        transcript_pending_commits: AtomicUsize::new(0),
+        decode_jobs_total: AtomicUsize::new(0),
+        decode_jobs_with_text: AtomicUsize::new(0),
+        decode_audio_total_ms: AtomicUsize::new(0),
+        decode_total_ms: AtomicUsize::new(0),
+        decode_queue_wait_total_ms: AtomicUsize::new(0),
+        decode_last_ms: AtomicUsize::new(0),
+        decode_queue_wait_last_ms: AtomicUsize::new(0),
+        decode_shed_total: AtomicUsize::new(0),
+        dispatch_gate_total: AtomicUsize::new(0),
+        resample_error_total: AtomicUsize::new(0),
+        decoded_audio_activity: AtomicUsize::new(0),
+        decode_failure_activity: AtomicUsize::new(0),
+        unmapped_ssrc_activity: AtomicUsize::new(0),
+        transcription_started_notified: AtomicBool::new(false),
         recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
     state.guild_runtimes.insert(guild_id, Arc::clone(&runtime));
@@ -106,7 +106,7 @@ pub(super) async fn start_call_session(
     tokio::spawn(transcript_writer_loop(
         session,
         utterance_rx,
-        Arc::clone(&runtime.transcript_pending_commits),
+        Arc::clone(&runtime),
         transcript_jsonl_path,
     ));
 

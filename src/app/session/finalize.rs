@@ -10,7 +10,9 @@ use serenity::prelude::Context;
 use tokio::fs;
 
 use super::super::{AppState, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT, Utterance};
-use crate::asr::{clear_unknown_ssrc_audio_for_guild, prune_old_transcripts, should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
+use crate::app::journal::prune_old_transcripts;
+use crate::app::summary;
+use crate::asr::{clear_unknown_ssrc_audio_for_guild, should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
 
 pub async fn finalize_call_for_guild(
     ctx: &Context,
@@ -55,17 +57,17 @@ pub async fn finalize_call_for_guild(
     let session = session_lock.read().await;
     let transcript = load_persisted_transcript(&session.transcript_jsonl_path, session.started_mono).await;
 
-    let transcript_title = super::super::summary::format_call_title(session.started_at);
+    let transcript_title = summary::format_call_title(session.started_at);
     let call_duration = session.started_mono.elapsed();
     let should_generate_summary = state.post_call_summary_enabled;
     let include_summary_in_markdown =
         should_generate_summary && state.post_call_summary_include_in_markdown;
     let mut auto_summary = if include_summary_in_markdown {
-        super::super::summary::maybe_generate_post_call_summary(ctx, state, &transcript, session.started_at).await
+        summary::maybe_generate_post_call_summary(ctx, state, &transcript, session.started_at).await
     } else {
         None
     };
-    let transcript_text = super::super::summary::format_export_markdown(
+    let transcript_text = summary::format_export_markdown(
         ctx,
         &transcript,
         session.started_at,
@@ -102,7 +104,7 @@ pub async fn finalize_call_for_guild(
 
     if should_generate_summary && state.post_call_summary_post_in_thread {
         if auto_summary.is_none() {
-            auto_summary = super::super::summary::maybe_generate_post_call_summary(
+            auto_summary = summary::maybe_generate_post_call_summary(
                 ctx,
                 state,
                 &transcript,
@@ -112,7 +114,7 @@ pub async fn finalize_call_for_guild(
         }
 
         if let Some(summary) = auto_summary.as_deref() {
-            let summary_message = super::super::summary::format_summary_thread_message(summary);
+            let summary_message = summary::format_summary_thread_message(summary);
             if let Err(e) = thread.say(&ctx.http, summary_message).await {
                 tracing::warn!(guild = %guild_id, "failed to post auto-summary in thread: {e:#}");
             }
@@ -256,16 +258,16 @@ async fn settle_and_flush_guild_audio(state: &Arc<AppState>, guild_id: GuildId) 
 }
 
 async fn wait_for_transcription_drain(state: &Arc<AppState>, guild_id: GuildId) {
-    let Some(counter) = state
+    let Some(runtime) = state
         .guild_runtimes
         .get(&guild_id)
-        .map(|v| Arc::clone(&v.transcription_inflight))
+        .map(|v| Arc::clone(v.value()))
     else {
         return;
     };
 
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
-        while counter.load(Ordering::SeqCst) > 0 {
+        while runtime.transcription_inflight.load(Ordering::SeqCst) > 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -311,16 +313,16 @@ async fn wait_for_capture_quiesce_with_timeout(
 }
 
 async fn wait_for_transcript_commit_drain(state: &Arc<AppState>, guild_id: GuildId) {
-    let Some(counter) = state
+    let Some(runtime) = state
         .guild_runtimes
         .get(&guild_id)
-        .map(|v| Arc::clone(&v.transcript_pending_commits))
+        .map(|v| Arc::clone(v.value()))
     else {
         return;
     };
 
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
-        while counter.load(Ordering::SeqCst) > 0 {
+        while runtime.transcript_pending_commits.load(Ordering::SeqCst) > 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -385,7 +387,7 @@ async fn flush_pending_buffers_for_export(
         let mut noise_rms_ema = 0.0f32;
 
         if let Some(mut stream) = state.streams.get_mut(&user_key) {
-            noise_rms_ema = stream.denoiser.noise_rms_ema();
+            noise_rms_ema = stream.frontend.noise_rms_ema();
             let entry = &mut stream.buffer;
 
             if entry.pcm.is_empty() {

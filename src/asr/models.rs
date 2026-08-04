@@ -63,16 +63,19 @@ pub(super) fn configure_model(
     model_base: &Path,
     forced_family_hint: Option<&str>,
 ) -> anyhow::Result<&'static str> {
+    // Order is significant: try the most specific layouts before broader heuristics.
+    // In particular, qwen3_asr (conv_frontend + tokenizer/) must run before whisper,
+    // because whisper matching only looks for encoder/decoder style names.
     if let Some(label) = try_transducer(cfg, model_base) {
         return Ok(label);
     }
     if let Some(label) = try_moonshine(cfg, model_base) {
         return Ok(label);
     }
-    if let Some(label) = try_whisper(cfg, model_base)? {
+    if let Some(label) = try_qwen3_asr(cfg, model_base) {
         return Ok(label);
     }
-    if let Some(label) = try_qwen3_asr(cfg, model_base) {
+    if let Some(label) = try_whisper(cfg, model_base)? {
         return Ok(label);
     }
     if let Some(label) = try_single_file_family(cfg, model_base, forced_family_hint)? {
