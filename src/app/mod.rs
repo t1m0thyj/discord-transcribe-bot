@@ -18,6 +18,7 @@ use crate::transcription::{
     AsrEngine, SsrcMap, Streams,
 };
 
+mod autojoin;
 mod commands;
 mod session;
 mod summary;
@@ -295,5 +296,5 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
     }
 }
 
+pub use autojoin::maybe_autojoin_on_voice_state;
 pub use session::maybe_finalize_on_empty_voice_channel;
-pub use commands::maybe_autojoin_on_voice_state;
