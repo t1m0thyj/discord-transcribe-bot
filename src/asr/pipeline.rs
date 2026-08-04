@@ -196,3 +196,65 @@ fn decode_rejection_reason(text: &str, audio_secs: f32) -> Option<&'static str> 
 
 pub type Streams = DashMap<(GuildId, UserId), UserStreamState>;
 pub type SsrcMap = DashMap<(GuildId, u32), UserId>;
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_rejection_reason, should_dispatch_chunk, trim_finalize_tail};
+
+    #[test]
+    fn dispatch_gate_rejects_insufficient_voiced_ticks() {
+        let pcm = vec![0.01; 3_200];
+        let rejection = should_dispatch_chunk(&pcm, 3, 0.001).unwrap_err();
+        assert_eq!(rejection.reason, "insufficient_voiced_ticks");
+    }
+
+    #[test]
+    fn dispatch_gate_rejects_below_noise_floor() {
+        let pcm = vec![0.001; 3_200];
+        let rejection = should_dispatch_chunk(&pcm, 12, 0.01).unwrap_err();
+        assert_eq!(rejection.reason, "below_noise_floor");
+    }
+
+    #[test]
+    fn dispatch_gate_accepts_voiced_and_loud_enough_audio() {
+        let pcm = vec![0.02; 3_200];
+        assert!(should_dispatch_chunk(&pcm, 12, 0.002).is_ok());
+    }
+
+    #[test]
+    fn trim_finalize_tail_noop_when_silence_ticks_zero() {
+        let mut pcm = vec![0.5; 10_000];
+        let before = pcm.len();
+        trim_finalize_tail(&mut pcm, 0);
+        assert_eq!(pcm.len(), before);
+    }
+
+    #[test]
+    fn trim_finalize_tail_removes_expected_tail() {
+        let mut pcm = vec![0.5; 12_000];
+        trim_finalize_tail(&mut pcm, 20);
+        assert_eq!(pcm.len(), 4_704);
+    }
+
+    #[test]
+    fn decode_rejection_blocks_known_hallucination_phrase() {
+        assert_eq!(
+            decode_rejection_reason("Thank you!!!", 1.0),
+            Some("blocklist")
+        );
+    }
+
+    #[test]
+    fn decode_rejection_blocks_implausible_character_rate() {
+        let text = "a".repeat(100);
+        assert_eq!(
+            decode_rejection_reason(&text, 2.0),
+            Some("implausible_char_rate")
+        );
+    }
+
+    #[test]
+    fn decode_rejection_allows_normal_text() {
+        assert_eq!(decode_rejection_reason("this sounds normal", 2.0), None);
+    }
+}

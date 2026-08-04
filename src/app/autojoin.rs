@@ -118,3 +118,30 @@ pub(super) fn normalized_autojoin_suffix(suffix: &str) -> String {
 pub(super) fn strip_known_autojoin_suffix(name: &str, suffix: &str) -> Option<String> {
     name.strip_suffix(suffix).map(ToString::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{normalized_autojoin_suffix, strip_known_autojoin_suffix};
+
+    #[test]
+    fn normalized_suffix_uses_default_when_blank() {
+        assert_eq!(normalized_autojoin_suffix("   "), " [Transcribe]");
+    }
+
+    #[test]
+    fn normalized_suffix_adds_leading_space() {
+        assert_eq!(normalized_autojoin_suffix("[Live]"), " [Live]");
+    }
+
+    #[test]
+    fn strip_known_suffix_only_when_present() {
+        assert_eq!(
+            strip_known_autojoin_suffix("General [Transcribe]", " [Transcribe]"),
+            Some("General".to_string())
+        );
+        assert_eq!(
+            strip_known_autojoin_suffix("General", " [Transcribe]"),
+            None
+        );
+    }
+}

@@ -329,3 +329,79 @@ fn try_single_file_family(
     cfg.model_config.tokens = tokens_str;
     Ok(Some(label))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sherpa_onnx::OfflineRecognizerConfig;
+
+    use super::{ForcedFamily, configure_model};
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "transcribe-bot-tests-{}-{}-{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("valid clock")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn forced_family_parses_common_aliases() {
+        assert_eq!(ForcedFamily::from_hint("sense-voice"), Some(ForcedFamily::SenseVoice));
+        assert_eq!(ForcedFamily::from_hint("zipformer_ctc"), Some(ForcedFamily::ZipformerCtc));
+        assert_eq!(ForcedFamily::from_hint("nemoctc"), Some(ForcedFamily::NemoCtc));
+    }
+
+    #[test]
+    fn forced_family_guesses_from_directory_name() {
+        assert_eq!(
+            ForcedFamily::guess_from_dir_name(PathBuf::from("model-sensevoice").as_path()),
+            Some(ForcedFamily::SenseVoice)
+        );
+        assert_eq!(
+            ForcedFamily::guess_from_dir_name(PathBuf::from("acoustic-tdnn").as_path()),
+            Some(ForcedFamily::Tdnn)
+        );
+    }
+
+    #[test]
+    fn configure_model_supports_single_file_with_forced_family() {
+        let dir = test_temp_dir("single-file-forced-family");
+        fs::write(dir.join("model.onnx"), b"").expect("write model");
+        fs::write(dir.join("tokens.txt"), b"").expect("write tokens");
+
+        let mut cfg = OfflineRecognizerConfig::default();
+        let label = configure_model(&mut cfg, &dir, Some("paraformer"))
+            .expect("model should configure");
+
+        assert_eq!(label, "paraformer");
+        assert!(cfg.model_config.paraformer.model.is_some());
+        assert!(cfg.model_config.tokens.is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configure_model_single_file_without_family_errors() {
+        let dir = test_temp_dir("single-file-missing-family");
+        fs::write(dir.join("model.int8.onnx"), b"").expect("write model");
+        fs::write(dir.join("tokens.txt"), b"").expect("write tokens");
+
+        let mut cfg = OfflineRecognizerConfig::default();
+        let err = configure_model(&mut cfg, &dir, None)
+            .expect_err("single-file config should fail without family hint");
+        assert!(err.to_string().contains("can't tell which family"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

@@ -304,3 +304,46 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RNNOISE_FRAME_SIZE, UserDenoiseState, compute_rms, downmix_stereo_to_mono_i16_scale,
+        downmix_stereo_to_mono_unit_scale,
+    };
+
+    #[test]
+    fn downmix_i16_scale_averages_stereo_pairs() {
+        let input = [100i16, 300, -400, 200];
+        let mono = downmix_stereo_to_mono_i16_scale(&input);
+        assert_eq!(mono, vec![200.0, -100.0]);
+    }
+
+    #[test]
+    fn downmix_unit_scale_constrains_to_minus_one_to_one() {
+        let input = [i16::MAX, i16::MAX, i16::MIN, i16::MIN];
+        let mono = downmix_stereo_to_mono_unit_scale(&input);
+        assert!(mono[0] <= 1.0 && mono[0] > 0.99);
+        assert!(mono[1] >= -1.0 && mono[1] < -0.99);
+    }
+
+    #[test]
+    fn compute_rms_handles_empty_and_known_values() {
+        assert_eq!(compute_rms(&[]), 0.0);
+        let rms = compute_rms(&[1.0, -1.0, 1.0, -1.0]);
+        assert!((rms - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn push_mono_pcm_buffers_until_full_frame() {
+        let mut state = UserDenoiseState::new();
+        let almost_frame = vec![0.1f32; RNNOISE_FRAME_SIZE - 10];
+        let tail = vec![0.1f32; 10];
+
+        let first_out = state.push_mono_pcm(&almost_frame);
+        assert!(first_out.is_empty());
+
+        let second_out = state.push_mono_pcm(&tail);
+        assert_eq!(second_out.len(), RNNOISE_FRAME_SIZE);
+    }
+}

@@ -447,3 +447,45 @@ fn choose_rollover_split_index(
 
     best.clamp(min_split, max_split)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::choose_rollover_split_index;
+
+    #[test]
+    fn rollover_short_buffer_uses_nominal_tail_keep() {
+        let pcm = vec![0.1; 2_000];
+        let split = choose_rollover_split_index(&pcm, 400, 1_000);
+        assert_eq!(split, 1_600);
+    }
+
+    #[test]
+    fn rollover_degenerate_bounds_returns_max_split() {
+        let pcm = vec![0.1; 3_200];
+        let split = choose_rollover_split_index(&pcm, 800, 1_000);
+        assert_eq!(split, 1_600);
+    }
+
+    #[test]
+    fn rollover_split_stays_inside_bounds() {
+        let pcm = vec![0.1; 10_000];
+        let keep = 3_000;
+        let max_keep_without_starving = 5_000;
+        let split = choose_rollover_split_index(&pcm, keep, max_keep_without_starving);
+
+        let min_split = pcm.len().saturating_sub(max_keep_without_starving).max(1_600);
+        let max_split = pcm.len().saturating_sub(1_600);
+        assert!(split >= min_split && split <= max_split);
+    }
+
+    #[test]
+    fn rollover_prefers_quieter_window_when_available() {
+        let mut pcm = vec![1.0; 10_000];
+        for sample in pcm.iter_mut().take(6_400).skip(5_600) {
+            *sample = 0.0;
+        }
+
+        let split = choose_rollover_split_index(&pcm, 3_000, 5_000);
+        assert!(split >= 5_400 && split <= 6_600);
+    }
+}

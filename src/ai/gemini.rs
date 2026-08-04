@@ -95,3 +95,29 @@ pub async fn generate_chat(
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::provider_config;
+    use crate::ai::AiProviderConfig;
+
+    #[test]
+    fn provider_config_requires_nonempty_api_key() {
+        let err = provider_config(Some("   ".to_string()), None).expect_err("missing key should fail");
+        assert!(err.to_string().contains("missing GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn provider_config_uses_default_model_when_missing() {
+        let cfg = provider_config(Some("abc".to_string()), None)
+            .expect("valid gemini config");
+
+        match cfg {
+            AiProviderConfig::Gemini { api_key, model } => {
+                assert_eq!(api_key, "abc");
+                assert_eq!(model, "gemini-flash-latest");
+            }
+            _ => panic!("expected gemini provider"),
+        }
+    }
+}
+

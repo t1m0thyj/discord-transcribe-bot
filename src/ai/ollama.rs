@@ -85,3 +85,49 @@ fn resolve_ollama_base_url(base_url: Option<String>) -> String {
 
     "http://127.0.0.1:11434".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_config, resolve_ollama_base_url};
+    use crate::ai::AiProviderConfig;
+
+    #[test]
+    fn resolve_ollama_base_url_defaults_when_missing() {
+        assert_eq!(
+            resolve_ollama_base_url(None),
+            "http://127.0.0.1:11434".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_ollama_base_url_trims_whitespace_and_trailing_slash() {
+        assert_eq!(
+            resolve_ollama_base_url(Some(" http://localhost:11434/  ".to_string())),
+            "http://localhost:11434".to_string()
+        );
+    }
+
+    #[test]
+    fn provider_config_requires_model() {
+        let err = provider_config(Some("  ".to_string()), None)
+            .expect_err("missing model should fail");
+        assert!(err.to_string().contains("missing OLLAMA_MODEL"));
+    }
+
+    #[test]
+    fn provider_config_applies_base_url_normalization() {
+        let cfg = provider_config(
+            Some("llama3".to_string()),
+            Some("http://localhost:11434/".to_string()),
+        )
+        .expect("valid ollama config");
+
+        match cfg {
+            AiProviderConfig::Ollama { base_url, model } => {
+                assert_eq!(base_url, "http://localhost:11434");
+                assert_eq!(model, "llama3");
+            }
+            _ => panic!("expected ollama provider"),
+        }
+    }
+}

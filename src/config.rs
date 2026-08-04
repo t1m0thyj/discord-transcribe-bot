@@ -317,3 +317,54 @@ fn read_nonempty_env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use super::{read_nonempty_env, resolve_config_path};
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn read_nonempty_env_trims_and_filters_empty() {
+        let _guard = EnvGuard::new("TRANSCRIBE_BOT_TEST_ENV");
+        env::set_var("TRANSCRIBE_BOT_TEST_ENV", "   value   ");
+        assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), Some("value".to_string()));
+
+        env::set_var("TRANSCRIBE_BOT_TEST_ENV", "    ");
+        assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), None);
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_env_override() {
+        let _guard = EnvGuard::new("APP_CONFIG_PATH");
+        env::set_var("APP_CONFIG_PATH", "custom.toml");
+        assert_eq!(resolve_config_path(), "custom.toml");
+
+        env::remove_var("APP_CONFIG_PATH");
+        assert_eq!(resolve_config_path(), "config.toml");
+    }
+}
+

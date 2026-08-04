@@ -126,3 +126,46 @@ pub async fn prune_old_transcripts(dir: &Path, retention: Duration) -> usize {
 
     deleted
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::prune_old_transcripts;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "transcribe-bot-tests-{}-{}-{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("valid clock")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn prune_old_transcripts_only_deletes_matching_jsonl_files() {
+        let dir = temp_dir("prune");
+        let keep_non_transcript = dir.join("notes.jsonl");
+        let keep_wrong_ext = dir.join("transcript-demo.txt");
+        let prune_target = dir.join("transcript-demo.jsonl");
+
+        fs::write(&keep_non_transcript, b"x").expect("write notes");
+        fs::write(&keep_wrong_ext, b"x").expect("write txt");
+        fs::write(&prune_target, b"x").expect("write transcript");
+
+        let deleted = prune_old_transcripts(&dir, Duration::ZERO).await;
+        assert_eq!(deleted, 1);
+        assert!(keep_non_transcript.exists());
+        assert!(keep_wrong_ext.exists());
+        assert!(!prune_target.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

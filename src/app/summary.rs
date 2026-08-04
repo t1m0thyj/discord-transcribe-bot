@@ -222,3 +222,48 @@ fn yaml_single_line_scalar(value: &str) -> String {
         format!("\"{}\"", yaml_escape_double_quoted(value))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{
+        format_call_title, format_duration, format_summary_thread_message,
+        format_transcript_stamp, yaml_escape_double_quoted, yaml_single_line_scalar,
+    };
+
+    #[test]
+    fn transcript_stamp_formats_minutes_seconds() {
+        assert_eq!(format_transcript_stamp(Duration::from_secs(65)), "1:05");
+    }
+
+    #[test]
+    fn duration_formats_with_or_without_hours() {
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_duration(Duration::from_secs(3_665)), "1h 1m 5s");
+    }
+
+    #[test]
+    fn summary_thread_message_truncates_long_content() {
+        let long = "a".repeat(2_100);
+        let message = format_summary_thread_message(&long);
+        assert!(message.ends_with("\n\n(truncated)"));
+        assert!(message.chars().count() <= 1_800);
+    }
+
+    #[test]
+    fn yaml_helpers_escape_and_quote_when_needed() {
+        assert_eq!(yaml_escape_double_quoted("a\\b\"c"), "a\\\\b\\\"c");
+        assert_eq!(yaml_single_line_scalar("Alice-1"), "Alice-1");
+        assert_eq!(yaml_single_line_scalar("Alice:1"), "\"Alice:1\"");
+    }
+
+    #[test]
+    fn call_title_contains_utc_suffix() {
+        let started = chrono::DateTime::parse_from_rfc3339("2026-08-04T12:34:56Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let title = format_call_title(started);
+        assert!(title.contains("UTC"));
+    }
+}

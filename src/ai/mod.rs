@@ -168,3 +168,44 @@ fn tail_chars(input: &str, max_chars: usize) -> String {
         .rev()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AiProviderConfig, tail_chars};
+
+    #[test]
+    fn tail_chars_keeps_short_input() {
+        assert_eq!(tail_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn tail_chars_returns_suffix() {
+        assert_eq!(tail_chars("abcdef", 3), "def");
+    }
+
+    #[test]
+    fn provider_selection_is_case_insensitive() {
+        let cfg = AiProviderConfig::from_selection(
+            "GEMINI",
+            Some("key".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("gemini config should parse");
+        assert_eq!(cfg.provider_label(), "gemini");
+    }
+
+    #[test]
+    fn provider_selection_rejects_unknown_provider() {
+        let err = AiProviderConfig::from_selection(
+            "not-a-provider",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("unknown provider should fail");
+        assert!(err.to_string().contains("unsupported AI_PROVIDER"));
+    }
+}
