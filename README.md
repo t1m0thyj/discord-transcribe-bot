@@ -1,17 +1,14 @@
 # transcribe-bot
 
-Transcribe Discord voice channels locally and answer questions about the finished call.
-
-## What It Does
-
-The bot receives Discord voice audio, transcribes finalized speech locally, and posts a Markdown transcript when the call ends. Its transcript thread supports optional Q&A and summaries through Gemini or Ollama.
+Transcribe Discord voice channels locally and use AI to summarize the conversation or answer follow-up questions.
 
 ## Configuring
 
-1. Create a Discord application and bot. The required scopes, permissions, and Developer Portal settings are in the [usage guide](USAGE.md#discord-setup).
-2. Create `.env` from `.env.example`, then set `DISCORD_TOKEN`. Add `GEMINI_API_KEY` only when `[ai].provider = "gemini"`.
-3. Create `config.toml` from `config.example.toml`. Set the AI provider and `[asr].model_dir`.
-4. Install the Hugging Face CLI and download the default ASR model:
+1. Run `transcribe-bot init` in the directory where the bot will run, or `cargo run -- init` from a source checkout. It creates `.env` and `config.toml` without overwriting existing files.
+2. Create a Discord application and bot. The required scopes, permissions, and Developer Portal settings are in the [usage guide](USAGE.md#discord-setup).
+3. Set `DISCORD_TOKEN` in `.env`. Add `GEMINI_API_KEY` when using Gemini; see [AI provider setup](USAGE.md#ai-provider-setup).
+4. Select an AI provider and set `[asr].model_dir` in `config.toml`.
+5. Install the Hugging Face CLI and download the default ASR model:
 
    ```bash
    pip install --upgrade "huggingface_hub[cli]"
@@ -19,6 +16,8 @@ The bot receives Discord voice audio, transcribes finalized speech locally, and 
    ```
 
    **Note:** For gated models, authenticate first with `hf auth login`.
+
+6. Run `transcribe-bot doctor` (or `cargo run -- doctor` from source) to validate the configuration, ASR model, and configured AI provider before starting the bot.
 
 ## Building From Source
 
@@ -33,7 +32,7 @@ On Windows, use the Visual Studio Build Tools C++ workload. The workspace includ
 
 ## Installing A Prebuilt Binary
 
-Download the binary matching your platform from a published release or the corresponding GitHub Actions build artifact. Put it beside `.env` and `config.toml`, keep the configured model directory available, then run the binary from that directory.
+Download the binary matching your platform from a published release or the corresponding GitHub Actions build artifact and put it in an empty directory. Run `transcribe-bot init` there, complete [configuration](#configuring), then start the binary from that directory.
 
 ## How It Works
 

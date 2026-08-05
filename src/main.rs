@@ -1,6 +1,7 @@
 mod app;
 mod ai;
 mod asr;
+mod cli;
 mod config;
 
 use std::sync::Arc;
@@ -85,6 +86,26 @@ async fn run() -> anyhow::Result<()> {
             }),
         )
         .init();
+
+    match cli::command_from_env()? {
+        cli::Command::Init => {
+            cli::initialize_current_directory()?;
+            return Ok(());
+        }
+        cli::Command::Doctor => {
+            cli::run_doctor().await?;
+            return Ok(());
+        }
+        cli::Command::Help => return Ok(()),
+        cli::Command::Run => {}
+    }
+
+    if cli::should_initialize_automatically() {
+        cli::initialize_current_directory()?;
+        anyhow::bail!(
+            "configuration was created; configure .env and config.toml, then run transcribe-bot again"
+        );
+    }
 
     let cfg = AppConfig::from_env()?;
 

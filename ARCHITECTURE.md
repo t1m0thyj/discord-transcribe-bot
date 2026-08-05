@@ -30,7 +30,7 @@ flowchart TD
 	Resample --> Vad["VAD, preroll, and hangover"]
 	Vad --> Segment{"Endpoint or rolling limit?"}
 	Segment -- "No" --> Buffer["Keep per-user PCM buffer"]
-	Buffer --> Discord
+	Buffer --> Ingest
 	Segment -- "Yes" --> Gate["RMS and voiced-tick dispatch gate"]
 	Gate -- "Rejected" --> Drop["Record no transcript line"]
 	Gate -- "Accepted" --> Queue["Global FIFO decode queue, capacity 8"]
@@ -97,9 +97,12 @@ Secrets and file selection are environment-driven:
 
 All other runtime settings live in `config.toml`: AI provider/model and timeout, ASR model directory and threads, denoiser, endpointing and rolling-buffer limits, journal retention, autojoin suffix, debug logging, and summary behavior. See [config.example.toml](config.example.toml) for defaults.
 
+Before normal startup, the CLI handles `init`, `doctor`, and help requests. `init` creates missing default templates without overwriting existing files; a normal launch with no default `config.toml` runs the same initialization and exits. `doctor` validates the resolved configuration and ASR model, and checks the Ollama service and selected model when Ollama is configured.
+
 ## Module Map
 
 - `src/main.rs`: process startup, Discord intents, and event routing.
+- `src/cli.rs`: startup command parsing, template initialization, and local preflight checks.
 - `src/config.rs`: `.env`, TOML, and runtime configuration resolution.
 - `src/ai/`: provider abstraction plus Gemini and Ollama clients.
 - `src/asr/audio.rs`: Songbird voice receive, SSRC handling, segmentation, and decode dispatch.

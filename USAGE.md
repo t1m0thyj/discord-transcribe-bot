@@ -2,6 +2,15 @@
 
 Complete [configuration](README.md#configuring) before inviting the bot to a server.
 
+## Setup Commands
+
+| Command | Purpose |
+| --- | --- |
+| `transcribe-bot init` | Create `.env` and `config.toml` from the bundled templates without overwriting existing files. Use `cargo run -- init` from a source checkout. |
+| `transcribe-bot doctor` | Validate configuration and the local ASR model; for Ollama, also check that the service is reachable and the configured model is installed. Use `cargo run -- doctor` from a source checkout. |
+
+When the default `config.toml` is missing, starting the bot performs the same initialization and then exits so the generated files can be configured. `init` is useful for preparing a release-binary directory explicitly.
+
 ## Discord setup
 
 Create the bot with these OAuth2 scopes:
@@ -22,6 +31,53 @@ Grant these recommended permissions:
 - Manage Channels, required for `/autojoin` channel suffix changes
 
 Enable the **Message Content Intent** in the Discord Developer Portal for thread Q&A message handling.
+
+## AI Provider Setup
+
+Choose one provider for `/ask` and optional call summaries. Speech transcription remains local for both options.
+
+### Gemini
+
+1. Create an API key in [Google AI Studio](https://aistudio.google.com/app/apikey).
+2. Add it to `.env`:
+
+	```text
+	GEMINI_API_KEY=your-api-key
+	```
+
+3. Set the provider in `config.toml`:
+
+	```toml
+	[ai]
+	provider = "gemini"
+	```
+
+	The optional `[ai.gemini].model` setting defaults to `gemini-flash-latest`.
+
+### Ollama
+
+1. [Install Ollama](https://ollama.com/download), then download a local model. For example, [Gemma 3 4B](https://ollama.com/library/gemma3):
+
+	```bash
+	ollama pull gemma3:4b
+	```
+
+2. Start the Ollama server in a separate terminal, unless the Ollama desktop app is already serving locally:
+
+	```bash
+	ollama serve
+	```
+
+3. Set the provider and model in `config.toml`:
+
+	```toml
+	[ai]
+	provider = "ollama"
+
+	[ai.ollama]
+	model = "gemma3:4b"
+	base_url = "http://127.0.0.1:11434"
+	```
 
 ## First Call
 

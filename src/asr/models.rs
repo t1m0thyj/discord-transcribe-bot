@@ -48,7 +48,7 @@ impl ForcedFamily {
     }
 }
 
-pub(super) fn resolve_model_dir(model_dir: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_model_dir(model_dir: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(model_dir);
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -88,6 +88,14 @@ pub(super) fn configure_model(
          Moonshine's split or merged files, and single-file model.onnx variants)",
         model_base.display()
     )
+}
+
+pub(crate) fn validate_model_layout(
+    model_base: &Path,
+    forced_family_hint: Option<&str>,
+) -> anyhow::Result<&'static str> {
+    let mut recognizer = OfflineRecognizerConfig::default();
+    configure_model(&mut recognizer, model_base, forced_family_hint)
 }
 
 fn find_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {

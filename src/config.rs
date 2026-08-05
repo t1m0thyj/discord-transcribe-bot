@@ -65,7 +65,7 @@ impl AppConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let file_cfg = load_file_config()?;
 
-        let discord_token = env::var("DISCORD_TOKEN")?;
+        let discord_token = required_nonempty_env("DISCORD_TOKEN")?;
         let ai_provider_name = file_cfg
             .ai
             .as_ref()
@@ -296,7 +296,7 @@ fn load_file_config() -> anyhow::Result<FileConfig> {
     Ok(cfg)
 }
 
-fn resolve_config_path() -> String {
+pub(crate) fn resolve_config_path() -> String {
     if let Some(path) = read_nonempty_env("APP_CONFIG_PATH") {
         return path;
     }
@@ -310,12 +310,17 @@ fn read_nonempty_env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn required_nonempty_env(name: &str) -> anyhow::Result<String> {
+    read_nonempty_env(name).ok_or_else(|| anyhow::anyhow!("missing {name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use super::{
         AsrSection, DiscordSection, TranscriptionSection, read_nonempty_env,
+        required_nonempty_env,
         resolve_asr_runtime_config, resolve_autojoin_suffix, resolve_config_path,
         resolve_transcription_runtime_config,
     };
@@ -353,6 +358,13 @@ mod tests {
 
         env::set_var("TRANSCRIBE_BOT_TEST_ENV", "    ");
         assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), None);
+        assert!(required_nonempty_env("TRANSCRIBE_BOT_TEST_ENV").is_err());
+
+        env::set_var("TRANSCRIBE_BOT_TEST_ENV", "  token  ");
+        assert_eq!(
+            required_nonempty_env("TRANSCRIBE_BOT_TEST_ENV").unwrap(),
+            "token"
+        );
 
         env::set_var("APP_CONFIG_PATH", "custom.toml");
         assert_eq!(resolve_config_path(), "custom.toml");
