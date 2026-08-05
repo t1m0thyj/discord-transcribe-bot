@@ -1,109 +1,117 @@
 # Architecture
 
-Practical architecture overview for the Discord live transcription bot, with enough detail to maintain and debug it.
+This document describes the implemented runtime, its durability boundaries, and the code that owns each stage. For installation and commands, see the [README](README.md) and [usage guide](USAGE.md).
 
-## At a glance
+## System Boundaries
 
 - One active call session per guild.
-- Speech is transcribed locally with a single ASR model.
-- Only finalized utterances are committed (no revision stream).
-- Commits are journaled incrementally to disk.
-- End-of-call export posts transcript and opens a Q&A thread.
+- Speech recognition runs locally through one configured sherpa-onnx model.
+- The transcript is utterance-final: no partial text or later revisions are emitted.
+- Finalized utterances are journaled incrementally to disk before export.
+- Gemini and Ollama are used only for optional Q&A and summaries, not speech recognition.
 
-## Stack
+## Detailed Runtime Flow
 
-- Rust + tokio runtime.
-- serenity + songbird for Discord events and voice receive.
-- sherpa-onnx for local ASR.
-- Optional nnnoiseless denoiser.
-- AI provider abstraction (Gemini or Ollama via reqwest) for transcript Q&A and summaries.
+```mermaid
+flowchart TD
+	Join["/join or autojoin"] --> Start["Create CallSession and JSONL journal"]
+	Start --> Attach["Join Songbird call and attach handlers"]
+	Attach --> Watchdogs["Start receive watchdogs"]
 
-## Runtime flow
+	Discord["Discord voice tick"] --> Ssrc{"SSRC mapped to user?"}
+	Ssrc -- "No" --> PreMap["Bounded pre-map PCM buffer"]
+	PreMap --> MapEvent["Speaking-state update maps SSRC"]
+	MapEvent --> Ingest
+	Ssrc -- "Yes" --> Ingest["Per-user ingest frontend"]
 
-1. /join creates the guild call session and attaches voice handlers.
-2. Voice events map SSRC to users and feed per-user stream state.
-3. Audio is cleaned, VAD-gated, segmented, and dispatched for ASR decode.
-4. Finalized utterances are committed in receive order.
-5. Each commit is appended to a per-session JSONL journal in transcripts/.
-6. /log and /ask read committed transcript state (non-destructive).
-7. /leave (or empty channel finalize) settles and flushes with bounded waits, writes a local transcript file, uploads to Discord, and creates a thread.
+	Ingest --> Downmix["Stereo downmix and high-pass filter"]
+	Downmix --> Denoise["Optional denoiser and bypass hysteresis"]
+	Denoise --> Resample["48 kHz to 16 kHz resample"]
+	Resample --> Vad["VAD, preroll, and hangover"]
+	Vad --> Segment{"Endpoint or rolling limit?"}
+	Segment -- "No" --> Buffer["Keep per-user PCM buffer"]
+	Buffer --> Discord
+	Segment -- "Yes" --> Gate["RMS and voiced-tick dispatch gate"]
+	Gate -- "Rejected" --> Drop["Record no transcript line"]
+	Gate -- "Accepted" --> Queue["Global FIFO decode queue, capacity 8"]
+	Queue -- "Full" --> Shed["Drop oldest queued chunk and count shed"]
+	Queue --> Worker["Single async decode worker"]
+	Worker --> Blocking["spawn_blocking ASR decode"]
+	Blocking --> Text{"Usable text?"}
+	Text -- "No or error" --> Metrics["Log and update health counters"]
+	Text -- "Yes" --> Commit["Send finalized Utterance to per-guild writer"]
+	Commit --> Memory["Append active CallSession transcript"]
+	Memory --> Journal["Append and flush JSONL journal"]
 
-## Audio and transcription path
+	Commands["/log and /ask"] --> Memory
+	Commands --> AI["Configured Gemini or Ollama provider"]
+	Leave["/leave or channel becomes empty"] --> Flush["Settle capture and flush per-user buffers"]
+	Flush --> Drain["Bounded decode and commit drain"]
+	Drain --> Load["Reload persisted JSONL journal"]
+	Load --> Export["Build Markdown transcript and upload to Discord"]
+	Export --> Thread["Create transcript thread and cache context"]
+	Thread --> AI
+```
+
+The queue is global across guilds, bounded to eight chunks, and intentionally sheds the oldest queued item when full. This caps memory and latency growth at the cost of missing audio under sustained overload.
+
+## Audio And Transcription
 
 - Per-user ingest frontend combines DSP/VAD state + rolling buffer.
 - Pipeline stages: downmix, high-pass, optional denoise, 48k->16k resample, VAD, endpointing.
 - Rolling ingest bounds long speech segments and dispatches chunks through a bounded decode queue.
 - Rollover chooses a split near the context boundary using a min-RMS search window to avoid cutting through louder speech.
-- Decode rejection and dispatch gating drop implausible/low-value chunks early.
+- Dispatch gating rejects chunks without enough voiced activity or above the implausible text-rate threshold.
 
-## Ordering and consistency
+## Transcript Durability And Ordering
 
 - Transcript commits are append-only and persisted incrementally to JSONL.
-- Finalized utterances are written in receive order.
-- Session shutdown uses bounded settle and drain waits to avoid hanging forever.
-- Export reads persisted transcript data so finalized lines survive transient Discord upload failures.
+- The writer maintains the active in-memory transcript, then flushes each JSONL record.
+- Export reloads the persisted JSONL journal rather than trusting only in-memory state.
+- Finalization settles capture, flushes buffered speech, and waits for decode and commits with bounded timeouts.
+- A timeout can produce a partial export; it is preferred over a permanently blocked shutdown.
 
-## Commands
+## State Ownership
 
-- /join: start transcription in your current voice channel.
-- /status: show receive/transcription health counters.
-- /log: print recent committed transcript lines.
-- /ask: ask Gemini about the committed transcript.
-- /autojoin: mark/unmark a channel by suffix for auto-start.
-- /leave: finalize and export transcript.
+- `CallSession`: active transcript, Discord channel IDs, timestamps, and JSONL path.
+- `GuildRuntime`: utterance sender, health counters, recovery coordination, and decode state.
+- `UserStreamState`: per-user DSP/VAD state and rolling PCM buffer.
+- `SsrcMap`: guild and SSRC to Discord-user mapping.
+- `ThreadContext`: cached exported transcript and bounded Q&A turn history.
 
-Autojoin is suffix-based: channels ending with the configured marker (default [Transcribe]) are auto-joined when a non-bot user enters.
+## Failure Handling And Observability
 
-Status reports include decode queue depth, in-flight jobs, pending commits, decode failure rate, realtime factor (RTF), average queue wait/decode times, shed rate, and unmapped SSRC activity.
+- Startup and steady-state watchdogs attempt to recover a voice receive path that joins successfully but produces no usable audio.
+- Unknown SSRC PCM is retained briefly and within a fixed bound until a speaking-state mapping arrives.
+- Resample failures, ASR errors, journal failures, queue shedding, and unmapped SSRC activity are logged and reflected in `/status` counters.
+- A poisoned decode-queue mutex is recovered rather than crashing the worker.
+- Journal write failures are logged; later queued records continue to be processed, but the failed utterance is not durable.
 
-## Core state
+## Configuration Model
 
-- CallSession: transcript, channel IDs, session timestamps.
-- GuildRuntime: per-guild sender, health counters, recovery lock.
-- UserStreamState: per-user ingest frontend state and rolling audio buffer.
-- ThreadContext: transcript snapshot and bounded Q&A turn history.
+Secrets and file selection are environment-driven:
 
-## Reliability behavior
+- `DISCORD_TOKEN` is required.
+- `GEMINI_API_KEY` is required only for the Gemini provider.
+- `APP_CONFIG_PATH` optionally selects a TOML file; it defaults to `config.toml`.
 
-- Startup watchdog recovers if join succeeds but usable audio does not.
-- Steady-state watchdog recovers stalled receive paths.
-- Finalization waits are timeout-bounded to avoid indefinite hangs.
-- Incremental JSONL journaling protects transcript data across crashes or failed uploads.
+All other runtime settings live in `config.toml`: AI provider/model and timeout, ASR model directory and threads, denoiser, endpointing and rolling-buffer limits, journal retention, autojoin suffix, debug logging, and summary behavior. See [config.example.toml](config.example.toml) for defaults.
 
-## Main modules
+## Module Map
 
-- src/main.rs: startup, intents, event routing.
-- src/config.rs: env/config parsing.
-- src/ai/mod.rs + src/ai/{gemini,ollama}.rs: provider abstraction and AI API calls.
-- src/asr/audio.rs: voice ingest, segmentation, and decode dispatch.
-- src/asr/frontend.rs: ingest DSP frontend (high-pass, denoise bypass, resample, VAD, preroll).
-- src/asr/pipeline.rs: ASR engine setup, dispatch gate, finalize-tail trim, stream state types.
-- src/asr/models.rs: model autodetect and recognizer model config wiring.
-- src/asr/decoder.rs: bounded decode queue and worker.
-- src/app/mod.rs: shared app state and command/message routing.
-- src/app/commands.rs: slash command handlers and session start.
-- src/app/autojoin.rs: autojoin detection and suffix/channel helpers.
-- src/app/summary.rs: transcript/export formatting and post-call summary handling.
-- src/app/journal.rs: transcript JSONL persistence and retention cleanup.
-- src/app/session/{mod,watchdog,finalize}.rs: start/finalize/recovery/watchdogs/export/thread context.
+- `src/main.rs`: process startup, Discord intents, and event routing.
+- `src/config.rs`: `.env`, TOML, and runtime configuration resolution.
+- `src/ai/`: provider abstraction plus Gemini and Ollama clients.
+- `src/asr/audio.rs`: Songbird voice receive, SSRC handling, segmentation, and decode dispatch.
+- `src/asr/frontend.rs`: downmix, high-pass, denoise bypass, resampling, VAD, and preroll.
+- `src/asr/pipeline.rs`: recognizer setup, dispatch gate, tail trim, and stream-state types.
+- `src/asr/models.rs`: model-layout detection and sherpa-onnx recognizer wiring.
+- `src/asr/decoder.rs`: global bounded decode queue and worker.
+- `src/app/`: command handling, sessions, watchdogs, journal, autojoin, export, and thread context.
 
-## Important config knobs
+## Intentional Limits
 
-- DISCORD_TOKEN
-- GEMINI_API_KEY
-- GEMINI_MODEL
-- ASR_MODEL_DIR
-- ASR_MODEL_FAMILY (optional)
-- LIVE_TRANSCRIPT_DEBUG
-- ENABLE_DENOISER
-- ENDPOINT_SILENCE_MS
-- ROLLING_INGEST_MAX_MS
-- ROLLING_INGEST_CONTEXT_MS
-- AUTOJOIN_SUFFIX (optional; default [Transcribe])
-
-## Current limits
-
-- Q&A context is bounded (no full long-term conversation memory).
-- Thread turn history is in-memory and intentionally limited.
-- Runtime state is not persisted across restarts (transcript journal is persisted).
-- Single-pass finalized transcription favors stability over immediate partial text updates.
+- No partial or revised captions are shown during speech.
+- The decode dispatcher has one worker and a global bounded queue; overload sheds chunks rather than growing without bound.
+- Thread Q&A history is in memory and intentionally bounded.
+- Active runtime state is not restored after a process restart; persisted transcripts remain available for export and thread-context reload.

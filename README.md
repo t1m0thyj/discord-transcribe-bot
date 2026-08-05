@@ -1,112 +1,55 @@
 # transcribe-bot
 
-Discord voice transcription + live Q&A bot in Rust.
+Transcribe Discord voice channels locally and answer questions about the finished call.
 
-## Quick start
+## What It Does
 
-1. Copy `.env.example` to `.env` and fill values.
-   - Keep secrets here: `DISCORD_TOKEN`, `GEMINI_API_KEY` (only needed if using Gemini).
-   - Optional: `APP_CONFIG_PATH` can point to a custom TOML path (default: `config.toml`).
-2. Copy `config.example.toml` to `config.toml` and edit settings.
-   - Set `[ai].provider = "ollama" | "gemini"` for AI summaries.
-   - Ollama: run `ollama serve`, set `[ai.ollama].model`, optionally change `[ai.ollama].base_url`.
-   - Gemini: set `[ai].provider = "gemini"`; `[ai.gemini].model` is optional (default: `gemini-flash-latest`).
-3. Ensure the ASR model directory in `[asr].model_dir` exists.
-   - Recommended: run `python scripts/download_model.py <repo_id>` to fetch a model from Hugging Face into `models/`.
-   - Example local paths: `models/sherpa-onnx-moonshine-base-en-int8`, `models/sherpa-onnx-whisper-base.en`
-4. Run:
+The bot receives Discord voice audio, transcribes finalized speech locally, and posts a Markdown transcript when the call ends. Its transcript thread supports optional Q&A and summaries through Gemini or Ollama.
 
-```bash
-cargo run
-```
+## Configuring
 
-## Debug logging
+1. Create a Discord application and bot. The required scopes, permissions, and Developer Portal settings are in the [usage guide](USAGE.md#discord-setup).
+2. Create `.env` from `.env.example`, then set `DISCORD_TOKEN`. Add `GEMINI_API_KEY` only when `[ai].provider = "gemini"`.
+3. Create `config.toml` from `config.example.toml`. Set the AI provider and `[asr].model_dir`.
+4. Install the Hugging Face CLI and download the default ASR model:
 
-To print live transcription lines to the console:
+   ```bash
+   pip install --upgrade "huggingface_hub[cli]"
+   hf download sherpa-onnx/sherpa-onnx-moonshine-base-en-int8 --local-dir models/sherpa-onnx-moonshine-base-en-int8
+   ```
 
-1. Set `[debug].log_live_transcript = true` in `config.toml`.
-2. Run with debug logs enabled, for example:
+   **Note:** For gated models, authenticate first with `hf auth login`.
+
+## Building From Source
+
+Install a current Rust toolchain, then build and run:
 
 ```bash
-RUST_LOG=debug cargo run
+cargo build --release
+cargo run --release
 ```
 
-You will see `live transcription` log lines in the terminal as utterances are transcribed.
+On Windows, use the Visual Studio Build Tools C++ workload. The workspace includes VS Code build and test tasks for that environment.
 
-## Transcript format
+## Installing A Prebuilt Binary
 
-Transcript exports are chronological and Zoom-like:
+Download the binary matching your platform from a published release or the corresponding GitHub Actions build artifact. Put it beside `.env` and `config.toml`, keep the configured model directory available, then run the binary from that directory.
 
-```text
----
-title: "Transcript 2026-07-25 20:15:04 UTC"
-type: meeting
-date: 2026-07-25T20:15:04Z
-duration: "48m 12s"
-source: discord
-status: complete
-attendees:
-   - Alice
-   - Bob
----
+## How It Works
 
-## Transcript
+Use `/join` in a voice channel to start a call. The bot segments and transcribes each participant locally, persists finalized lines during the call, then uploads a Markdown transcript at the end. It creates a thread from that transcript, where participants can ask questions about the call.
 
-[Alice 0:03] Are we ready to deploy?
-[Bob 0:08] I will run the final tests tonight.
-```
+The optional `/autojoin` command marks a voice channel to begin transcription when someone joins it. One call session runs per guild at a time.
 
-Each utterance is prefixed with speaker name and elapsed call time.
+## Technology
 
-## After the call ends
+- Rust, Tokio, Serenity, and Songbird for the Discord bot and voice receive path.
+- sherpa-onnx for local speech recognition.
+- Gemini or Ollama for optional transcript Q&A and summaries.
+- Append-only JSONL journals and Markdown exports for durable call transcripts.
 
-- The bot posts the full transcript as a Markdown (`.md`) file attachment.
-- The bot creates a thread from that transcript message.
-- Questions posted in that thread are answered using the transcript context.
-- If the bot restarts and thread context is not in memory, it lazily reloads the transcript from the starter message attachment on the first follow-up message.
-- Optional auto-summary is configured under `[summary]` in `config.toml` (off by default).
-- `enabled = true`
-- `post_in_thread = true` (default)
-- `include_in_markdown = false` (default)
+## Further Reading
 
-## Commands
-
-- `/join` - bot joins your current voice channel in that guild.
-- `/status` - shows current receive/transcription health and queue state.
-- `/log` - prints recent committed transcript lines.
-- `/ask` - asks the configured AI provider about the current committed transcript.
-- `/autojoin` - marks/unmarks your current voice channel (or an explicitly mentioned voice channel) by suffix so the bot auto-starts there later (default marker: `[Transcribe]`).
-- `/leave` - bot leaves and finalizes call transcript export.
-
-## Runtime behavior
-
-- The bot supports one active transcription session per guild at a time.
-- After `/join`, the bot posts a short "Listening and waiting for speech..." message.
-- `/autojoin` renames the voice channel with a configurable suffix (default: ` [Transcribe]`); when a non-bot user joins that marked channel, the bot auto-starts transcription.
-- For autojoin sessions, status/transcript messages go to the first text channel in the same category as the voice channel.
-- Set `[discord].autojoin_suffix` in `config.toml` to customize the marker text (for example: `[Transcribe]` or `🎙️`).
-- Once first usable speech is decoded, it posts "Started transcribing in <#voice-channel>." (once per call).
-- If receive starts unhealthy (no decoded audio after join), the bot attempts automatic voice receive recovery and posts concise retry status.
-
-## Discord OAuth2 setup
-
-Required OAuth2 scopes:
-
-- `bot`
-- `applications.commands`
-
-Recommended bot permissions:
-
-- View Channels
-- Send Messages
-- Send Messages in Threads
-- Read Message History
-- Attach Files
-- Create Public Threads
-- Connect
-- Speak
-- Manage Channels (required for `/autojoin` channel suffix rename)
-
-Developer Portal setting:
-
-- Enable Message Content Intent (required for thread Q&A message handling)
+- [Usage guide](USAGE.md): Discord OAuth setup, permissions, commands, autojoin, recovery, and call lifecycle.
+- [Developer guide](DEVELOPERS.md): debug logging and transcript format.
+- [Architecture](ARCHITECTURE.md): audio pipeline, persistence, runtime state, and source map.
