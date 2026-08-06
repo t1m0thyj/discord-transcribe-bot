@@ -43,7 +43,7 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<
 }
 
 pub(crate) fn initialize_current_directory() -> anyhow::Result<()> {
-    let config_path = PathBuf::from(config::resolve_config_path());
+    let config_path = config::resolve_config_path();
     let env_path = PathBuf::from(".env");
     let config_created = write_template_if_missing(&config_path, CONFIG_TEMPLATE)?;
     let env_created = write_template_if_missing(&env_path, ENV_TEMPLATE)?;
@@ -198,7 +198,7 @@ fn model_destination(repository: &str) -> PathBuf {
 
 pub(crate) async fn run_doctor() -> anyhow::Result<()> {
     let mut failures = Vec::new();
-    let config_path = PathBuf::from(config::resolve_config_path());
+    let config_path = config::resolve_config_path();
     check(
         config_path.is_file(),
         format!("configuration: {}", config_path.display()),

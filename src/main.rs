@@ -142,6 +142,6 @@ async fn run() -> anyhow::Result<()> {
 }
 
 fn should_initialize_automatically() -> bool {
-    let config_path = Path::new(&config::resolve_config_path());
+    let config_path = &config::resolve_config_path();
     config_path == Path::new("config.toml") && !config_path.exists()
 }

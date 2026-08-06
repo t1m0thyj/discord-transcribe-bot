@@ -284,23 +284,22 @@ fn resolve_autojoin_suffix(section: Option<&DiscordSection>) -> String {
 
 fn load_file_config() -> anyhow::Result<FileConfig> {
     let config_path = resolve_config_path();
-    let path = PathBuf::from(config_path);
-    if !path.is_file() {
+    if !config_path.is_file() {
         return Ok(FileConfig::default());
     }
 
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {}", config_path.display(), e))?;
     let cfg = toml::from_str::<FileConfig>(&raw)
-        .map_err(|e| anyhow::anyhow!("invalid TOML in {}: {}", path.display(), e))?;
+        .map_err(|e| anyhow::anyhow!("invalid TOML in {}: {}", config_path.display(), e))?;
     Ok(cfg)
 }
 
-pub(crate) fn resolve_config_path() -> String {
+pub(crate) fn resolve_config_path() -> PathBuf {
     if let Some(path) = read_nonempty_env("APP_CONFIG_PATH") {
-        return path;
+        return PathBuf::from(path);
     }
-    "config.toml".to_string()
+    PathBuf::from("config.toml")
 }
 
 fn read_nonempty_env(name: &str) -> Option<String> {
@@ -367,10 +366,10 @@ mod tests {
         );
 
         env::set_var("APP_CONFIG_PATH", "custom.toml");
-        assert_eq!(resolve_config_path(), "custom.toml");
+        assert_eq!(resolve_config_path().to_str(), Some("custom.toml"));
 
         env::remove_var("APP_CONFIG_PATH");
-        assert_eq!(resolve_config_path(), "config.toml");
+        assert_eq!(resolve_config_path().to_str(), Some("config.toml"));
     }
 
     #[test]
