@@ -1,9 +1,10 @@
-mod app;
 mod ai;
+mod app;
 mod asr;
 mod cli;
 mod config;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -45,8 +46,14 @@ impl EventHandler for Handler {
         new: serenity::all::VoiceState,
     ) {
         if let Some(guild_id) = new.guild_id {
-            app::maybe_autojoin_on_voice_state(&ctx, &self.state, guild_id, old.clone(), new.clone())
-                .await;
+            app::maybe_autojoin_on_voice_state(
+                &ctx,
+                &self.state,
+                guild_id,
+                old.clone(),
+                new.clone(),
+            )
+            .await;
 
             if let Err(e) =
                 app::maybe_finalize_on_empty_voice_channel(&ctx, &self.state, guild_id, old, new)
@@ -96,11 +103,15 @@ async fn run() -> anyhow::Result<()> {
             cli::run_doctor().await?;
             return Ok(());
         }
+        cli::Command::Download { repo_id } => {
+            cli::download_model(&repo_id)?;
+            return Ok(());
+        }
         cli::Command::Help => return Ok(()),
         cli::Command::Run => {}
     }
 
-    if cli::should_initialize_automatically() {
+    if should_initialize_automatically() {
         cli::initialize_current_directory()?;
         anyhow::bail!(
             "configuration was created; configure .env and config.toml, then run transcribe-bot again"
@@ -117,12 +128,9 @@ async fn run() -> anyhow::Result<()> {
         | GatewayIntents::GUILD_VOICE_STATES;
 
     let songbird = songbird::Songbird::serenity();
-    songbird.set_config(
-        songbird::Config::default()
-            .decode_mode(songbird::driver::DecodeMode::Decode(
-                songbird::driver::DecodeConfig::default(),
-            )),
-    );
+    songbird.set_config(songbird::Config::default().decode_mode(
+        songbird::driver::DecodeMode::Decode(songbird::driver::DecodeConfig::default()),
+    ));
 
     let mut client = serenity::Client::builder(&cfg.discord_token, intents)
         .event_handler(Handler { state })
@@ -131,4 +139,9 @@ async fn run() -> anyhow::Result<()> {
 
     client.start().await?;
     Ok(())
+}
+
+fn should_initialize_automatically() -> bool {
+    let config_path = Path::new(&config::resolve_config_path());
+    config_path == Path::new("config.toml") && !config_path.exists()
 }

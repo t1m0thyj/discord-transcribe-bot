@@ -8,8 +8,21 @@ Complete [configuration](README.md#configuring) before inviting the bot to a ser
 | --- | --- |
 | `transcribe-bot init` | Create `.env` and `config.toml` from the bundled templates without overwriting existing files. Use `cargo run -- init` from a source checkout. |
 | `transcribe-bot doctor` | Validate configuration and the local ASR model; for Ollama, also check that the service is reachable and the configured model is installed. Use `cargo run -- doctor` from a source checkout. |
+| `transcribe-bot download owner/repo` | Find the `hf` CLI, display the model's Hub information, ask before downloading it into `models/repo`, and verify the detected ASR layout. If `hf` is missing, it prints the `pip` installation command. Use `cargo run -- download owner/repo` from a source checkout. |
 
 When the default `config.toml` is missing, starting the bot performs the same initialization and then exits so the generated files can be configured. `init` is useful for preparing a release-binary directory explicitly.
+
+## Suggested Models
+
+Run `transcribe-bot download owner/repo` for a model below. It displays Hub information, asks before downloading, and verifies the downloaded layout. When `hf` is missing, it prints the `pip` installation command. Set `[asr].model_dir` to the downloaded `models/repo` directory, then run `transcribe-bot doctor`.
+
+| Model | Rank | Approx. download | Notes |
+| --- | --- | ---: | --- |
+| [Moonshine Base EN INT8](https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-base-en-int8) | Light | 274 MiB | Use when system resources are limited. |
+| [Whisper Base EN](https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base.en) | Medium | 432 MiB | English-only Whisper baseline. |
+| [Nemo Parakeet TDT 0.6B v2 INT8](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8) | Medium | 631 MiB | Recommended starting point for most systems. |
+| [Qwen3 ASR 0.6B INT8](https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25) | Heavy | 954 MiB | Higher-capacity ASR model. |
+| [Whisper Distil Medium EN](https://huggingface.co/csukuangfj/sherpa-onnx-whisper-distil-medium.en) | Heavy | 2.0 GiB | Largest bundled option. |
 
 ## Discord setup
 
