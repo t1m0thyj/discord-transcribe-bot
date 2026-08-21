@@ -1,8 +1,8 @@
-# Build Linux releases against the CentOS-compatible Cross toolchains instead of
-# the runner's system libc.  These images target the glibc 2.17 ABI, so the
-# resulting binaries run on systems with glibc 2.36 (and other newer versions).
+# Build Linux releases against pinned Cross toolchains targeting the glibc 2.31
+# ABI instead of the runner's system libc. The binaries run on glibc 2.36 (and
+# other newer versions).
 [target.x86_64-unknown-linux-gnu]
-image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main-centos"
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
 
 [target.aarch64-unknown-linux-gnu]
-image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main-centos"
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
