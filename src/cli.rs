@@ -111,6 +111,8 @@ pub(crate) fn download_model(repo_id: &str) -> anyhow::Result<()> {
     )
     .context("downloading Hugging Face model")?;
     check_downloaded_model(&destination)?;
+    println!("\nAdd this to the [asr] section of config.toml:");
+    println!("model_dir = \"models/{repository}\"");
 
     Ok(())
 }
