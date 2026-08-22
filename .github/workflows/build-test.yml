@@ -32,6 +32,9 @@ jobs:
             container: rust:bookworm
     steps:
       - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y --no-install-recommends cmake pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
