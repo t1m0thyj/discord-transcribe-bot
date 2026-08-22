@@ -36,4 +36,3 @@ autojoin_suffix = "[Transcribe]"
 enabled = false
 post_in_thread = true
 include_in_markdown = false
-timeout_secs = 30

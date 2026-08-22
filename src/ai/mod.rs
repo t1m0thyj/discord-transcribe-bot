@@ -56,10 +56,16 @@ pub struct AiClient {
 impl AiClient {
     pub fn new(provider: AiProviderConfig, request_timeout: u64) -> anyhow::Result<Self> {
         let timeout = Duration::from_secs(request_timeout.max(1));
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .context("failed to create AI HTTP client")?;
+        let builder = reqwest::Client::builder().connect_timeout(timeout);
+        let http = match &provider {
+            // Ollama streams generated tokens. A per-read timeout permits a slow
+            // generation to continue while it is producing output, but still
+            // interrupts a stalled connection.
+            AiProviderConfig::Ollama { .. } => builder.read_timeout(timeout),
+            AiProviderConfig::Gemini { .. } => builder.timeout(timeout),
+        }
+        .build()
+        .context("failed to create AI HTTP client")?;
 
         Ok(Self { provider, http })
     }

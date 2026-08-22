@@ -92,6 +92,8 @@ Choose one provider for `/ask` and optional call summaries. Speech transcription
 	base_url = "http://127.0.0.1:11434"
 	```
 
+`[ai].request_timeout` is an idle timeout for Ollama's streamed responses.
+
 ## First Call
 
 1. Join the target Discord voice channel.

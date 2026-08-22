@@ -58,7 +58,6 @@ pub struct SummaryRuntimeConfig {
     pub enabled: bool,
     pub post_in_thread: bool,
     pub include_in_markdown: bool,
-    pub timeout_secs: u64,
 }
 
 impl AppConfig {
@@ -133,13 +132,6 @@ impl AppConfig {
             .and_then(|s| s.include_in_markdown)
             .unwrap_or(false);
 
-        let post_call_summary_timeout_secs = file_cfg
-            .summary
-            .as_ref()
-            .and_then(|s| s.timeout_secs)
-            .filter(|v| *v >= 5)
-            .unwrap_or(25);
-
         Ok(Self {
             discord_token,
             ai: AiRuntimeConfig {
@@ -157,7 +149,6 @@ impl AppConfig {
                 enabled: post_call_summary_enabled,
                 post_in_thread: post_call_summary_post_in_thread,
                 include_in_markdown: post_call_summary_include_in_markdown,
-                timeout_secs: post_call_summary_timeout_secs,
             },
         })
     }
@@ -228,7 +219,6 @@ struct SummarySection {
     enabled: Option<bool>,
     post_in_thread: Option<bool>,
     include_in_markdown: Option<bool>,
-    timeout_secs: Option<u64>,
 }
 
 fn resolve_asr_runtime_config(

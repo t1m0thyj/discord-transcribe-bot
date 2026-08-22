@@ -41,20 +41,71 @@ pub async fn generate_chat(
         })
         .collect();
 
-    let http_resp = http
+    let mut http_resp = http
         .post(&url)
         .json(&json!({
             "model": model,
-            "stream": false,
+            "stream": true,
             "messages": messages
         }))
         .send()
         .await?;
 
     let status = http_resp.status();
-    let resp: serde_json::Value = http_resp.json().await?;
+    if !status.is_success() {
+        let resp: serde_json::Value = http_resp.json().await?;
+        return parse_ollama_response(status, &resp);
+    }
 
-    parse_ollama_response(status, &resp)
+    let mut response = String::new();
+    let mut pending = Vec::new();
+    let mut saw_done = false;
+
+    while let Some(chunk) = http_resp.chunk().await? {
+        pending.extend_from_slice(&chunk);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=newline).collect();
+            saw_done |= append_ollama_stream_line(&line, &mut response)?;
+        }
+    }
+
+    if !pending.is_empty() {
+        saw_done |= append_ollama_stream_line(&pending, &mut response)?;
+    }
+
+    if !saw_done {
+        return Err(anyhow::anyhow!(
+            "Ollama stream ended before its final response"
+        ));
+    }
+
+    let response = response.trim().to_string();
+    if response.is_empty() {
+        Err(anyhow::anyhow!("Ollama returned no text"))
+    } else {
+        Ok(response)
+    }
+}
+
+fn append_ollama_stream_line(line: &[u8], response: &mut String) -> anyhow::Result<bool> {
+    let line = std::str::from_utf8(line)
+        .context("Ollama returned a non-UTF-8 streaming response")?
+        .trim();
+    if line.is_empty() {
+        return Ok(false);
+    }
+
+    let event: serde_json::Value =
+        serde_json::from_str(line).context("invalid Ollama stream event")?;
+    if let Some(error) = event["error"].as_str() {
+        return Err(anyhow::anyhow!("Ollama stream failed: {error}"));
+    }
+
+    if let Some(content) = event["message"]["content"].as_str() {
+        response.push_str(content);
+    }
+
+    Ok(event["done"].as_bool().unwrap_or(false))
 }
 
 fn parse_ollama_response(
@@ -97,7 +148,9 @@ fn resolve_ollama_base_url(base_url: Option<String>) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{parse_ollama_response, provider_config, resolve_ollama_base_url};
+    use super::{
+        append_ollama_stream_line, parse_ollama_response, provider_config, resolve_ollama_base_url,
+    };
     use crate::ai::AiProviderConfig;
 
     #[test]
@@ -159,5 +212,29 @@ mod tests {
         let err = parse_ollama_response(reqwest::StatusCode::OK, &json!({ "message": {} }))
             .expect_err("missing content should fail");
         assert!(err.to_string().contains("returned no text"));
+    }
+
+    #[test]
+    fn stream_parser_collects_content_and_detects_completion() {
+        let mut response = String::new();
+        assert!(!append_ollama_stream_line(
+            br#"{"message":{"content":"hello "},"done":false}"#,
+            &mut response,
+        )
+        .unwrap());
+        assert!(append_ollama_stream_line(
+            br#"{"message":{"content":"world"},"done":true}"#,
+            &mut response,
+        )
+        .unwrap());
+        assert_eq!(response, "hello world");
+    }
+
+    #[test]
+    fn stream_parser_surfaces_errors() {
+        let err =
+            append_ollama_stream_line(br#"{"error":"model unavailable"}"#, &mut String::new())
+                .expect_err("stream errors should fail");
+        assert!(err.to_string().contains("model unavailable"));
     }
 }

@@ -119,10 +119,8 @@ pub(super) async fn maybe_generate_post_call_summary(
     }
 
     let transcript_context = format_transcript(ctx, transcript, started_at).await;
-    let timeout = Duration::from_secs(state.post_call_summary_timeout_secs.max(5));
-
-    match tokio::time::timeout(timeout, state.ai.summarize_transcript(&transcript_context)).await {
-        Ok(Ok(summary)) => {
+    match state.ai.summarize_transcript(&transcript_context).await {
+        Ok(summary) => {
             let summary = summary.trim().to_string();
             if summary.is_empty() {
                 tracing::warn!("auto-summary returned empty text");
@@ -131,12 +129,8 @@ pub(super) async fn maybe_generate_post_call_summary(
                 Some(summary)
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::warn!("auto-summary failed: {e:#}");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(timeout_secs = state.post_call_summary_timeout_secs, "auto-summary timed out");
             None
         }
     }
