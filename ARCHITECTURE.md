@@ -8,7 +8,7 @@ This document describes the implemented runtime, its durability boundaries, and 
 - Speech recognition runs locally through one configured sherpa-onnx model.
 - The transcript is utterance-final: no partial text or later revisions are emitted.
 - Finalized utterances are journaled incrementally to disk before export.
-- Gemini and Ollama are used only for optional Q&A and summaries, not speech recognition.
+- Gemini, OpenRouter, and Ollama are used only for optional Q&A and summaries, not speech recognition.
 
 ## Detailed Runtime Flow
 
@@ -44,7 +44,7 @@ flowchart TD
 	Memory --> Journal["Append and flush JSONL journal"]
 
 	Commands["/log and /ask"] --> Memory
-	Commands --> AI["Configured Gemini or Ollama provider"]
+	Commands --> AI["Configured Gemini, OpenRouter, or Ollama provider"]
 	Leave["/leave or channel becomes empty"] --> Flush["Settle capture and flush per-user buffers"]
 	Flush --> Drain["Bounded decode and commit drain"]
 	Drain --> Load["Reload persisted JSONL journal"]
@@ -93,6 +93,7 @@ Secrets and file selection are environment-driven:
 
 - `DISCORD_TOKEN` is required.
 - `GEMINI_API_KEY` is required only for the Gemini provider.
+- `OPENROUTER_API_KEY` is required only for the OpenRouter provider.
 - `APP_CONFIG_PATH` optionally selects a TOML file; it defaults to `config.toml`.
 
 All other runtime settings live in `config.toml`: AI provider/model and timeout, ASR model directory and threads, denoiser, endpointing and rolling-buffer limits, journal retention, autojoin suffix, debug logging, and summary behavior. See [config.example.toml](config.example.toml) for defaults.
@@ -104,7 +105,7 @@ Before normal startup, the CLI handles `init`, `doctor`, and help requests. `ini
 - `src/main.rs`: process startup, Discord intents, and event routing.
 - `src/cli.rs`: startup command parsing, template initialization, and local preflight checks.
 - `src/config.rs`: `.env`, TOML, and runtime configuration resolution.
-- `src/ai/`: provider abstraction plus Gemini and Ollama clients.
+- `src/ai/`: provider abstraction plus Gemini, OpenRouter, and Ollama clients.
 - `src/asr/audio.rs`: Songbird voice receive, SSRC handling, segmentation, and decode dispatch.
 - `src/asr/frontend.rs`: downmix, high-pass, denoise bypass, resampling, VAD, and preroll.
 - `src/asr/pipeline.rs`: recognizer setup, dispatch gate, tail trim, and stream-state types.

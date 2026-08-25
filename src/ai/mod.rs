@@ -1,5 +1,6 @@
 mod gemini;
 mod ollama;
+mod openrouter;
 
 use std::time::Duration;
 
@@ -19,6 +20,10 @@ pub enum AiProviderConfig {
         base_url: String,
         model: String,
     },
+    OpenRouter {
+        api_key: String,
+        model: String,
+    },
 }
 
 impl AiProviderConfig {
@@ -28,12 +33,15 @@ impl AiProviderConfig {
         gemini_model: Option<String>,
         ollama_model: Option<String>,
         ollama_base_url: Option<String>,
+        openrouter_api_key: Option<String>,
+        openrouter_model: Option<String>,
     ) -> anyhow::Result<Self> {
         match provider.trim().to_ascii_lowercase().as_str() {
             "gemini" => gemini::provider_config(gemini_api_key, gemini_model),
             "ollama" => ollama::provider_config(ollama_model, ollama_base_url),
+            "openrouter" => openrouter::provider_config(openrouter_api_key, openrouter_model),
             other => Err(anyhow::anyhow!(
-                "unsupported AI_PROVIDER='{}'. Expected one of: gemini, ollama",
+                "unsupported AI_PROVIDER='{}'. Expected one of: gemini, ollama, openrouter",
                 other
             )),
         }
@@ -43,6 +51,7 @@ impl AiProviderConfig {
         match self {
             Self::Gemini { .. } => "gemini",
             Self::Ollama { .. } => "ollama",
+            Self::OpenRouter { .. } => "openrouter",
         }
     }
 }
@@ -62,7 +71,9 @@ impl AiClient {
             // generation to continue while it is producing output, but still
             // interrupts a stalled connection.
             AiProviderConfig::Ollama { .. } => builder.read_timeout(timeout),
-            AiProviderConfig::Gemini { .. } => builder.timeout(timeout),
+            AiProviderConfig::Gemini { .. } | AiProviderConfig::OpenRouter { .. } => {
+                builder.timeout(timeout)
+            }
         }
         .build()
         .context("failed to create AI HTTP client")?;
@@ -89,6 +100,9 @@ impl AiClient {
             AiProviderConfig::Ollama { base_url, model } => {
                 ollama::generate_chat(&self.http, base_url, model, &turns).await
             }
+            AiProviderConfig::OpenRouter { api_key, model } => {
+                openrouter::generate_chat(&self.http, api_key, model, &turns).await
+            }
         }
     }
 
@@ -111,6 +125,9 @@ Do not speculate and keep total length under about 250 words.\n\n\
             }
             AiProviderConfig::Ollama { base_url, model } => {
                 ollama::generate_chat(&self.http, base_url, model, &turns).await
+            }
+            AiProviderConfig::OpenRouter { api_key, model } => {
+                openrouter::generate_chat(&self.http, api_key, model, &turns).await
             }
         }
     }
@@ -224,6 +241,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("gemini config should parse");
         assert_eq!(cfg.provider_label(), "gemini");
@@ -233,6 +252,8 @@ mod tests {
     fn provider_selection_rejects_unknown_provider() {
         let err = AiProviderConfig::from_selection(
             "not-a-provider",
+            None,
+            None,
             None,
             None,
             None,

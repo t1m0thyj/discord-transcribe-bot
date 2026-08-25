@@ -10,6 +10,10 @@ base_url = "http://127.0.0.1:11434"
 # Optional; defaults to gemini-flash-latest.
 model = "gemini-flash-latest"
 
+[ai.openrouter]
+# Optional; defaults to openrouter/free.
+model = "openrouter/free"
+
 [asr]
 model_dir = "models/sherpa-onnx-moonshine-base-en-int8"
 # Only needed for single-file model.onnx families that cannot be inferred.

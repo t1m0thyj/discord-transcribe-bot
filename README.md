@@ -7,7 +7,7 @@ Transcribe Discord voice channels locally and use AI to summarize the conversati
 1. Run `transcribe-bot init` in the directory where the bot will run, or `cargo run -- init` from a source checkout. It creates `.env` and `config.toml` without overwriting existing files.
 2. Create a Discord application and bot. The required scopes, permissions, and Developer Portal settings are in the [usage guide](USAGE.md#discord-setup).
 3. Choose an [AI provider](USAGE.md#ai-provider-setup) and a [suggested ASR model](USAGE.md#suggested-models). Start with Parakeet unless the system is low-resource, in which case choose Moonshine.
-4. Set `DISCORD_TOKEN` in `.env`, add `GEMINI_API_KEY` when using Gemini, and configure the chosen provider in `config.toml`.
+4. Set `DISCORD_TOKEN` in `.env`, add the selected hosted provider's API key when using Gemini or OpenRouter, and configure the chosen provider in `config.toml`.
 5. Download the selected ASR model. For the recommended starting model:
 
    ```bash
@@ -45,7 +45,7 @@ The optional `/autojoin` command marks a voice channel to begin transcription wh
 
 - Rust, Tokio, Serenity, and Songbird for the Discord bot and voice receive path.
 - sherpa-onnx for local speech recognition.
-- Gemini or Ollama for optional transcript Q&A and summaries.
+- Gemini, OpenRouter, or Ollama for optional transcript Q&A and summaries.
 - Append-only JSONL journals and Markdown exports for durable call transcripts.
 
 ## Further Reading

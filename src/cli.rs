@@ -264,6 +264,9 @@ async fn check_ai_provider(cfg: &AppConfig, failures: &mut Vec<String>) {
         AiProviderConfig::Gemini { model, .. } => {
             println!("ok: Gemini configured with model {model}");
         }
+        AiProviderConfig::OpenRouter { model, .. } => {
+            println!("ok: OpenRouter configured with model {model}");
+        }
         AiProviderConfig::Ollama { base_url, model } => {
             let endpoint = format!("{}/api/tags", base_url.trim_end_matches('/'));
             let client = match reqwest::Client::builder()

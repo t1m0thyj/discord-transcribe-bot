@@ -47,7 +47,7 @@ Enable the **Message Content Intent** in the Discord Developer Portal for thread
 
 ## AI Provider Setup
 
-Choose one provider for `/ask` and optional call summaries. Speech transcription remains local for both options.
+Choose one provider for `/ask` and optional call summaries. Speech transcription remains local for all options.
 
 ### Gemini
 
@@ -66,6 +66,27 @@ Choose one provider for `/ask` and optional call summaries. Speech transcription
 	```
 
 	The optional `[ai.gemini].model` setting defaults to `gemini-flash-latest`.
+
+### OpenRouter
+
+1. Create an API key in [OpenRouter](https://openrouter.ai/keys).
+2. Add it to `.env`:
+
+	```text
+	OPENROUTER_API_KEY=your-api-key
+	```
+
+3. Set the provider in `config.toml`:
+
+	```toml
+	[ai]
+	provider = "openrouter"
+
+	[ai.openrouter]
+	model = "openrouter/free"
+	```
+
+	The model setting is optional and defaults to `openrouter/free`, which chooses an available free model. For more predictable latency and responses, pin a model instead; for example, `deepseek/deepseek-v4-flash:free` is a good fast option.
 
 ### Ollama
 
@@ -131,7 +152,7 @@ For autojoin sessions, status and transcript messages go to the first text chann
 
 The bot stores a JSONL journal locally in `transcripts/` while the call is active and uploads the final Markdown transcript to Discord. Local journal retention is controlled by `[transcription].retention_days`.
 
-Speech recognition remains local. `/ask` and optional summaries send transcript context to the configured AI provider: Gemini is a hosted service; Ollama normally runs locally at the configured URL.
+Speech recognition remains local. `/ask` and optional summaries send transcript context to the configured AI provider: Gemini and OpenRouter are hosted services; Ollama normally runs locally at the configured URL.
 
 ## Health And Recovery
 

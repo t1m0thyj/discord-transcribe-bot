@@ -82,12 +82,18 @@ impl AppConfig {
             .ai
             .as_ref()
             .and_then(|ai| ai.ollama.as_ref().and_then(|o| o.base_url.clone()));
+        let openrouter_model = file_cfg
+            .ai
+            .as_ref()
+            .and_then(|ai| ai.openrouter.as_ref().and_then(|o| o.model.clone()));
         let ai_provider = AiProviderConfig::from_selection(
             &ai_provider_name,
             read_nonempty_env("GEMINI_API_KEY"),
             gemini_model,
             ollama_model,
             ollama_base_url,
+            read_nonempty_env("OPENROUTER_API_KEY"),
+            openrouter_model,
         )?;
         let ai_request_timeout = file_cfg
             .ai
@@ -171,6 +177,7 @@ struct AiSection {
     request_timeout: Option<u64>,
     ollama: Option<OllamaSection>,
     gemini: Option<GeminiSection>,
+    openrouter: Option<OpenRouterSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +188,11 @@ struct OllamaSection {
 
 #[derive(Debug, Default, Deserialize)]
 struct GeminiSection {
+    model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenRouterSection {
     model: Option<String>,
 }
 
