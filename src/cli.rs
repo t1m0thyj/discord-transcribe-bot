@@ -276,11 +276,14 @@ async fn check_ai_provider(cfg: &AppConfig, failures: &mut Vec<String>) {
 
     match client.check_model_available().await {
         Ok(()) => println!(
-            "ok: OpenAI-compatible API model {} is available at {} {authentication}",
+            "ok: OpenAI-compatible API model {} is listed at {} {authentication}",
             cfg.ai.provider.model, cfg.ai.provider.base_url
         ),
         Err(error) => {
             println!("error: OpenAI-compatible API model check: {error:#}");
+            println!(
+                "note: doctor checks GET /models; a non-standard server may still support chat completions"
+            );
             failures.push("AI API model".to_string());
         }
     }

@@ -7,7 +7,7 @@ Complete [configuration](README.md#configuring) before inviting the bot to a ser
 | Command | Purpose |
 | --- | --- |
 | `transcribe-bot init` | Create `.env` and `config.toml` from the bundled templates without overwriting existing files. Use `cargo run -- init` from a source checkout. |
-| `transcribe-bot doctor` | Validate configuration and the local ASR model, then contact the AI API to confirm the configured model is listed (without generating text). Use `cargo run -- doctor` from a source checkout. |
+| `transcribe-bot doctor` | Validate configuration and the local ASR model, then contact the AI API to confirm the configured model is listed (without generating text). Transient failures are retried; failure also notes that a non-standard server may still support chat completions without model discovery. Use `cargo run -- doctor` from a source checkout. |
 | `transcribe-bot download owner/repo` | Find the `hf` CLI, display the model's Hub information, ask before downloading it into `models/repo`, and verify the detected ASR layout. If `hf` is missing, it prints the `pip` installation command. Use `cargo run -- download owner/repo` from a source checkout. |
 
 When the default `config.toml` is missing, starting the bot performs the same initialization and then exits so the generated files can be configured. `init` is useful for preparing a release-binary directory explicitly.
@@ -62,7 +62,7 @@ Configure one OpenAI-compatible endpoint for `/ask` and optional call summaries.
 
 ### OpenAI-compatible APIs
 
-The bot has one non-streaming Chat Completions client. Use it with OpenAI, [Gemini's OpenAI-compatible API](https://ai.google.dev/gemini-api/docs/openai), OpenRouter, [Ollama's local OpenAI-compatible endpoint](https://docs.ollama.com/openai), or another compatible API. It sends requests to `{base_url}/chat/completions` and adds a bearer token only when an API-key environment variable is configured and set.
+The bot has one streaming Chat Completions client. Use it with OpenAI, [Gemini's OpenAI-compatible API](https://ai.google.dev/gemini-api/docs/openai), OpenRouter, [Ollama's local OpenAI-compatible endpoint](https://docs.ollama.com/openai), or DeepSeek. It sends requests to `{base_url}/chat/completions` and adds a bearer token only when `[ai].api_key_env` is configured.
 
 For local Ollama, [install Ollama](https://ollama.com/download) and download a model. For example:
 
@@ -94,6 +94,7 @@ For a hosted compatible API, put its key in `.env` as `OPENAI_API_KEY`, then set
 	[ai]
 	model = "deepseek-v4-flash"
 	base_url = "https://api.deepseek.com"
+	api_key_env = "OPENAI_API_KEY"
 	```
 
 If you prefer a provider-specific variable such as `GEMINI_API_KEY` or `OPENROUTER_API_KEY`, select it without putting the secret in `config.toml`:
@@ -112,7 +113,7 @@ If you prefer a provider-specific variable such as `GEMINI_API_KEY` or `OPENROUT
 	api_key_env = "OPENROUTER_API_KEY"
 	```
 
-`[ai].request_timeout` is the maximum duration of an API request. `OPENAI_API_KEY` is the default key variable and is optional for local servers such as Ollama.
+`[ai].request_timeout` is the maximum time the API may go without sending response data. Set `[ai].api_key_env` for hosted APIs that require authentication; the named environment variable must then be present and non-empty. When `api_key_env` is omitted, the bot sends no authentication header.
 
 ## First Call
 
@@ -147,6 +148,8 @@ Optional post-call summaries are configured under `[summary]` in `config.toml` a
 `/autojoin` appends a suffix to a voice channel name. When a non-bot user enters a marked channel, the bot starts a session automatically. The default suffix is ` [Transcribe]`, configurable with `[discord].autojoin_suffix`.
 
 For autojoin sessions, status and transcript messages go to the first text channel in the same category as the voice channel.
+
+For a single-guild installation, optionally set `[discord].autojoin_text_channel_id` to a Discord text-channel ID. It overrides autojoin's channel selection for call status, live transcript, and final transcript exports. `/join` always uses the channel where it was invoked. Leave the setting unset to preserve the normal autojoin behavior.
 
 ## Transcript Data And AI
 

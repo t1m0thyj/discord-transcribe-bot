@@ -1,15 +1,13 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::Context as _;
-use serenity::builder::GetMessages;
 use serenity::all::{ChannelType, CommandDataOptionValue, CommandInteraction};
+use serenity::builder::GetMessages;
 use serenity::prelude::Context;
 
-use super::{
-    AppState, LOG_DEFAULT_UTTERANCES, LOG_MAX_DISCORD_CHARS,
-};
 use super::autojoin::{normalized_autojoin_suffix, strip_known_autojoin_suffix};
+use super::{AppState, LOG_DEFAULT_UTTERANCES, LOG_MAX_DISCORD_CHARS};
 use crate::asr::{decode_queue_capacity, decode_queue_depth};
 
 pub(super) async fn handle_join(
@@ -32,7 +30,8 @@ pub(super) async fn handle_join(
             .context("you are not connected to a voice channel")?
     };
 
-    super::session::start_call_session(ctx, state, guild_id, channel_id, command.channel_id).await?;
+    super::session::start_call_session(ctx, state, guild_id, channel_id, command.channel_id)
+        .await?;
 
     Ok(format!(
         "Joined <#{}>. Listening and waiting for speech...",
@@ -331,9 +330,7 @@ pub(super) async fn handle_log(
         return Ok("No transcribed utterances yet.".to_string());
     }
 
-    let start = snapshot
-        .len()
-        .saturating_sub(requested_utterances);
+    let start = snapshot.len().saturating_sub(requested_utterances);
     let mut transcript = super::summary::format_transcript_from_call_start(
         ctx,
         &snapshot[start..],
@@ -438,8 +435,7 @@ async fn handle_completed_thread_summary(
         .map(|thread_context| thread_context.transcript.clone())
         .context("transcript thread context was evicted while preparing summary")?;
 
-    if let Some(cached_summary) = super::summary::cached_summary_from_export_markdown(&transcript)
-    {
+    if let Some(cached_summary) = super::summary::cached_summary_from_export_markdown(&transcript) {
         let posted = command
             .channel_id
             .say(
@@ -529,7 +525,9 @@ pub(super) async fn handle_autojoin(
                 .voice_states
                 .get(&command.user.id)
                 .and_then(|vs| vs.channel_id)
-                .context("you are not connected to a voice channel (or provide a channel mention)")?
+                .context(
+                    "you are not connected to a voice channel (or provide a channel mention)",
+                )?
         }
     };
 
@@ -571,12 +569,17 @@ pub(super) async fn handle_autojoin(
     };
 
     if new_name.trim().is_empty() {
-        anyhow::bail!("cannot remove the autojoin suffix because it would leave an empty channel name");
+        anyhow::bail!(
+            "cannot remove the autojoin suffix because it would leave an empty channel name"
+        );
     }
 
     if new_name != old_name {
         voice_channel_id
-            .edit(&ctx.http, serenity::builder::EditChannel::new().name(new_name))
+            .edit(
+                &ctx.http,
+                serenity::builder::EditChannel::new().name(new_name),
+            )
             .await
             .context("failed to rename voice channel (need Manage Channels permission)")?;
     }
@@ -593,4 +596,3 @@ pub(super) async fn handle_autojoin(
         ))
     }
 }
-

@@ -34,11 +34,11 @@ The terminal includes `live transcription` lines after successful ASR decode and
 
 ## Configuration And Generated Files
 
-- `.env` holds `DISCORD_TOKEN`, an optional API-key variable selected by `[ai].api_key_env` (default `OPENAI_API_KEY`), and optional `APP_CONFIG_PATH`.
+- `.env` holds `DISCORD_TOKEN`, an optional API-key variable selected explicitly by `[ai].api_key_env`, and optional `APP_CONFIG_PATH`.
 - `config.toml` contains model, AI-provider, audio, transcription, summary, and Discord settings. `transcribe-bot init` embeds and writes the current templates without overwriting local files.
 - `models/`, `transcripts/`, `.env`, and `config.toml` are local runtime artifacts and are ignored by Git.
 - The bot writes a per-call JSONL journal to `transcripts/`; it removes old journals according to `[transcription].retention_days` after a call finalizes.
-- `transcribe-bot doctor` performs preflight validation without connecting to Discord. It checks the resolved configuration and ASR model layout, then queries the selected AI API's model list. It does not send a generation request that would consume tokens.
+- `transcribe-bot doctor` performs preflight validation without connecting to Discord. It checks the resolved configuration and ASR model layout, then queries the selected AI API's model list with transient retries. It does not send a generation request that would consume tokens.
 
 ## Transcript format
 

@@ -13,11 +13,9 @@ use serenity::prelude::Context;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
-use crate::config::AppConfig;
 use crate::ai::AiClient;
-use crate::asr::{
-    AsrEngine, SsrcMap, Streams,
-};
+use crate::asr::{AsrEngine, SsrcMap, Streams};
+use crate::config::AppConfig;
 
 mod autojoin;
 mod commands;
@@ -128,6 +126,7 @@ pub struct AppState {
     pub rolling_ingest_context_ms: u64,
     pub transcript_retention_days: u64,
     pub autojoin_suffix: String,
+    pub autojoin_text_channel_override: Option<ChannelId>,
     pub post_call_summary_enabled: bool,
     pub post_call_summary_post_in_thread: bool,
     pub post_call_summary_include_in_markdown: bool,
@@ -172,6 +171,10 @@ impl AppState {
             rolling_ingest_context_ms: cfg.transcription.rolling_ingest_context_ms,
             transcript_retention_days: cfg.transcription.retention_days,
             autojoin_suffix: cfg.discord.autojoin_suffix,
+            autojoin_text_channel_override: cfg
+                .discord
+                .autojoin_text_channel_id
+                .map(ChannelId::new),
             post_call_summary_enabled: cfg.summary.enabled,
             post_call_summary_post_in_thread: cfg.summary.post_in_thread,
             post_call_summary_include_in_markdown: cfg.summary.include_in_markdown,
@@ -233,8 +236,7 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
         CreateCommand::new("leave")
             .description("Leave voice and finalize transcript export")
             .default_member_permissions(Permissions::MOVE_MEMBERS),
-        CreateCommand::new("status")
-            .description("Show live transcription status for this guild"),
+        CreateCommand::new("status").description("Show live transcription status for this guild"),
         CreateCommand::new("log")
             .description("Show recent committed transcript lines for the active call")
             .add_option(
@@ -250,7 +252,7 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
             .add_option(
                 CreateCommandOption::new(CommandOptionType::String, "question", "Question to ask")
                     .set_autocomplete(true)
-                .required(true),
+                    .required(true),
             ),
         CreateCommand::new("summary")
             .description("Summarize the active call or a completed transcript thread"),
@@ -427,6 +429,7 @@ fn format_slash_command(command: &CommandInteraction) -> String {
             CommandDataOptionValue::SubCommand(_)
             | CommandDataOptionValue::SubCommandGroup(_)
             | CommandDataOptionValue::Unknown(_) => continue,
+            _ => continue,
         };
         text.push(' ');
         text.push_str(&value);
@@ -465,8 +468,8 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
         let answer = state
             .ai
             .ask(&transcript, &question, Some(&prior_turns))
-        .await
-        .unwrap_or_else(|e| format!("ai error: {e}"));
+            .await
+            .unwrap_or_else(|e| format!("ai error: {e}"));
         drop(typing);
 
         let _ = msg.channel_id.say(&ctx.http, &answer).await;

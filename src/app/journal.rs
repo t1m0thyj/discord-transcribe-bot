@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
@@ -31,7 +31,8 @@ pub async fn transcript_writer_loop(
             .open(path)
             .await
             .with_context(|| format!("failed to open transcript journal {}", path.display()))?;
-        let line = serde_json::to_string(item).context("failed to serialize transcript utterance")?;
+        let line =
+            serde_json::to_string(item).context("failed to serialize transcript utterance")?;
         file.write_all(format!("{line}\n").as_bytes())
             .await
             .with_context(|| format!("failed to append transcript journal {}", path.display()))?;
@@ -66,12 +67,7 @@ pub async fn transcript_writer_loop(
 
     let mut first_error = None;
     while let Some(item) = rx.recv().await {
-        let result = append_utterance(
-            &session,
-            &transcript_jsonl_path,
-            item,
-        )
-        .await;
+        let result = append_utterance(&session, &transcript_jsonl_path, item).await;
         runtime
             .transcript_pending_commits
             .fetch_sub(1, AtomicOrdering::SeqCst);
@@ -168,8 +164,8 @@ pub async fn prune_old_transcripts(dir: &Path, retention: Duration) -> usize {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use chrono::Utc;
@@ -224,7 +220,6 @@ mod tests {
         assert!(keep_non_transcript.exists());
         assert!(keep_wrong_ext.exists());
         assert!(!prune_target.exists());
-
     }
 
     #[tokio::test]

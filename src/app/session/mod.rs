@@ -9,16 +9,16 @@ use serenity::prelude::Context;
 use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
 
-use super::{AppState, CallSession, GuildRuntime, Utterance};
 use super::journal::transcript_writer_loop;
+use super::{AppState, CallSession, GuildRuntime, Utterance};
 
 mod finalize;
 mod watchdog;
 
 pub use finalize::{finalize_call_for_guild, maybe_finalize_on_empty_voice_channel};
 pub use watchdog::{
-    VoiceHandlerAttachContext, attach_voice_handlers, startup_receive_watchdog,
-    steady_state_receive_watchdog,
+    attach_voice_handlers, startup_receive_watchdog, steady_state_receive_watchdog,
+    VoiceHandlerAttachContext,
 };
 
 const TRANSCRIPT_ATTACHMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -63,12 +63,14 @@ pub(super) async fn start_call_session(
         guild_id.get(),
         session_started_at.format("%Y%m%d-%H%M%S")
     ));
-    fs::File::create(&transcript_jsonl_path).await.with_context(|| {
-        format!(
-            "failed to create transcript journal file {}",
-            transcript_jsonl_path.display()
-        )
-    })?;
+    fs::File::create(&transcript_jsonl_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create transcript journal file {}",
+                transcript_jsonl_path.display()
+            )
+        })?;
 
     let runtime = Arc::new(GuildRuntime::new(utterance_tx.clone()));
     state.guild_runtimes.insert(guild_id, Arc::clone(&runtime));
@@ -85,13 +87,9 @@ pub(super) async fn start_call_session(
 
     let writer_runtime = Arc::clone(&runtime);
     tokio::spawn(async move {
-        if let Err(error) = transcript_writer_loop(
-            session,
-            utterance_rx,
-            writer_runtime,
-            transcript_jsonl_path,
-        )
-        .await
+        if let Err(error) =
+            transcript_writer_loop(session, utterance_rx, writer_runtime, transcript_jsonl_path)
+                .await
         {
             tracing::error!("transcript writer stopped: {error:#}");
         }

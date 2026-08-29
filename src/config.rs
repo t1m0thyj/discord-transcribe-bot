@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use serde::Deserialize;
 
 use crate::ai::AiProviderConfig;
@@ -51,6 +52,7 @@ pub struct TranscriptionRuntimeConfig {
 #[derive(Clone, Debug)]
 pub struct DiscordRuntimeConfig {
     pub autojoin_suffix: String,
+    pub autojoin_text_channel_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,18 +69,9 @@ impl AppConfig {
         let discord_token = required_nonempty_env("DISCORD_TOKEN")?;
         let openai_model = file_cfg.ai.as_ref().and_then(|ai| ai.model.clone());
         let openai_base_url = file_cfg.ai.as_ref().and_then(|ai| ai.base_url.clone());
-        let openai_api_key_env = file_cfg
-            .ai
-            .as_ref()
-            .and_then(|ai| ai.api_key_env.clone())
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
-        let ai_provider = AiProviderConfig::openai_compatible(
-            read_nonempty_env(&openai_api_key_env),
-            openai_model,
-            openai_base_url,
-        )?;
+        let api_key = resolve_ai_api_key(file_cfg.ai.as_ref())?;
+        let ai_provider =
+            AiProviderConfig::openai_compatible(api_key, openai_model, openai_base_url)?;
         let ai_request_timeout = file_cfg
             .ai
             .as_ref()
@@ -103,6 +96,7 @@ impl AppConfig {
             .unwrap_or(false);
         let transcription = resolve_transcription_runtime_config(file_cfg.transcription.as_ref());
         let autojoin_suffix = resolve_autojoin_suffix(file_cfg.discord.as_ref());
+        let autojoin_text_channel_id = resolve_autojoin_text_channel_id(file_cfg.discord.as_ref())?;
 
         let post_call_summary_enabled = file_cfg
             .summary
@@ -134,7 +128,10 @@ impl AppConfig {
                 log_live_transcript,
             },
             transcription,
-            discord: DiscordRuntimeConfig { autojoin_suffix },
+            discord: DiscordRuntimeConfig {
+                autojoin_suffix,
+                autojoin_text_channel_id,
+            },
             summary: SummaryRuntimeConfig {
                 enabled: post_call_summary_enabled,
                 post_in_thread: post_call_summary_post_in_thread,
@@ -161,6 +158,17 @@ struct AiSection {
     model: Option<String>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+}
+
+fn resolve_ai_api_key(section: Option<&AiSection>) -> anyhow::Result<Option<String>> {
+    let api_key_env = section
+        .and_then(|ai| ai.api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    api_key_env
+        .map(required_nonempty_env)
+        .transpose()
+        .with_context(|| "reading [ai].api_key_env")
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -191,6 +199,7 @@ struct DebugSection {
 #[derive(Debug, Default, Deserialize)]
 struct DiscordSection {
     autojoin_suffix: Option<String>,
+    autojoin_text_channel_id: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -257,6 +266,17 @@ fn resolve_autojoin_suffix(section: Option<&DiscordSection>) -> String {
         .unwrap_or_else(|| "[Transcribe]".to_string())
 }
 
+fn resolve_autojoin_text_channel_id(
+    section: Option<&DiscordSection>,
+) -> anyhow::Result<Option<u64>> {
+    match section.and_then(|discord| discord.autojoin_text_channel_id) {
+        Some(0) => anyhow::bail!(
+            "[discord].autojoin_text_channel_id must be a non-zero Discord channel ID"
+        ),
+        channel_id => Ok(channel_id),
+    }
+}
+
 fn load_file_config() -> anyhow::Result<FileConfig> {
     let config_path = resolve_config_path();
     if !config_path.is_file() {
@@ -293,9 +313,10 @@ mod tests {
     use std::env;
 
     use super::{
-        read_nonempty_env, required_nonempty_env, resolve_asr_runtime_config,
-        resolve_autojoin_suffix, resolve_config_path, resolve_transcription_runtime_config,
-        AsrSection, DiscordSection, TranscriptionSection,
+        read_nonempty_env, required_nonempty_env, resolve_ai_api_key, resolve_asr_runtime_config,
+        resolve_autojoin_suffix, resolve_autojoin_text_channel_id, resolve_config_path,
+        resolve_transcription_runtime_config, AiSection, AsrSection, DiscordSection,
+        TranscriptionSection,
     };
 
     struct EnvGuard {
@@ -347,6 +368,29 @@ mod tests {
 
         env::remove_var("APP_CONFIG_PATH");
         assert_eq!(resolve_config_path().to_str(), Some("config.toml"));
+    }
+
+    #[test]
+    fn api_key_is_only_read_when_its_environment_variable_is_configured() {
+        let _default_guard = EnvGuard::new("OPENAI_API_KEY");
+        let _explicit_guard = EnvGuard::new("TRANSCRIBE_BOT_TEST_API_KEY");
+        env::set_var("OPENAI_API_KEY", "must-not-be-used");
+        env::set_var("TRANSCRIBE_BOT_TEST_API_KEY", " explicit-key ");
+
+        let without_key = AiSection {
+            model: Some("model-a".to_string()),
+            ..AiSection::default()
+        };
+        assert_eq!(resolve_ai_api_key(Some(&without_key)).unwrap(), None);
+
+        let with_key = AiSection {
+            api_key_env: Some("TRANSCRIBE_BOT_TEST_API_KEY".to_string()),
+            ..without_key
+        };
+        assert_eq!(
+            resolve_ai_api_key(Some(&with_key)).unwrap().as_deref(),
+            Some("explicit-key")
+        );
     }
 
     #[test]
@@ -409,7 +453,26 @@ mod tests {
     fn autojoin_suffix_uses_default_for_blank_values() {
         let blank = DiscordSection {
             autojoin_suffix: Some("   ".to_string()),
+            ..DiscordSection::default()
         };
         assert_eq!(resolve_autojoin_suffix(Some(&blank)), "[Transcribe]");
+    }
+
+    #[test]
+    fn autojoin_text_channel_id_is_optional_but_cannot_be_zero() {
+        assert_eq!(resolve_autojoin_text_channel_id(None).unwrap(), None);
+        assert_eq!(
+            resolve_autojoin_text_channel_id(Some(&DiscordSection {
+                autojoin_text_channel_id: Some(123),
+                ..DiscordSection::default()
+            }))
+            .unwrap(),
+            Some(123)
+        );
+        assert!(resolve_autojoin_text_channel_id(Some(&DiscordSection {
+            autojoin_text_channel_id: Some(0),
+            ..DiscordSection::default()
+        }))
+        .is_err());
     }
 }

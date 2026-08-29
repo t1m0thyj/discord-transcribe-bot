@@ -1,16 +1,19 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serenity::all::{CreateAttachment, CreateMessage, GuildId, UserId, VoiceState};
 use serenity::prelude::Context;
 
-use super::super::{AppState, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT, Utterance};
+use super::super::{AppState, Utterance, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT};
 use crate::app::journal::{load_persisted_transcript, prune_old_transcripts};
 use crate::app::summary;
-use crate::asr::{clear_unknown_ssrc_audio_for_guild, should_dispatch_chunk, transcribe_mono_pcm, trim_finalize_tail};
+use crate::asr::{
+    clear_unknown_ssrc_audio_for_guild, should_dispatch_chunk, transcribe_mono_pcm,
+    trim_finalize_tail,
+};
 
 pub async fn finalize_call_for_guild(
     ctx: &Context,
@@ -53,7 +56,8 @@ pub async fn finalize_call_for_guild(
     }
 
     let session = session_lock.read().await;
-    let transcript = load_persisted_transcript(&session.transcript_jsonl_path, session.started_mono).await;
+    let transcript =
+        load_persisted_transcript(&session.transcript_jsonl_path, session.started_mono).await;
 
     let transcript_title = summary::format_call_title(session.started_at);
     let call_duration = session.started_mono.elapsed();
@@ -75,19 +79,22 @@ pub async fn finalize_call_for_guild(
         include_summary_in_markdown,
     )
     .await;
-    let filename = format!("transcript-{}.md", session.started_at.format("%Y%m%d-%H%M%S"));
+    let filename = format!(
+        "transcript-{}.md",
+        session.started_at.format("%Y%m%d-%H%M%S")
+    );
 
     let local_dir = PathBuf::from("transcripts");
 
-    let attachment = CreateAttachment::bytes(transcript_text.clone().into_bytes(), filename.clone());
+    let attachment =
+        CreateAttachment::bytes(transcript_text.clone().into_bytes(), filename.clone());
     let msg = session
         .text_channel
         .send_files(
             &ctx.http,
             vec![attachment],
-            CreateMessage::new().content(
-                "Call transcript attached. Ask questions or run /summary in the thread.",
-            ),
+            CreateMessage::new()
+                .content("Call transcript attached. Ask questions or run /summary in the thread."),
         )
         .await?;
 
@@ -208,7 +215,8 @@ async fn settle_and_flush_guild_audio(state: &Arc<AppState>, guild_id: GuildId) 
     };
 
     for _ in 0..FINALIZE_SETTLE_PASSES {
-        let _ = wait_for_capture_quiesce_with_timeout(state, guild_id, FINALIZE_SETTLE_TIMEOUT).await;
+        let _ =
+            wait_for_capture_quiesce_with_timeout(state, guild_id, FINALIZE_SETTLE_TIMEOUT).await;
 
         let pending = flush_pending_buffers_for_export(state, guild_id).await;
         if !pending.is_empty() {
@@ -307,7 +315,11 @@ async fn wait_for_transcript_commit_drain(state: &Arc<AppState>, guild_id: Guild
     }
 }
 
-async fn commit_flushed_utterances(state: &Arc<AppState>, guild_id: GuildId, pending: Vec<Utterance>) {
+async fn commit_flushed_utterances(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    pending: Vec<Utterance>,
+) {
     let Some(runtime) = state
         .guild_runtimes
         .get(&guild_id)
@@ -394,7 +406,11 @@ async fn flush_pending_buffers_for_export(
         }
 
         match transcribe_finalized_mono_pcm(state, pcm).await {
-            Ok(Some(text)) => out.push(Utterance { user_id, start_ts, text }),
+            Ok(Some(text)) => out.push(Utterance {
+                user_id,
+                start_ts,
+                text,
+            }),
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(

@@ -92,19 +92,19 @@ The queue is global across guilds, bounded to eight chunks, and intentionally sh
 Secrets and file selection are environment-driven:
 
 - `DISCORD_TOKEN` is required.
-- `OPENAI_API_KEY` is the default optional bearer-token variable. `[ai].api_key_env` can select another variable; local servers such as Ollama do not normally need a key.
+- `[ai].api_key_env` optionally selects an environment variable containing the API bearer token. No authentication header is sent when it is omitted.
 - `APP_CONFIG_PATH` optionally selects a TOML file; it defaults to `config.toml`.
 
 All other runtime settings live in `config.toml`: AI provider/model and timeout, ASR model directory and threads, denoiser, endpointing and rolling-buffer limits, journal retention, autojoin suffix, debug logging, and summary behavior. See [config.example.toml](config.example.toml) for defaults.
 
-Before normal startup, the CLI handles `init`, `doctor`, and help requests. `init` creates missing default templates without overwriting existing files; a normal launch with no default `config.toml` runs the same initialization and exits. `doctor` validates the resolved configuration and ASR model, then queries the AI API's model list without sending a generation request.
+Before normal startup, the CLI handles `init`, `doctor`, and help requests. `init` creates missing default templates without overwriting existing files; a normal launch with no default `config.toml` runs the same initialization and exits. `doctor` validates the resolved configuration and ASR model, then queries the AI API's model list with transient retries and without sending a generation request.
 
 ## Module Map
 
 - `src/main.rs`: process startup, Discord intents, and event routing.
 - `src/cli.rs`: startup command parsing, template initialization, and local preflight checks.
 - `src/config.rs`: `.env`, TOML, and runtime configuration resolution.
-- `src/ai.rs`: OpenAI-compatible Chat Completions client and transcript prompt construction.
+- `src/ai/`: AI client facade and prompt construction (`mod.rs`), OpenAI-compatible HTTP transport (`openai.rs`), and SSE parsing (`stream.rs`).
 - `src/asr/audio.rs`: Songbird voice receive, SSRC handling, segmentation, and decode dispatch.
 - `src/asr/frontend.rs`: downmix, high-pass, denoise bypass, resampling, VAD, and preroll.
 - `src/asr/pipeline.rs`: recognizer setup, dispatch gate, tail trim, and stream-state types.

@@ -407,7 +407,10 @@ mod tests {
             cached_summary_from_export_markdown(markdown).as_deref(),
             Some("## Decisions\n\nUse retries.")
         );
-        assert!(cached_summary_from_export_markdown("---\ntitle: \"Call\"\n---\n\n## Transcript\n").is_none());
+        assert!(cached_summary_from_export_markdown(
+            "---\ntitle: \"Call\"\n---\n\n## Transcript\n"
+        )
+        .is_none());
     }
 
     #[test]

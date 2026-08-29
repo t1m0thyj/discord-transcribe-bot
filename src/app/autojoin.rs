@@ -47,7 +47,9 @@ pub async fn maybe_autojoin_on_voice_state(
             return;
         }
 
-        pick_autojoin_text_channel(&guild, channel_id)
+        state
+            .autojoin_text_channel_override
+            .or_else(|| pick_autojoin_text_channel(&guild, channel_id))
     }) else {
         tracing::warn!(
             guild = %guild_id,
@@ -56,7 +58,9 @@ pub async fn maybe_autojoin_on_voice_state(
         return;
     };
 
-    if let Err(e) = super::session::start_call_session(ctx, state, guild_id, channel_id, text_channel_id).await {
+    if let Err(e) =
+        super::session::start_call_session(ctx, state, guild_id, channel_id, text_channel_id).await
+    {
         tracing::warn!(guild = %guild_id, "autojoin failed to start session: {e:#}");
         return;
     }
@@ -88,11 +92,7 @@ pub(super) fn pick_autojoin_text_channel(
         })
         .collect();
 
-    pick_autojoin_text_channel_from_channels(
-        &channels,
-        voice_channel_id,
-        guild.system_channel_id,
-    )
+    pick_autojoin_text_channel_from_channels(&channels, voice_channel_id, guild.system_channel_id)
 }
 
 #[derive(Clone, Copy)]
@@ -116,7 +116,9 @@ fn pick_autojoin_text_channel_from_channels(
     if let Some(parent_id) = voice_parent_id {
         let same_category = channels
             .iter()
-            .filter(|channel| channel.kind == ChannelType::Text && channel.parent_id == Some(parent_id))
+            .filter(|channel| {
+                channel.kind == ChannelType::Text && channel.parent_id == Some(parent_id)
+            })
             .min_by_key(|channel| (channel.position, channel.id.get()))
             .map(|channel| channel.id);
 
@@ -153,8 +155,8 @@ mod tests {
     use serenity::all::{ChannelId, ChannelType};
 
     use super::{
-        ChannelSummary, normalized_autojoin_suffix, pick_autojoin_text_channel_from_channels,
-        strip_known_autojoin_suffix,
+        normalized_autojoin_suffix, pick_autojoin_text_channel_from_channels,
+        strip_known_autojoin_suffix, ChannelSummary,
     };
 
     fn channel(
@@ -211,13 +213,24 @@ mod tests {
             channel(2, ChannelType::Text, None, 0),
         ];
         assert_eq!(
-            pick_autojoin_text_channel_from_channels(&channels, ChannelId::new(1), Some(ChannelId::new(2))),
+            pick_autojoin_text_channel_from_channels(
+                &channels,
+                ChannelId::new(1),
+                Some(ChannelId::new(2))
+            ),
             Some(ChannelId::new(3))
         );
 
-        let no_category_text = [channel(1, ChannelType::Voice, Some(10), 0), channel(2, ChannelType::Text, None, 3)];
+        let no_category_text = [
+            channel(1, ChannelType::Voice, Some(10), 0),
+            channel(2, ChannelType::Text, None, 3),
+        ];
         assert_eq!(
-            pick_autojoin_text_channel_from_channels(&no_category_text, ChannelId::new(1), Some(ChannelId::new(99))),
+            pick_autojoin_text_channel_from_channels(
+                &no_category_text,
+                ChannelId::new(1),
+                Some(ChannelId::new(99))
+            ),
             Some(ChannelId::new(99))
         );
         assert_eq!(

@@ -3,7 +3,7 @@ request_timeout = 30
 # OpenAI-compatible Chat Completions base URL. Ollama's local endpoint is the default.
 model = "llama3.1:8b-instruct"
 base_url = "http://127.0.0.1:11434/v1"
-# Optional environment variable containing the bearer token; defaults to OPENAI_API_KEY.
+# Optional environment variable containing the bearer token.
 # api_key_env = "OPENAI_API_KEY"
 
 [asr]
@@ -27,6 +27,8 @@ retention_days = 30
 
 [discord]
 autojoin_suffix = "[Transcribe]"
+# Optional fixed destination for autojoin status, live transcript, and exports.
+# autojoin_text_channel_id = 123456789012345678
 
 [summary]
 enabled = false
