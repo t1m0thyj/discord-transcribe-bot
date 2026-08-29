@@ -5,7 +5,7 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::Context as _;
 
-use crate::ai::AiProviderConfig;
+use crate::ai::AiClient;
 use crate::asr::{resolve_model_dir, validate_model_layout};
 use crate::config::{self, AppConfig};
 
@@ -62,7 +62,7 @@ pub(crate) fn initialize_current_directory() -> anyhow::Result<()> {
     println!("\nNext steps:");
     println!("1. Set DISCORD_TOKEN in .env.");
     println!(
-        "2. Configure Gemini or Ollama in {}.",
+        "2. Configure Gemini, OpenRouter, or an OpenAI-compatible API in {}.",
         config_path.display()
     );
     println!("3. Set [asr].model_dir and download that ASR model.");
@@ -260,69 +260,30 @@ fn check_model(cfg: &AppConfig, failures: &mut Vec<String>) {
 }
 
 async fn check_ai_provider(cfg: &AppConfig, failures: &mut Vec<String>) {
-    match &cfg.ai.provider {
-        AiProviderConfig::Gemini { model, .. } => {
-            println!("ok: Gemini configured with model {model}");
+    let authentication = if cfg.ai.provider.api_key.is_some() {
+        "with an API key"
+    } else {
+        "without an API key"
+    };
+    let client = match AiClient::new(cfg.ai.provider.clone(), cfg.ai.request_timeout) {
+        Ok(client) => client,
+        Err(error) => {
+            println!("error: OpenAI-compatible API client: {error:#}");
+            failures.push("AI API client".to_string());
+            return;
         }
-        AiProviderConfig::OpenRouter { model, .. } => {
-            println!("ok: OpenRouter configured with model {model}");
-        }
-        AiProviderConfig::Ollama { base_url, model } => {
-            let endpoint = format!("{}/api/tags", base_url.trim_end_matches('/'));
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(cfg.ai.request_timeout))
-                .build()
-            {
-                Ok(client) => client,
-                Err(error) => {
-                    println!("error: failed to create Ollama client: {error:#}");
-                    failures.push("Ollama client".to_string());
-                    return;
-                }
-            };
+    };
 
-            match client.get(&endpoint).send().await {
-                Ok(response) if response.status().is_success() => {
-                    match response.json::<serde_json::Value>().await {
-                        Ok(payload) if ollama_model_is_available(&payload, model) => {
-                            println!("ok: Ollama is reachable at {base_url} and has model {model}");
-                        }
-                        Ok(_) => {
-                            println!("error: Ollama is reachable at {base_url}, but model {model} is not installed");
-                            failures.push("Ollama model".to_string());
-                        }
-                        Err(error) => {
-                            println!(
-                                "error: failed to read Ollama model list from {endpoint}: {error}"
-                            );
-                            failures.push("Ollama service".to_string());
-                        }
-                    }
-                }
-                Ok(response) => {
-                    println!(
-                        "error: Ollama returned {} from {endpoint}",
-                        response.status()
-                    );
-                    failures.push("Ollama service".to_string());
-                }
-                Err(error) => {
-                    println!("error: Ollama is not reachable at {base_url}: {error}");
-                    failures.push("Ollama service".to_string());
-                }
-            }
+    match client.check_model_available().await {
+        Ok(()) => println!(
+            "ok: OpenAI-compatible API model {} is available at {} {authentication}",
+            cfg.ai.provider.model, cfg.ai.provider.base_url
+        ),
+        Err(error) => {
+            println!("error: OpenAI-compatible API model check: {error:#}");
+            failures.push("AI API model".to_string());
         }
     }
-}
-
-fn ollama_model_is_available(payload: &serde_json::Value, configured_model: &str) -> bool {
-    payload
-        .get("models")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
-        .any(|name| name == configured_model)
 }
 
 fn check(condition: bool, label: String, failures: &mut Vec<String>) {
@@ -341,9 +302,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        find_hf_cli_in_paths, is_download_confirmation, model_destination,
-        ollama_model_is_available, parse_command, parse_repo_id, write_template_if_missing,
-        Command,
+        find_hf_cli_in_paths, is_download_confirmation, model_destination, parse_command,
+        parse_repo_id, write_template_if_missing, Command,
     };
 
     struct TempDir(PathBuf);
@@ -463,14 +423,5 @@ mod tests {
         assert!(is_download_confirmation("unexpected input"));
         assert!(!is_download_confirmation("no"));
         assert!(!is_download_confirmation("N"));
-    }
-
-    #[test]
-    fn ollama_model_check_requires_the_configured_model() {
-        let payload = serde_json::json!({
-            "models": [{"name": "gemma3:4b"}, {"name": "llama3.1:8b"}]
-        });
-        assert!(ollama_model_is_available(&payload, "gemma3:4b"));
-        assert!(!ollama_model_is_available(&payload, "missing:latest"));
     }
 }

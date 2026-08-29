@@ -7,7 +7,7 @@ Complete [configuration](README.md#configuring) before inviting the bot to a ser
 | Command | Purpose |
 | --- | --- |
 | `transcribe-bot init` | Create `.env` and `config.toml` from the bundled templates without overwriting existing files. Use `cargo run -- init` from a source checkout. |
-| `transcribe-bot doctor` | Validate configuration and the local ASR model; for Ollama, also check that the service is reachable and the configured model is installed. Use `cargo run -- doctor` from a source checkout. |
+| `transcribe-bot doctor` | Validate configuration and the local ASR model, then contact the AI API to confirm the configured model is listed (without generating text). Use `cargo run -- doctor` from a source checkout. |
 | `transcribe-bot download owner/repo` | Find the `hf` CLI, display the model's Hub information, ask before downloading it into `models/repo`, and verify the detected ASR layout. If `hf` is missing, it prints the `pip` installation command. Use `cargo run -- download owner/repo` from a source checkout. |
 
 When the default `config.toml` is missing, starting the bot performs the same initialization and then exits so the generated files can be configured. `init` is useful for preparing a release-binary directory explicitly.
@@ -58,73 +58,61 @@ Enable the **Message Content Intent** in the Discord Developer Portal for thread
 
 ## AI Provider Setup
 
-Choose one provider for `/ask` and optional call summaries. Speech transcription remains local for all options.
+Configure one OpenAI-compatible endpoint for `/ask` and optional call summaries. Speech transcription remains local.
 
-### Gemini
+### OpenAI-compatible APIs
 
-1. Create an API key in [Google AI Studio](https://aistudio.google.com/app/apikey).
-2. Add it to `.env`:
+The bot has one non-streaming Chat Completions client. Use it with OpenAI, [Gemini's OpenAI-compatible API](https://ai.google.dev/gemini-api/docs/openai), OpenRouter, [Ollama's local OpenAI-compatible endpoint](https://docs.ollama.com/openai), or another compatible API. It sends requests to `{base_url}/chat/completions` and adds a bearer token only when an API-key environment variable is configured and set.
 
-	```text
-	GEMINI_API_KEY=your-api-key
-	```
-
-3. Set the provider in `config.toml`:
-
-	```toml
-	[ai]
-	provider = "gemini"
-	```
-
-	The optional `[ai.gemini].model` setting defaults to `gemini-flash-latest`.
-
-### OpenRouter
-
-1. Create an API key in [OpenRouter](https://openrouter.ai/keys).
-2. Add it to `.env`:
-
-	```text
-	OPENROUTER_API_KEY=your-api-key
-	```
-
-3. Set the provider in `config.toml`:
-
-	```toml
-	[ai]
-	provider = "openrouter"
-
-	[ai.openrouter]
-	model = "openrouter/free"
-	```
-
-	The model setting is optional and defaults to `openrouter/free`, which chooses an available free model. For more predictable latency and responses, pin a model instead; for example, `deepseek/deepseek-v4-flash:free` is a good fast option.
-
-### Ollama
-
-1. [Install Ollama](https://ollama.com/download), then download a local model. For example, [Gemma 3 4B](https://ollama.com/library/gemma3):
+For local Ollama, [install Ollama](https://ollama.com/download) and download a model. For example:
 
 	```bash
 	ollama pull gemma3:4b
 	```
 
-2. Start the Ollama server in a separate terminal, unless the Ollama desktop app is already serving locally:
+Start the Ollama server in a separate terminal, unless the Ollama desktop app is already serving locally:
 
 	```bash
 	ollama serve
 	```
 
-3. Set the provider and model in `config.toml`:
+Configure it in `config.toml`:
 
 	```toml
 	[ai]
-	provider = "ollama"
-
-	[ai.ollama]
 	model = "gemma3:4b"
-	base_url = "http://127.0.0.1:11434"
+	base_url = "http://127.0.0.1:11434/v1"
 	```
 
-`[ai].request_timeout` is an idle timeout for Ollama's streamed responses.
+For a hosted compatible API, put its key in `.env` as `OPENAI_API_KEY`, then set its base URL and model. For example, [DeepSeek's API](https://api-docs.deepseek.com/) supports the OpenAI Chat Completions format:
+
+	```text
+	OPENAI_API_KEY=your-deepseek-api-key
+	```
+
+	```toml
+	[ai]
+	model = "deepseek-v4-flash"
+	base_url = "https://api.deepseek.com"
+	```
+
+If you prefer a provider-specific variable such as `GEMINI_API_KEY` or `OPENROUTER_API_KEY`, select it without putting the secret in `config.toml`:
+
+	```toml
+	[ai]
+	model = "gemini-3.7-flash"
+	base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+	api_key_env = "GEMINI_API_KEY"
+	```
+
+	```toml
+	[ai]
+	model = "openrouter/free"
+	base_url = "https://openrouter.ai/api/v1"
+	api_key_env = "OPENROUTER_API_KEY"
+	```
+
+`[ai].request_timeout` is the maximum duration of an API request. `OPENAI_API_KEY` is the default key variable and is optional for local servers such as Ollama.
 
 ## First Call
 
@@ -164,7 +152,7 @@ For autojoin sessions, status and transcript messages go to the first text chann
 
 The bot stores a JSONL journal locally in `transcripts/` while the call is active and uploads the final Markdown transcript to Discord. Local journal retention is controlled by `[transcription].retention_days`.
 
-Speech recognition remains local. `/ask` and optional summaries send transcript context to the configured AI provider: Gemini and OpenRouter are hosted services; Ollama normally runs locally at the configured URL.
+Speech recognition remains local. `/ask` and optional summaries send transcript context to the configured OpenAI-compatible API, which can be local (for example, Ollama) or hosted.
 
 ## Health And Recovery
 

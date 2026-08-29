@@ -65,35 +65,19 @@ impl AppConfig {
         let file_cfg = load_file_config()?;
 
         let discord_token = required_nonempty_env("DISCORD_TOKEN")?;
-        let ai_provider_name = file_cfg
+        let openai_model = file_cfg.ai.as_ref().and_then(|ai| ai.model.clone());
+        let openai_base_url = file_cfg.ai.as_ref().and_then(|ai| ai.base_url.clone());
+        let openai_api_key_env = file_cfg
             .ai
             .as_ref()
-            .and_then(|ai| ai.provider.clone())
-            .unwrap_or_else(|| "ollama".to_string());
-        let gemini_model = file_cfg
-            .ai
-            .as_ref()
-            .and_then(|ai| ai.gemini.as_ref().and_then(|g| g.model.clone()));
-        let ollama_model = file_cfg
-            .ai
-            .as_ref()
-            .and_then(|ai| ai.ollama.as_ref().and_then(|o| o.model.clone()));
-        let ollama_base_url = file_cfg
-            .ai
-            .as_ref()
-            .and_then(|ai| ai.ollama.as_ref().and_then(|o| o.base_url.clone()));
-        let openrouter_model = file_cfg
-            .ai
-            .as_ref()
-            .and_then(|ai| ai.openrouter.as_ref().and_then(|o| o.model.clone()));
-        let ai_provider = AiProviderConfig::from_selection(
-            &ai_provider_name,
-            read_nonempty_env("GEMINI_API_KEY"),
-            gemini_model,
-            ollama_model,
-            ollama_base_url,
-            read_nonempty_env("OPENROUTER_API_KEY"),
-            openrouter_model,
+            .and_then(|ai| ai.api_key_env.clone())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+        let ai_provider = AiProviderConfig::openai_compatible(
+            read_nonempty_env(&openai_api_key_env),
+            openai_model,
+            openai_base_url,
         )?;
         let ai_request_timeout = file_cfg
             .ai
@@ -173,27 +157,10 @@ struct FileConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct AiSection {
-    provider: Option<String>,
     request_timeout: Option<u64>,
-    ollama: Option<OllamaSection>,
-    gemini: Option<GeminiSection>,
-    openrouter: Option<OpenRouterSection>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct OllamaSection {
     model: Option<String>,
     base_url: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GeminiSection {
-    model: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct OpenRouterSection {
-    model: Option<String>,
+    api_key_env: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -239,8 +206,14 @@ fn resolve_asr_runtime_config(
 ) -> anyhow::Result<AsrRuntimeConfig> {
     let model_dir = section
         .and_then(|asr| asr.model_dir.clone())
-        .ok_or_else(|| anyhow::anyhow!("missing ASR model directory: set [asr].model_dir in config.toml"))?;
-    let default_threads = if detected_cores >= 4 { 3 } else { detected_cores };
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing ASR model directory: set [asr].model_dir in config.toml")
+        })?;
+    let default_threads = if detected_cores >= 4 {
+        3
+    } else {
+        detected_cores
+    };
     let num_threads = section
         .and_then(|asr| asr.num_threads)
         .filter(|threads| *threads >= 1)
@@ -320,10 +293,9 @@ mod tests {
     use std::env;
 
     use super::{
-        AsrSection, DiscordSection, TranscriptionSection, read_nonempty_env,
-        required_nonempty_env,
-        resolve_asr_runtime_config, resolve_autojoin_suffix, resolve_config_path,
-        resolve_transcription_runtime_config,
+        read_nonempty_env, required_nonempty_env, resolve_asr_runtime_config,
+        resolve_autojoin_suffix, resolve_config_path, resolve_transcription_runtime_config,
+        AsrSection, DiscordSection, TranscriptionSection,
     };
 
     struct EnvGuard {
@@ -355,7 +327,10 @@ mod tests {
         let _value_guard = EnvGuard::new("TRANSCRIBE_BOT_TEST_ENV");
         let _path_guard = EnvGuard::new("APP_CONFIG_PATH");
         env::set_var("TRANSCRIBE_BOT_TEST_ENV", "   value   ");
-        assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), Some("value".to_string()));
+        assert_eq!(
+            read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"),
+            Some("value".to_string())
+        );
 
         env::set_var("TRANSCRIBE_BOT_TEST_ENV", "    ");
         assert_eq!(read_nonempty_env("TRANSCRIBE_BOT_TEST_ENV"), None);
@@ -411,16 +386,30 @@ mod tests {
             model_family: None,
             num_threads: Some(99),
         };
-        assert_eq!(resolve_asr_runtime_config(Some(&high), 4).unwrap().num_threads, 8);
+        assert_eq!(
+            resolve_asr_runtime_config(Some(&high), 4)
+                .unwrap()
+                .num_threads,
+            8
+        );
 
-        let invalid = AsrSection { num_threads: Some(0), ..high };
-        assert_eq!(resolve_asr_runtime_config(Some(&invalid), 2).unwrap().num_threads, 2);
+        let invalid = AsrSection {
+            num_threads: Some(0),
+            ..high
+        };
+        assert_eq!(
+            resolve_asr_runtime_config(Some(&invalid), 2)
+                .unwrap()
+                .num_threads,
+            2
+        );
     }
 
     #[test]
     fn autojoin_suffix_uses_default_for_blank_values() {
-        let blank = DiscordSection { autojoin_suffix: Some("   ".to_string()) };
+        let blank = DiscordSection {
+            autojoin_suffix: Some("   ".to_string()),
+        };
         assert_eq!(resolve_autojoin_suffix(Some(&blank)), "[Transcribe]");
     }
 }
-

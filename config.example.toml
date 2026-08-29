@@ -1,18 +1,10 @@
 [ai]
-provider = "ollama"
 request_timeout = 30
-
-[ai.ollama]
+# OpenAI-compatible Chat Completions base URL. Ollama's local endpoint is the default.
 model = "llama3.1:8b-instruct"
-base_url = "http://127.0.0.1:11434"
-
-[ai.gemini]
-# Optional; defaults to gemini-flash-latest.
-model = "gemini-flash-latest"
-
-[ai.openrouter]
-# Optional; defaults to openrouter/free.
-model = "openrouter/free"
+base_url = "http://127.0.0.1:11434/v1"
+# Optional environment variable containing the bearer token; defaults to OPENAI_API_KEY.
+# api_key_env = "OPENAI_API_KEY"
 
 [asr]
 model_dir = "models/sherpa-onnx-moonshine-base-en-int8"

@@ -8,7 +8,7 @@ This document describes the implemented runtime, its durability boundaries, and 
 - Speech recognition runs locally through one configured sherpa-onnx model.
 - The transcript is utterance-final: no partial text or later revisions are emitted.
 - Finalized utterances are journaled incrementally to disk before export.
-- Gemini, OpenRouter, and Ollama are used only for optional Q&A and summaries, not speech recognition.
+- An OpenAI-compatible API is used only for optional Q&A and summaries, not speech recognition.
 
 ## Detailed Runtime Flow
 
@@ -44,7 +44,7 @@ flowchart TD
 	Memory --> Journal["Append and flush JSONL journal"]
 
 	Commands["/log and /ask"] --> Memory
-	Commands --> AI["Configured Gemini, OpenRouter, or Ollama provider"]
+	Commands --> AI["Configured OpenAI-compatible API"]
 	Leave["/leave or channel becomes empty"] --> Flush["Settle capture and flush per-user buffers"]
 	Flush --> Drain["Bounded decode and commit drain"]
 	Drain --> Load["Reload persisted JSONL journal"]
@@ -92,20 +92,19 @@ The queue is global across guilds, bounded to eight chunks, and intentionally sh
 Secrets and file selection are environment-driven:
 
 - `DISCORD_TOKEN` is required.
-- `GEMINI_API_KEY` is required only for the Gemini provider.
-- `OPENROUTER_API_KEY` is required only for the OpenRouter provider.
+- `OPENAI_API_KEY` is the default optional bearer-token variable. `[ai].api_key_env` can select another variable; local servers such as Ollama do not normally need a key.
 - `APP_CONFIG_PATH` optionally selects a TOML file; it defaults to `config.toml`.
 
 All other runtime settings live in `config.toml`: AI provider/model and timeout, ASR model directory and threads, denoiser, endpointing and rolling-buffer limits, journal retention, autojoin suffix, debug logging, and summary behavior. See [config.example.toml](config.example.toml) for defaults.
 
-Before normal startup, the CLI handles `init`, `doctor`, and help requests. `init` creates missing default templates without overwriting existing files; a normal launch with no default `config.toml` runs the same initialization and exits. `doctor` validates the resolved configuration and ASR model, and checks the Ollama service and selected model when Ollama is configured.
+Before normal startup, the CLI handles `init`, `doctor`, and help requests. `init` creates missing default templates without overwriting existing files; a normal launch with no default `config.toml` runs the same initialization and exits. `doctor` validates the resolved configuration and ASR model, then queries the AI API's model list without sending a generation request.
 
 ## Module Map
 
 - `src/main.rs`: process startup, Discord intents, and event routing.
 - `src/cli.rs`: startup command parsing, template initialization, and local preflight checks.
 - `src/config.rs`: `.env`, TOML, and runtime configuration resolution.
-- `src/ai/`: provider abstraction plus Gemini, OpenRouter, and Ollama clients.
+- `src/ai.rs`: OpenAI-compatible Chat Completions client and transcript prompt construction.
 - `src/asr/audio.rs`: Songbird voice receive, SSRC handling, segmentation, and decode dispatch.
 - `src/asr/frontend.rs`: downmix, high-pass, denoise bypass, resampling, VAD, and preroll.
 - `src/asr/pipeline.rs`: recognizer setup, dispatch gate, tail trim, and stream-state types.
