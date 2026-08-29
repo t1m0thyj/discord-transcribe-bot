@@ -31,17 +31,28 @@ Create the bot with these OAuth2 scopes:
 - `bot`
 - `applications.commands`
 
-Grant these recommended permissions:
+### Bot role permissions
 
-- View Channels
-- Send Messages
-- Send Messages in Threads
-- Read Message History
-- Attach Files
-- Create Public Threads
-- Connect
-- Speak
-- Manage Channels, required for `/autojoin` channel suffix changes
+Grant the bot role the following permissions in the text and voice channels where it will operate:
+
+| Permission | Why the bot needs it |
+| --- | --- |
+| View Channels | See the configured text channel and join the selected voice channel. |
+| Send Messages | Post command responses and the completed-call transcript message. |
+| Send Messages in Threads | Reply to transcript-thread questions and post automatic summaries. |
+| Read Message History | Reload transcript attachments when the bot is restarted. |
+| Attach Files | Upload the final Markdown transcript. |
+| Create Public Threads | Create the public discussion thread for each transcript. |
+| Connect | Join the voice channel and receive its audio. |
+| Manage Channels | Required only when using `/autojoin`, which adds or removes the channel-name suffix. |
+
+The bot does not need **Speak**: it receives audio but does not send audio. Apply channel overrides if the bot should be limited to particular meeting channels.
+
+### Member permissions for commands
+
+Members with **Use Application Commands** can use `/status`, `/log`, `/ask`, and `/summary`. `/join` and `/leave` additionally require **Move Members**. `/autojoin` requires **Manage Channels**. Server administrators can further allow or deny individual commands by role, member, or channel in Discord's command/integration settings.
+
+For the post-call transcript thread, participants need **View Channels** on its parent channel and **Send Messages in Threads** to ask the bot questions there.
 
 Enable the **Message Content Intent** in the Discord Developer Portal for thread Q&A message handling.
 

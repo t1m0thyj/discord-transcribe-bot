@@ -102,6 +102,7 @@ pub async fn finalize_call_for_guild(
 
     if should_generate_summary && state.post_call_summary_post_in_thread {
         if auto_summary.is_none() {
+            let typing = thread.id.start_typing(&ctx.http);
             auto_summary = summary::maybe_generate_post_call_summary(
                 ctx,
                 state,
@@ -109,6 +110,7 @@ pub async fn finalize_call_for_guild(
                 session.started_at,
             )
             .await;
+            drop(typing);
         }
 
         if let Some(summary) = auto_summary.as_deref() {

@@ -315,9 +315,13 @@ pub(super) async fn handle_log(
         .context("no active call for this guild")?
         .clone();
 
-    let (mut snapshot, started_at) = {
+    let (mut snapshot, started_at, started_mono) = {
         let session = session_lock.read().await;
-        (session.transcript.clone(), session.started_at)
+        (
+            session.transcript.clone(),
+            session.started_at,
+            session.started_mono,
+        )
     };
 
     snapshot.sort_by_key(|u| u.start_ts);
@@ -329,8 +333,13 @@ pub(super) async fn handle_log(
     let start = snapshot
         .len()
         .saturating_sub(requested_utterances);
-    let mut transcript =
-        super::summary::format_transcript(ctx, &snapshot[start..], started_at).await;
+    let mut transcript = super::summary::format_transcript_from_call_start(
+        ctx,
+        &snapshot[start..],
+        started_at,
+        started_mono,
+    )
+    .await;
 
     if transcript.chars().count() > LOG_MAX_DISCORD_CHARS {
         let keep = LOG_MAX_DISCORD_CHARS.saturating_sub(48);
@@ -349,6 +358,41 @@ pub(super) async fn handle_log(
         "Recent transcript (last {} utterances):\n{}",
         requested_utterances, transcript
     ))
+}
+
+pub(super) async fn handle_summary(
+    ctx: &Context,
+    state: &Arc<AppState>,
+    command: &CommandInteraction,
+) -> anyhow::Result<String> {
+    let guild_id = command.guild_id.context("summary used outside guild")?;
+    let session_lock = state
+        .active_calls
+        .get(&guild_id)
+        .context("no active call for this guild")?
+        .clone();
+
+    let (mut snapshot, started_at) = {
+        let session = session_lock.read().await;
+        (session.transcript.clone(), session.started_at)
+    };
+    snapshot.sort_by_key(|utterance| utterance.start_ts);
+
+    if snapshot.is_empty() {
+        return Ok(
+            "No transcribed utterances yet. Try /summary again after someone speaks and pauses briefly."
+                .to_string(),
+        );
+    }
+
+    let transcript = super::summary::format_transcript(ctx, &snapshot, started_at).await;
+    let summary = state
+        .ai
+        .summarize_transcript(&transcript)
+        .await
+        .unwrap_or_else(|error| format!("ai error: {error}"));
+
+    Ok(summary)
 }
 
 pub(super) async fn handle_autojoin(

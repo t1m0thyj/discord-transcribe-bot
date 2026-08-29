@@ -2,7 +2,7 @@ use serde_json::json;
 
 use anyhow::Context as _;
 
-use super::{AiMessage, AiProviderConfig};
+use super::{send_with_retry, AiMessage, AiProviderConfig};
 
 pub(super) fn provider_config(
     api_key: Option<String>,
@@ -41,15 +41,17 @@ pub async fn generate_chat(
         })
         .collect();
 
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    );
+    let url =
+        format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
 
-    let http_resp = http
-        .post(&url)
-        .json(&json!({ "contents": contents }))
-        .send()
-        .await?;
+    let payload = json!({ "contents": contents });
+    let http_resp = send_with_retry("gemini", model, || {
+        http.post(&url)
+            .header("x-goog-api-key", api_key)
+            .json(&payload)
+            .send()
+    })
+    .await?;
 
     let status = http_resp.status();
     let resp: serde_json::Value = http_resp.json().await?;

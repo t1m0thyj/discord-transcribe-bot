@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serenity::all::{
-    ChannelId, Command, CommandInteraction, CommandOptionType, CreateCommand,
+    AutocompleteChoice, ChannelId, Command, CommandDataOptionValue, CommandInteraction,
+    CommandOptionType, CreateAllowedMentions, CreateAutocompleteResponse, CreateCommand,
     CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
     EditInteractionResponse, GuildId, Message, Permissions, UserId,
 };
@@ -35,6 +36,8 @@ pub(super) const STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(30);
 pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const THREAD_AI_COOLDOWN: Duration = Duration::from_secs(3);
+const ASK_PROMPT_HISTORY_MAX_ITEMS: usize = 10;
+const ASK_AUTOCOMPLETE_MAX_CHARS: usize = 100;
 
 fn endpoint_silence_ticks(endpoint_silence_ms: u64) -> u32 {
     ((endpoint_silence_ms.saturating_add(19) / 20) as u32).max(1)
@@ -115,6 +118,7 @@ pub struct AppState {
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
     pub thread_context_last_used: DashMap<ChannelId, Instant>,
     pub thread_ai_last_reply: DashMap<ChannelId, Instant>,
+    pub ask_prompt_history: DashMap<(UserId, Option<GuildId>), Vec<String>>,
     pub ai: Arc<AiClient>,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
@@ -155,6 +159,7 @@ impl AppState {
             transcript_threads: DashMap::new(),
             thread_context_last_used: DashMap::new(),
             thread_ai_last_reply: DashMap::new(),
+            ask_prompt_history: DashMap::new(),
             ai,
             live_transcript_debug: cfg.debug.log_live_transcript,
             enable_denoiser: cfg.audio.enable_denoiser,
@@ -226,11 +231,9 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
             .description("Leave voice and finalize transcript export")
             .default_member_permissions(Permissions::MOVE_MEMBERS),
         CreateCommand::new("status")
-            .description("Show live transcription status for this guild")
-            .default_member_permissions(Permissions::MOVE_MEMBERS),
+            .description("Show live transcription status for this guild"),
         CreateCommand::new("log")
             .description("Show recent committed transcript lines for the active call")
-            .default_member_permissions(Permissions::MOVE_MEMBERS)
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::Integer,
@@ -241,11 +244,13 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
             ),
         CreateCommand::new("ask")
             .description("Ask about the current call transcript")
-            .default_member_permissions(Permissions::MOVE_MEMBERS)
             .add_option(
                 CreateCommandOption::new(CommandOptionType::String, "question", "Question to ask")
-                    .required(true),
+                    .set_autocomplete(true)
+                .required(true),
             ),
+        CreateCommand::new("summary")
+            .description("Summarize the current call transcript"),
         CreateCommand::new("autojoin")
             .description("Mark your current voice channel for automatic future joins")
             .default_member_permissions(Permissions::MANAGE_CHANNELS)
@@ -276,6 +281,8 @@ pub async fn handle_slash_command(
     state: &Arc<AppState>,
     command: CommandInteraction,
 ) {
+    let command_text = format_slash_command(&command);
+    remember_ask_prompt(state, &command);
     let _ = command
         .create_response(
             &ctx.http,
@@ -289,18 +296,139 @@ pub async fn handle_slash_command(
         "status" => commands::handle_status(ctx, state, &command).await,
         "log" => commands::handle_log(ctx, state, &command).await,
         "ask" => commands::handle_ask(ctx, state, &command).await,
+        "summary" => commands::handle_summary(ctx, state, &command).await,
         "autojoin" => commands::handle_autojoin(ctx, state, &command).await,
         _ => Ok("Unknown command".to_string()),
     };
 
-    let content = match result {
+    let result = match result {
         Ok(msg) => msg,
         Err(err) => format!("error: {err:#}"),
     };
+    let content = format!("**Command:** {command_text}\n\n{result}");
 
     let _ = command
-        .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+        .edit_response(
+            &ctx.http,
+            EditInteractionResponse::new()
+                .content(content)
+                .allowed_mentions(CreateAllowedMentions::new()),
+        )
         .await;
+}
+
+pub async fn handle_autocomplete(
+    ctx: &Context,
+    state: &Arc<AppState>,
+    command: CommandInteraction,
+) {
+    let input = command
+        .data
+        .options
+        .iter()
+        .find_map(|option| match &option.value {
+            CommandDataOptionValue::Autocomplete { value, .. } if option.name == "question" => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let choices = if command.data.name == "ask" {
+        state
+            .ask_prompt_history
+            .get(&(command.user.id, command.guild_id))
+            .map(|history| autocomplete_prompt_choices(&history, input))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if let Err(error) = command
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(choices),
+            ),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "failed to send command autocomplete choices");
+    }
+}
+
+fn remember_ask_prompt(state: &Arc<AppState>, command: &CommandInteraction) {
+    if command.data.name != "ask" {
+        return;
+    }
+
+    let Some(prompt) = command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "question")
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::String(value) => Some(value.trim()),
+            _ => None,
+        })
+        .filter(|prompt| !prompt.is_empty())
+    else {
+        return;
+    };
+
+    let mut history = state
+        .ask_prompt_history
+        .entry((command.user.id, command.guild_id))
+        .or_default();
+    update_prompt_history(&mut history, prompt.to_string());
+}
+
+fn update_prompt_history(history: &mut Vec<String>, prompt: String) {
+    history.retain(|previous| previous != &prompt);
+    history.insert(0, prompt);
+    history.truncate(ASK_PROMPT_HISTORY_MAX_ITEMS);
+}
+
+fn autocomplete_prompt_choices(history: &[String], input: &str) -> Vec<AutocompleteChoice> {
+    matching_prompt_values(history, input)
+        .into_iter()
+        .map(|prompt| AutocompleteChoice::from(prompt))
+        .collect()
+}
+
+fn matching_prompt_values(history: &[String], input: &str) -> Vec<String> {
+    let input = input.trim().to_lowercase();
+    history
+        .iter()
+        .filter(|prompt| prompt.chars().count() <= ASK_AUTOCOMPLETE_MAX_CHARS)
+        .filter(|prompt| input.is_empty() || prompt.to_lowercase().contains(&input))
+        .take(ASK_PROMPT_HISTORY_MAX_ITEMS)
+        .cloned()
+        .collect()
+}
+
+fn format_slash_command(command: &CommandInteraction) -> String {
+    let mut text = format!("/{}", command.data.name);
+    for option in &command.data.options {
+        let value = match &option.value {
+            CommandDataOptionValue::String(value)
+            | CommandDataOptionValue::Autocomplete { value, .. } => value.clone(),
+            CommandDataOptionValue::Boolean(value) => value.to_string(),
+            CommandDataOptionValue::Integer(value) => value.to_string(),
+            CommandDataOptionValue::Number(value) => value.to_string(),
+            CommandDataOptionValue::Channel(value) => format!("<#{}>", value.get()),
+            CommandDataOptionValue::User(value) => format!("<@{}>", value.get()),
+            CommandDataOptionValue::Role(value) => format!("<@&{}>", value.get()),
+            CommandDataOptionValue::Mentionable(value) => value.get().to_string(),
+            CommandDataOptionValue::Attachment(value) => value.get().to_string(),
+            CommandDataOptionValue::SubCommand(_)
+            | CommandDataOptionValue::SubCommandGroup(_)
+            | CommandDataOptionValue::Unknown(_) => continue,
+        };
+        text.push(' ');
+        text.push_str(&value);
+    }
+    text
 }
 
 pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) {
@@ -330,11 +458,13 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
         let prior_turns = thread_ctx.history.clone();
         drop(thread_ctx);
 
+        let typing = msg.channel_id.start_typing(&ctx.http);
         let answer = state
             .ai
             .ask(&transcript, &question, Some(&prior_turns))
         .await
         .unwrap_or_else(|e| format!("ai error: {e}"));
+        drop(typing);
 
         let _ = msg.channel_id.say(&ctx.http, &answer).await;
 
@@ -357,7 +487,10 @@ pub use session::maybe_finalize_on_empty_voice_channel;
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_silence_ticks;
+    use super::{
+        endpoint_silence_ticks, matching_prompt_values, update_prompt_history,
+        ASK_PROMPT_HISTORY_MAX_ITEMS,
+    };
 
     #[test]
     fn endpoint_silence_ticks_rounds_up_and_never_zero() {
@@ -365,5 +498,40 @@ mod tests {
         assert_eq!(endpoint_silence_ticks(401), 21);
         assert_eq!(endpoint_silence_ticks(80), 4);
         assert_eq!(endpoint_silence_ticks(1), 1);
+    }
+
+    #[test]
+    fn ask_prompt_history_deduplicates_and_keeps_most_recent_items() {
+        let mut history = vec!["older".to_string(), "same".to_string()];
+        update_prompt_history(&mut history, "same".to_string());
+        assert_eq!(history, ["same", "older"]);
+
+        for index in 0..ASK_PROMPT_HISTORY_MAX_ITEMS {
+            update_prompt_history(&mut history, format!("prompt {index}"));
+        }
+        assert_eq!(history.len(), ASK_PROMPT_HISTORY_MAX_ITEMS);
+        assert_eq!(
+            history[0],
+            format!("prompt {}", ASK_PROMPT_HISTORY_MAX_ITEMS - 1)
+        );
+    }
+
+    #[test]
+    fn autocomplete_matches_recent_prompts_without_returning_long_values() {
+        let long_prompt = "x".repeat(101);
+        let history = vec![
+            "When does the project ship?".to_string(),
+            "What did we decide?".to_string(),
+            long_prompt,
+        ];
+
+        assert_eq!(
+            matching_prompt_values(&history, "decide"),
+            ["What did we decide?"]
+        );
+        assert_eq!(
+            matching_prompt_values(&history, ""),
+            ["When does the project ship?", "What did we decide?"]
+        );
     }
 }

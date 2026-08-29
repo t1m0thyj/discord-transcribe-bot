@@ -23,8 +23,14 @@ struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Command(command) = interaction {
-            app::handle_slash_command(&ctx, &self.state, command).await;
+        match interaction {
+            Interaction::Command(command) => {
+                app::handle_slash_command(&ctx, &self.state, command).await;
+            }
+            Interaction::Autocomplete(command) => {
+                app::handle_autocomplete(&ctx, &self.state, command).await;
+            }
+            _ => {}
         }
     }
 

@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use serde_json::json;
 
-use super::{AiMessage, AiProviderConfig};
+use super::{send_with_retry, AiMessage, AiProviderConfig};
 
 const DEFAULT_MODEL: &str = "openrouter/free";
 const CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -40,13 +40,15 @@ pub async fn generate_chat(
         })
         .collect();
 
-    let http_resp = http
-        .post(CHAT_COMPLETIONS_URL)
-        .bearer_auth(api_key)
-        .header("X-OpenRouter-Title", "discord-live-transcribe")
-        .json(&json!({ "model": model, "messages": messages }))
-        .send()
-        .await?;
+    let payload = json!({ "model": model, "messages": messages });
+    let http_resp = send_with_retry("openrouter", model, || {
+        http.post(CHAT_COMPLETIONS_URL)
+            .bearer_auth(api_key)
+            .header("X-OpenRouter-Title", "discord-live-transcribe")
+            .json(&payload)
+            .send()
+    })
+    .await?;
 
     let status = http_resp.status();
     let response: serde_json::Value = http_resp.json().await?;

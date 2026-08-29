@@ -15,8 +15,33 @@ pub(super) async fn format_transcript(
     transcript: &[Utterance],
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> String {
+    format_transcript_with_timeline_start(
+        ctx,
+        transcript,
+        started_at,
+        transcript.first().map(|utterance| utterance.start_ts),
+    )
+    .await
+}
+
+pub(super) async fn format_transcript_from_call_start(
+    ctx: &Context,
+    transcript: &[Utterance],
+    started_at: chrono::DateTime<chrono::Utc>,
+    call_started_mono: std::time::Instant,
+) -> String {
+    format_transcript_with_timeline_start(ctx, transcript, started_at, Some(call_started_mono))
+        .await
+}
+
+async fn format_transcript_with_timeline_start(
+    ctx: &Context,
+    transcript: &[Utterance],
+    started_at: chrono::DateTime<chrono::Utc>,
+    timeline_start: Option<std::time::Instant>,
+) -> String {
     let by_user = resolve_display_names(ctx, transcript).await;
-    let mut lines = build_transcript_lines(transcript, &by_user);
+    let mut lines = build_transcript_lines(transcript, &by_user, timeline_start);
 
     lines.insert(0, String::new());
     lines.insert(0, "## Transcript".to_string());
@@ -94,7 +119,11 @@ fn format_export_markdown_with_names(
     }
     out.push("## Transcript".to_string());
     out.push(String::new());
-    out.extend(build_transcript_lines(transcript, &by_user));
+    out.extend(build_transcript_lines(
+        transcript,
+        &by_user,
+        transcript.first().map(|utterance| utterance.start_ts),
+    ));
     out.push(String::new());
 
     out.join("\n")
@@ -129,10 +158,7 @@ pub(super) async fn maybe_generate_post_call_summary(
                 Some(summary)
             }
         }
-        Err(e) => {
-            tracing::warn!("auto-summary failed: {e:#}");
-            None
-        }
+        Err(_) => None,
     }
 }
 
@@ -180,13 +206,17 @@ fn attendees_in_order(transcript: &[Utterance], by_user: &HashMap<UserId, String
     attendees
 }
 
-fn build_transcript_lines(transcript: &[Utterance], by_user: &HashMap<UserId, String>) -> Vec<String> {
+fn build_transcript_lines(
+    transcript: &[Utterance],
+    by_user: &HashMap<UserId, String>,
+    timeline_start: Option<std::time::Instant>,
+) -> Vec<String> {
     if transcript.is_empty() {
         return vec!["_No captured speech._".to_string()];
     }
 
     let mut lines = Vec::with_capacity(transcript.len());
-    let first = transcript[0].start_ts;
+    let timeline_start = timeline_start.unwrap_or(transcript[0].start_ts);
 
     for utt in transcript {
         let display = by_user
@@ -194,7 +224,7 @@ fn build_transcript_lines(transcript: &[Utterance], by_user: &HashMap<UserId, St
             .cloned()
             .unwrap_or_else(|| format!("{}", utt.user_id.get()));
 
-        let delta = utt.start_ts.saturating_duration_since(first);
+        let delta = utt.start_ts.saturating_duration_since(timeline_start);
         let stamp = format_transcript_stamp(delta);
         lines.push(format!("[{display} {stamp}] {}", utt.text));
     }
@@ -279,12 +309,21 @@ mod tests {
         let names = HashMap::from([(UserId::new(123), "Alice".to_string())]);
 
         assert_eq!(
-            build_transcript_lines(&transcript, &names),
+            build_transcript_lines(&transcript, &names, Some(started)),
             vec!["[Alice 0:00] Hello", "[456 1:05] Hi there"]
         );
         assert_eq!(
-            build_transcript_lines(&[], &names),
+            build_transcript_lines(&[], &names, Some(started)),
             vec!["_No captured speech._"]
+        );
+
+        assert_eq!(
+            build_transcript_lines(
+                &transcript,
+                &names,
+                Some(started - Duration::from_secs(305)),
+            ),
+            vec!["[Alice 5:05] Hello", "[456 6:10] Hi there"]
         );
     }
 
