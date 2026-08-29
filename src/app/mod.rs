@@ -118,6 +118,7 @@ pub struct AppState {
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
     pub thread_context_last_used: DashMap<ChannelId, Instant>,
     pub thread_ai_last_reply: DashMap<ChannelId, Instant>,
+    pub thread_summary_locks: DashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>,
     pub ask_prompt_history: DashMap<(UserId, Option<GuildId>), Vec<String>>,
     pub ai: Arc<AiClient>,
     pub live_transcript_debug: bool,
@@ -159,6 +160,7 @@ impl AppState {
             transcript_threads: DashMap::new(),
             thread_context_last_used: DashMap::new(),
             thread_ai_last_reply: DashMap::new(),
+            thread_summary_locks: DashMap::new(),
             ask_prompt_history: DashMap::new(),
             ai,
             live_transcript_debug: cfg.debug.log_live_transcript,
@@ -203,6 +205,7 @@ fn evict_thread_contexts_if_needed(state: &Arc<AppState>) {
         state.transcript_threads.remove(&channel_id);
         state.thread_context_last_used.remove(&channel_id);
         state.thread_ai_last_reply.remove(&channel_id);
+        state.thread_summary_locks.remove(&channel_id);
     }
 }
 
@@ -250,7 +253,7 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
                 .required(true),
             ),
         CreateCommand::new("summary")
-            .description("Summarize the current call transcript"),
+            .description("Summarize the active call or a completed transcript thread"),
         CreateCommand::new("autojoin")
             .description("Mark your current voice channel for automatic future joins")
             .default_member_permissions(Permissions::MANAGE_CHANNELS)

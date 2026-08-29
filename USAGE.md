@@ -142,6 +142,7 @@ Choose one provider for `/ask` and optional call summaries. Speech transcription
 | `/status` | Show receive, queue, decode, and transcript health counters. |
 | `/log` | Show recent committed transcript lines. |
 | `/ask` | Ask the configured AI provider about the active call transcript. |
+| `/summary` | Summarize the active call, or generate/retry a summary from a completed transcript thread. |
 | `/autojoin` | Mark or unmark a voice channel for automatic transcription. |
 | `/leave` | Leave voice and finalize the transcript export. |
 
@@ -149,7 +150,7 @@ Choose one provider for `/ask` and optional call summaries. Speech transcription
 
 The bot supports one active transcription session per guild. After `/join`, it posts a waiting status and begins local speech recognition. On first usable speech, it posts a start confirmation.
 
-When a call ends, the bot uploads a Markdown transcript and creates a thread from that message. Questions in the thread use the committed transcript context. After a restart, the bot can reload the thread context from the transcript attachment, subject to its attachment-size limit.
+When a call ends, the bot uploads a Markdown transcript and creates a thread from that message. Questions in the thread use the committed transcript context; run `/summary` in that thread to generate or retry its meeting summary. After a restart, the bot can reload the thread context from the transcript attachment, subject to its attachment-size limit.
 
 Optional post-call summaries are configured under `[summary]` in `config.toml` and are disabled by default.
 

@@ -86,7 +86,7 @@ pub async fn finalize_call_for_guild(
             &ctx.http,
             vec![attachment],
             CreateMessage::new().content(
-                "Call transcript attached. Ask AI questions in the thread on this message.",
+                "Call transcript attached. Ask questions or run /summary in the thread.",
             ),
         )
         .await?;

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
+use serenity::builder::GetMessages;
 use serenity::all::{ChannelType, CommandDataOptionValue, CommandInteraction};
 use serenity::prelude::Context;
 
@@ -365,6 +366,18 @@ pub(super) async fn handle_summary(
     state: &Arc<AppState>,
     command: &CommandInteraction,
 ) -> anyhow::Result<String> {
+    let is_thread = command.channel.as_ref().is_some_and(|channel| {
+        matches!(
+            channel.kind,
+            ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+        )
+    });
+    if is_thread {
+        if let Some(result) = handle_completed_thread_summary(ctx, state, command).await? {
+            return Ok(result);
+        }
+    }
+
     let guild_id = command.guild_id.context("summary used outside guild")?;
     let session_lock = state
         .active_calls
@@ -386,13 +399,99 @@ pub(super) async fn handle_summary(
     }
 
     let transcript = super::summary::format_transcript(ctx, &snapshot, started_at).await;
-    let summary = state
-        .ai
-        .summarize_transcript(&transcript)
-        .await
-        .unwrap_or_else(|error| format!("ai error: {error}"));
+    let summary = match state.ai.summarize_transcript(&transcript).await {
+        Ok(summary) if !summary.trim().is_empty() => summary,
+        Ok(_) => return Ok("ai error: provider returned no text".to_string()),
+        Err(error) => return Ok(format!("ai error: {error}")),
+    };
 
     Ok(summary)
+}
+
+async fn handle_completed_thread_summary(
+    ctx: &Context,
+    state: &Arc<AppState>,
+    command: &CommandInteraction,
+) -> anyhow::Result<Option<String>> {
+    super::session::maybe_load_thread_context(ctx, state, command.channel_id).await?;
+
+    if !state.transcript_threads.contains_key(&command.channel_id) {
+        return Ok(None);
+    }
+
+    let summary_lock = state
+        .thread_summary_locks
+        .entry(command.channel_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _summary_guard = summary_lock.lock().await;
+
+    if let Some(existing_link) = find_existing_thread_summary(ctx, command.channel_id).await? {
+        return Ok(Some(format!(
+            "A meeting summary was already posted in this thread: {existing_link}"
+        )));
+    }
+
+    let transcript = state
+        .transcript_threads
+        .get(&command.channel_id)
+        .map(|thread_context| thread_context.transcript.clone())
+        .context("transcript thread context was evicted while preparing summary")?;
+
+    if let Some(cached_summary) = super::summary::cached_summary_from_export_markdown(&transcript)
+    {
+        let posted = command
+            .channel_id
+            .say(
+                &ctx.http,
+                super::summary::format_summary_thread_message(&cached_summary),
+            )
+            .await
+            .context("failed to post cached summary in transcript thread")?;
+        return Ok(Some(format!(
+            "Meeting summary posted in this thread: {}",
+            posted.link()
+        )));
+    }
+
+    let typing = command.channel_id.start_typing(&ctx.http);
+    let summary = match state.ai.summarize_transcript(&transcript).await {
+        Ok(summary) if !summary.trim().is_empty() => summary,
+        Ok(_) => return Ok(Some("ai error: provider returned no text".to_string())),
+        Err(error) => return Ok(Some(format!("ai error: {error}"))),
+    };
+    drop(typing);
+
+    let summary_message = super::summary::format_summary_thread_message(&summary);
+    let posted = command
+        .channel_id
+        .say(&ctx.http, summary_message)
+        .await
+        .context("failed to post summary in transcript thread")?;
+
+    Ok(Some(format!(
+        "Meeting summary posted in this thread: {}",
+        posted.link()
+    )))
+}
+
+async fn find_existing_thread_summary(
+    ctx: &Context,
+    thread_id: serenity::all::ChannelId,
+) -> anyhow::Result<Option<String>> {
+    let bot_id = ctx.cache.current_user().id;
+    let messages = thread_id
+        .messages(&ctx.http, GetMessages::new().limit(100))
+        .await
+        .context("failed to inspect transcript thread for an existing summary")?;
+
+    Ok(messages
+        .into_iter()
+        .find(|message| {
+            message.author.id == bot_id
+                && super::summary::is_summary_thread_message(&message.content)
+        })
+        .map(|message| message.link()))
 }
 
 pub(super) async fn handle_autojoin(

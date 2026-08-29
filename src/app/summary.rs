@@ -9,6 +9,7 @@ use serenity::prelude::Context;
 use super::{AppState, Utterance};
 
 const THREAD_SUMMARY_MAX_CHARS: usize = 1_800;
+const THREAD_SUMMARY_HEADER: &str = "## Meeting summary";
 
 pub(super) async fn format_transcript(
     ctx: &Context,
@@ -168,13 +169,30 @@ pub(super) fn format_summary_thread_message(summary: &str) -> String {
         return String::new();
     }
 
-    let mut message = trimmed.to_string();
-    if message.chars().count() > THREAD_SUMMARY_MAX_CHARS {
-        let keep = THREAD_SUMMARY_MAX_CHARS.saturating_sub(18);
-        let truncated: String = message.chars().take(keep).collect();
-        message = format!("{truncated}\n\n(truncated)");
-    }
+    let prefix = format!("{THREAD_SUMMARY_HEADER}\n\n");
+    let max_summary_chars = THREAD_SUMMARY_MAX_CHARS.saturating_sub(prefix.chars().count());
+    let message_body = if trimmed.chars().count() > max_summary_chars {
+        let keep = max_summary_chars.saturating_sub(18);
+        let truncated: String = trimmed.chars().take(keep).collect();
+        format!("{truncated}\n\n(truncated)")
+    } else {
+        trimmed.to_string()
+    };
+
+    format!("{prefix}{message_body}")
+}
+
+pub(super) fn is_summary_thread_message(message: &str) -> bool {
     message
+        .lines()
+        .any(|line| line.trim() == THREAD_SUMMARY_HEADER)
+}
+
+pub(super) fn cached_summary_from_export_markdown(markdown: &str) -> Option<String> {
+    let (_, body) = markdown.split_once("\n---\n")?;
+    let (summary, _) = body.split_once("\n## Transcript\n")?;
+    let summary = summary.trim();
+    (!summary.is_empty()).then(|| summary.to_string())
 }
 
 async fn resolve_display_names(ctx: &Context, transcript: &[Utterance]) -> HashMap<UserId, String> {
@@ -280,8 +298,9 @@ mod tests {
     use serenity::all::UserId;
 
     use super::{
-        build_transcript_lines, format_call_title, format_duration, format_export_markdown_with_names,
-        format_summary_thread_message, format_transcript_stamp, yaml_escape_double_quoted,
+        build_transcript_lines, cached_summary_from_export_markdown, format_call_title,
+        format_duration, format_export_markdown_with_names, format_summary_thread_message,
+        format_transcript_stamp, is_summary_thread_message, yaml_escape_double_quoted,
         yaml_single_line_scalar,
     };
     use crate::app::Utterance;
@@ -366,8 +385,29 @@ mod tests {
     fn summary_thread_message_truncates_long_content() {
         let long = "a".repeat(2_100);
         let message = format_summary_thread_message(&long);
+        assert!(message.starts_with("## Meeting summary\n\n"));
         assert!(message.ends_with("\n\n(truncated)"));
         assert!(message.chars().count() <= 1_800);
+    }
+
+    #[test]
+    fn summary_thread_message_is_identifiable_after_a_slash_response_prefix() {
+        let message = format!(
+            "**Command:** /summary\n\n{}",
+            format_summary_thread_message("The decision is recorded.")
+        );
+        assert!(is_summary_thread_message(&message));
+        assert!(!is_summary_thread_message("A user asked for a summary."));
+    }
+
+    #[test]
+    fn cached_summary_is_read_from_export_markdown() {
+        let markdown = "---\ntitle: \"Call\"\n---\n\n## Decisions\n\nUse retries.\n\n## Transcript\n\n[Alex 0:00] Hello";
+        assert_eq!(
+            cached_summary_from_export_markdown(markdown).as_deref(),
+            Some("## Decisions\n\nUse retries.")
+        );
+        assert!(cached_summary_from_export_markdown("---\ntitle: \"Call\"\n---\n\n## Transcript\n").is_none());
     }
 
     #[test]
