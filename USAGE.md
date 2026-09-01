@@ -37,14 +37,14 @@ Grant the bot role the following permissions in the text and voice channels wher
 
 | Permission | Why the bot needs it |
 | --- | --- |
+| Manage Channels | Required only when using `/autojoin`, which adds or removes the channel-name suffix. |
 | View Channels | See the configured text channel and join the selected voice channel. |
 | Send Messages | Post command responses and the completed-call transcript message. |
-| Send Messages in Threads | Reply to transcript-thread questions and post automatic summaries. |
-| Read Message History | Reload transcript attachments when the bot is restarted. |
-| Attach Files | Upload the final Markdown transcript. |
 | Create Public Threads | Create the public discussion thread for each transcript. |
+| Send Messages in Threads | Reply to transcript-thread questions and post automatic summaries. |
+| Attach Files | Upload the final Markdown transcript. |
+| Read Message History | Reload transcript attachments when the bot is restarted. |
 | Connect | Join the voice channel and receive its audio. |
-| Manage Channels | Required only when using `/autojoin`, which adds or removes the channel-name suffix. |
 
 The bot does not need **Speak**: it receives audio but does not send audio. Apply channel overrides if the bot should be limited to particular meeting channels.
 
@@ -122,6 +122,42 @@ If you prefer a provider-specific variable such as `GEMINI_API_KEY` or `OPENROUT
 3. Speak normally. The bot replies when it starts receiving usable speech.
 4. Use `/status` if speech is not appearing or the call is under load.
 5. Run `/leave`, or let the channel empty, to finalize and upload the transcript.
+
+## Keeping the bot running
+
+### Linux
+
+Manage the bot with a systemd user service. Replace `/home/you/transcribe-bot` with the directory containing the binary, `.env`, and `config.toml`:
+
+```ini
+# ~/.config/systemd/user/transcribe-bot.service
+[Unit]
+Description=Discord Transcribe Bot
+
+[Service]
+WorkingDirectory=/home/you/transcribe-bot
+ExecStart=/home/you/transcribe-bot/transcribe-bot
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Create the file, then enable and inspect it with:
+
+```bash
+mkdir -p ~/.config/systemd/user
+systemctl --user daemon-reload
+systemctl --user enable --now transcribe-bot
+sudo loginctl enable-linger "$USER" # keep it running after logout and reboot
+journalctl --user -u transcribe-bot -f
+```
+
+### Other Platforms
+
+* _Windows_ - Use [Task Scheduler](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page) to run `transcribe-bot.exe` at startup, set its “Start in” directory, and enable restart on failure.
+* _macOS_ - Use a [launchd LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html) to run the binary at login, set its working directory, and use `KeepAlive` to restart it after failure.
 
 ## Commands
 

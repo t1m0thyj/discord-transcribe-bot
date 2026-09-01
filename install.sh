@@ -70,4 +70,4 @@ fi
 chmod +x "$binary" 2>/dev/null || true
 
 printf 'Installed %s in %s\n' "$binary" "$PWD"
-printf 'Next: %s init\n' "$binary"
+printf 'To configure it, run: %s init\n' "$binary"
