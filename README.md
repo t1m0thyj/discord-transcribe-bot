@@ -33,7 +33,13 @@ On Windows, use the Visual Studio Build Tools C++ workload. The workspace includ
 
 ## Installing A Prebuilt Binary
 
-Download the binary matching your platform from a published release or the corresponding GitHub Actions build artifact and put it in an empty directory. Run `transcribe-bot init` there, complete [configuration](#configuring), then start the binary from that directory.
+From the directory where the bot should run, download the matching artifact from the latest successful GitHub Actions build:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/t1m0thyj/discord-transcribe-bot/main/install.sh | sh
+```
+
+The installer extracts the binary into the current directory and removes the downloaded archive. Run `./transcribe-bot init` there, complete [configuration](#configuring), then start the binary from that directory. On Windows, use `./transcribe-bot.exe`.
 
 ## How It Works
 
