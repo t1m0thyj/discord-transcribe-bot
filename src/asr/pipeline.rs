@@ -7,7 +7,7 @@ use serenity::all::{GuildId, UserId};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 
 use super::frontend::{compute_rms, IngestFrontend};
-use super::models::{configure_model, resolve_model_dir};
+use super::models::{configure_model, resolve_model_dir, WHISPER_EN_TAIL_PADDING_FRAMES};
 
 const VAD_HANGOVER_MS: u32 = 256;
 const DISPATCH_GATE_MIN_VOICED_TICKS: u32 = 5;
@@ -101,8 +101,9 @@ impl AsrEngine {
         );
 
         if selected_backend.contains("whisper") {
-            tracing::warn!(
-                "Whisper backend selected: offline decode cost is effectively fixed by padded context; short conversational turns may incur high latency/backlog."
+            tracing::info!(
+                tail_padding_frames = WHISPER_EN_TAIL_PADDING_FRAMES,
+                "Whisper backend selected with English-optimized tail padding"
             );
         }
 

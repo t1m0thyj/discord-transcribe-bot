@@ -9,6 +9,8 @@ use sherpa_onnx::{
     OfflineZipformerCtcModelConfig,
 };
 
+pub(super) const WHISPER_EN_TAIL_PADDING_FRAMES: i32 = 50;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForcedFamily {
     Paraformer,
@@ -196,6 +198,23 @@ fn try_transducer(cfg: &mut OfflineRecognizerConfig, dir: &Path) -> Option<&'sta
         joiner: Some(joiner.to_string_lossy().to_string()),
     };
     cfg.model_config.tokens = Some(tokens.to_string_lossy().to_string());
+
+    // NeMo transducers use a different decoder implementation. Defining it here
+    // lets sherpa skip loading the encoder once just to inspect its metadata.
+    let dir_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if dir_name.contains("nemo")
+        || dir_name.contains("parakeet")
+        || dir_name.contains("giga-am")
+        || dir_name.contains("giga_am")
+        || dir_name.contains("gigaam")
+    {
+        cfg.model_config.model_type = Some("nemo_transducer".to_string());
+    }
+
     Some("transducer (Zipformer / NeMo Parakeet-style)")
 }
 
@@ -248,7 +267,7 @@ fn try_whisper(cfg: &mut OfflineRecognizerConfig, dir: &Path) -> anyhow::Result<
         decoder: Some(decoder.to_string_lossy().to_string()),
         language: Some("en".to_string()),
         task: Some("transcribe".to_string()),
-        tail_paddings: -1,
+        tail_paddings: WHISPER_EN_TAIL_PADDING_FRAMES,
         enable_token_timestamps: false,
         enable_segment_timestamps: false,
     };
@@ -285,7 +304,7 @@ fn try_single_file_family(
     dir: &Path,
     forced_family_hint: Option<&str>,
 ) -> anyhow::Result<Option<&'static str>> {
-    let model = ["model.onnx", "model.int8.onnx"]
+    let model = ["model.int8.onnx", "model.onnx"]
         .iter()
         .map(|f| dir.join(f))
         .find(|p| p.is_file());
@@ -349,7 +368,7 @@ mod tests {
 
     use sherpa_onnx::OfflineRecognizerConfig;
 
-    use super::{ForcedFamily, configure_model};
+    use super::{configure_model, ForcedFamily, WHISPER_EN_TAIL_PADDING_FRAMES};
 
     struct TempDir(PathBuf);
 
@@ -448,6 +467,45 @@ mod tests {
 
         assert_eq!(label, "transducer (Zipformer / NeMo Parakeet-style)");
         assert!(cfg.model_config.transducer.encoder.unwrap().contains("int8"));
+        assert_eq!(cfg.model_config.model_type, None);
+    }
+
+    #[test]
+    fn configures_nemo_transducer_type_for_parakeet() {
+        let dir = test_temp_dir("nemo-parakeet-transducer");
+        write_files(
+            dir.path(),
+            &[
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt",
+            ],
+        );
+        let mut cfg = OfflineRecognizerConfig::default();
+        configure_model(&mut cfg, dir.path(), None).expect("Parakeet config");
+
+        assert_eq!(
+            cfg.model_config.model_type.as_deref(),
+            Some("nemo_transducer")
+        );
+    }
+
+    #[test]
+    fn single_file_family_prefers_int8_when_both_variants_exist() {
+        let dir = test_temp_dir("single-file-int8-preference");
+        write_files(dir.path(), &["model.onnx", "model.int8.onnx", "tokens.txt"]);
+
+        let mut cfg = OfflineRecognizerConfig::default();
+        configure_model(&mut cfg, dir.path(), Some("nemo_ctc")).expect("single-file model config");
+
+        assert!(cfg
+            .model_config
+            .nemo_ctc
+            .model
+            .as_deref()
+            .expect("configured model")
+            .ends_with("model.int8.onnx"));
     }
 
     #[test]
@@ -480,7 +538,14 @@ mod tests {
             dir.path(),
             &["base.en-encoder.onnx", "base.en-decoder.onnx", "base.en-tokens.txt"],
         );
-        assert_eq!(configured_label(dir.path()), "whisper");
+        let mut cfg = OfflineRecognizerConfig::default();
+        let label = configure_model(&mut cfg, dir.path(), None).expect("whisper config");
 
+        assert_eq!(label, "whisper");
+        assert_eq!(
+            cfg.model_config.whisper.tail_paddings,
+            WHISPER_EN_TAIL_PADDING_FRAMES
+        );
+        assert_eq!(cfg.model_config.whisper.language.as_deref(), Some("en"));
     }
 }
