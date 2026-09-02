@@ -6,6 +6,12 @@ base_url = "http://127.0.0.1:11434/v1"
 # Optional environment variable containing the bearer token.
 # api_key_env = "OPENAI_API_KEY"
 
+# Rolling AI generation limits. Set any limit to 0 to disable it.
+[ai.rate_limits]
+user_per_minute = 5
+user_per_hour = 20
+guild_per_hour = 100
+
 [asr]
 model_dir = "models/sherpa-onnx-moonshine-base-en-int8"
 # Only needed for single-file model.onnx families that cannot be inferred.

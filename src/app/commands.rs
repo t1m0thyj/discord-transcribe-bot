@@ -7,7 +7,10 @@ use serenity::builder::GetMessages;
 use serenity::prelude::Context;
 
 use super::autojoin::{normalized_autojoin_suffix, strip_known_autojoin_suffix};
-use super::{AppState, LOG_DEFAULT_UTTERANCES, LOG_MAX_DISCORD_CHARS};
+use super::{
+    ai_request_rejection_message, try_begin_ai_request, AppState, LOG_DEFAULT_UTTERANCES,
+    LOG_MAX_DISCORD_CHARS,
+};
 use crate::asr::{decode_queue_capacity, decode_queue_depth};
 
 pub(super) async fn handle_join(
@@ -279,6 +282,10 @@ pub(super) async fn handle_ask(
         );
     }
 
+    if let Err(rejection) = try_begin_ai_request(state, guild_id, Some(command.user.id)) {
+        return Ok(ai_request_rejection_message(rejection));
+    }
+
     let transcript = super::summary::format_transcript(ctx, &snapshot, started_at).await;
 
     let answer = state
@@ -395,6 +402,10 @@ pub(super) async fn handle_summary(
         );
     }
 
+    if let Err(rejection) = try_begin_ai_request(state, guild_id, Some(command.user.id)) {
+        return Ok(ai_request_rejection_message(rejection));
+    }
+
     let transcript = super::summary::format_transcript(ctx, &snapshot, started_at).await;
     let summary = match state.ai.summarize_transcript(&transcript).await {
         Ok(summary) if !summary.trim().is_empty() => summary,
@@ -448,6 +459,11 @@ async fn handle_completed_thread_summary(
             "Meeting summary posted in this thread: {}",
             posted.link()
         )));
+    }
+
+    let guild_id = command.guild_id.context("summary used outside guild")?;
+    if let Err(rejection) = try_begin_ai_request(state, guild_id, Some(command.user.id)) {
+        return Ok(Some(ai_request_rejection_message(rejection)));
     }
 
     let typing = command.channel_id.start_typing(&ctx.http);

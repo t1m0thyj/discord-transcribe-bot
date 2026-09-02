@@ -113,7 +113,7 @@ If you prefer a provider-specific variable such as `GEMINI_API_KEY` or `OPENROUT
 	api_key_env = "OPENROUTER_API_KEY"
 	```
 
-`[ai].request_timeout` is the maximum time the API may go without sending response data. Set `[ai].api_key_env` for hosted APIs that require authentication; the named environment variable must then be present and non-empty. When `api_key_env` is omitted, the bot sends no authentication header.
+`[ai].request_timeout` is the maximum time the API may go without sending response data. Set `[ai].api_key_env` for hosted APIs that require authentication; the named environment variable must then be present and non-empty. When `api_key_env` is omitted, the bot sends no authentication header. AI requests are rate limited by default. Configure these under `[ai.rate_limits]`; set any limit to `0` to disable it.
 
 ## First Call
 

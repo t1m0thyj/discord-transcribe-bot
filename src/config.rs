@@ -22,6 +22,14 @@ pub struct AppConfig {
 pub struct AiRuntimeConfig {
     pub provider: AiProviderConfig,
     pub request_timeout: u64,
+    pub rate_limits: AiRateLimitConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiRateLimitConfig {
+    pub user_per_minute: Option<usize>,
+    pub user_per_hour: Option<usize>,
+    pub guild_per_hour: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +86,7 @@ impl AppConfig {
             .and_then(|ai| ai.request_timeout)
             .filter(|v| *v >= 5)
             .unwrap_or(30);
+        let ai_rate_limits = resolve_ai_rate_limits(file_cfg.ai.as_ref());
 
         let detected_cores = std::thread::available_parallelism()
             .map(|n| n.get() as i32)
@@ -121,6 +130,7 @@ impl AppConfig {
             ai: AiRuntimeConfig {
                 provider: ai_provider,
                 request_timeout: ai_request_timeout,
+                rate_limits: ai_rate_limits,
             },
             asr,
             audio: AudioRuntimeConfig { enable_denoiser },
@@ -155,6 +165,7 @@ struct FileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct AiSection {
     request_timeout: Option<u64>,
+    rate_limits: Option<AiRateLimitsSection>,
     model: Option<String>,
     base_url: Option<String>,
     api_key_env: Option<String>,
@@ -169,6 +180,31 @@ fn resolve_ai_api_key(section: Option<&AiSection>) -> anyhow::Result<Option<Stri
         .map(required_nonempty_env)
         .transpose()
         .with_context(|| "reading [ai].api_key_env")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AiRateLimitsSection {
+    user_per_minute: Option<usize>,
+    user_per_hour: Option<usize>,
+    guild_per_hour: Option<usize>,
+}
+
+fn resolve_ai_rate_limits(section: Option<&AiSection>) -> AiRateLimitConfig {
+    let rate_limits = section.and_then(|ai| ai.rate_limits.as_ref());
+    AiRateLimitConfig {
+        user_per_minute: rate_limits
+            .and_then(|limits| limits.user_per_minute)
+            .or(Some(5))
+            .filter(|limit| *limit > 0),
+        user_per_hour: rate_limits
+            .and_then(|limits| limits.user_per_hour)
+            .or(Some(30))
+            .filter(|limit| *limit > 0),
+        guild_per_hour: rate_limits
+            .and_then(|limits| limits.guild_per_hour)
+            .or(Some(150))
+            .filter(|limit| *limit > 0),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -313,10 +349,10 @@ mod tests {
     use std::env;
 
     use super::{
-        read_nonempty_env, required_nonempty_env, resolve_ai_api_key, resolve_asr_runtime_config,
-        resolve_autojoin_suffix, resolve_autojoin_text_channel_id, resolve_config_path,
-        resolve_transcription_runtime_config, AiSection, AsrSection, DiscordSection,
-        TranscriptionSection,
+        read_nonempty_env, required_nonempty_env, resolve_ai_api_key, resolve_ai_rate_limits,
+        resolve_asr_runtime_config, resolve_autojoin_suffix, resolve_autojoin_text_channel_id,
+        resolve_config_path, resolve_transcription_runtime_config, AiRateLimitConfig,
+        AiRateLimitsSection, AiSection, AsrSection, DiscordSection, TranscriptionSection,
     };
 
     struct EnvGuard {
@@ -390,6 +426,33 @@ mod tests {
         assert_eq!(
             resolve_ai_api_key(Some(&with_key)).unwrap().as_deref(),
             Some("explicit-key")
+        );
+    }
+
+    #[test]
+    fn ai_rate_limits_have_small_guild_defaults_and_zero_disables_each() {
+        assert_eq!(
+            resolve_ai_rate_limits(None),
+            AiRateLimitConfig {
+                user_per_minute: Some(5),
+                user_per_hour: Some(30),
+                guild_per_hour: Some(150),
+            }
+        );
+        assert_eq!(
+            resolve_ai_rate_limits(Some(&AiSection {
+                rate_limits: Some(AiRateLimitsSection {
+                    user_per_minute: Some(0),
+                    user_per_hour: Some(40),
+                    guild_per_hour: Some(0),
+                }),
+                ..AiSection::default()
+            })),
+            AiRateLimitConfig {
+                user_per_minute: None,
+                user_per_hour: Some(40),
+                guild_per_hour: None,
+            }
         );
     }
 

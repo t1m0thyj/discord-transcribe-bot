@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use tokio::sync::RwLock;
 
 use crate::ai::AiClient;
 use crate::asr::{AsrEngine, SsrcMap, Streams};
-use crate::config::AppConfig;
+use crate::config::{AiRateLimitConfig, AppConfig};
 
 mod autojoin;
 mod commands;
@@ -33,7 +34,8 @@ pub(super) const STARTUP_RECEIVE_WATCHDOG_DELAY: Duration = Duration::from_secs(
 pub(super) const STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
 pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(30);
 pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
-pub(super) const THREAD_AI_COOLDOWN: Duration = Duration::from_secs(3);
+const AI_REQUEST_MINUTE_WINDOW: Duration = Duration::from_secs(60);
+const AI_REQUEST_HOURLY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const ASK_PROMPT_HISTORY_MAX_ITEMS: usize = 10;
 const ASK_AUTOCOMPLETE_MAX_CHARS: usize = 100;
 
@@ -60,6 +62,24 @@ pub struct CallSession {
 pub struct ThreadContext {
     pub transcript: String,
     pub history: Vec<(String, String)>,
+}
+
+#[derive(Default)]
+struct AiUserRequestRateState {
+    starts: VecDeque<Instant>,
+}
+
+#[derive(Default)]
+struct AiRequestRateState {
+    guild_starts: VecDeque<Instant>,
+    users: HashMap<UserId, AiUserRequestRateState>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AiRequestRejection {
+    UserMinute(Duration),
+    UserHour(Duration),
+    GuildHour(Duration),
 }
 
 pub struct GuildRuntime {
@@ -115,10 +135,11 @@ pub struct AppState {
     pub session_start_locks: DashMap<GuildId, Arc<tokio::sync::Mutex<()>>>,
     pub transcript_threads: DashMap<ChannelId, ThreadContext>,
     pub thread_context_last_used: DashMap<ChannelId, Instant>,
-    pub thread_ai_last_reply: DashMap<ChannelId, Instant>,
+    ai_request_rates: DashMap<GuildId, AiRequestRateState>,
     pub thread_summary_locks: DashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>,
     pub ask_prompt_history: DashMap<(UserId, Option<GuildId>), Vec<String>>,
     pub ai: Arc<AiClient>,
+    ai_rate_limits: AiRateLimitConfig,
     pub live_transcript_debug: bool,
     pub enable_denoiser: bool,
     pub endpoint_silence_ticks: u32,
@@ -158,10 +179,11 @@ impl AppState {
             session_start_locks: DashMap::new(),
             transcript_threads: DashMap::new(),
             thread_context_last_used: DashMap::new(),
-            thread_ai_last_reply: DashMap::new(),
+            ai_request_rates: DashMap::new(),
             thread_summary_locks: DashMap::new(),
             ask_prompt_history: DashMap::new(),
             ai,
+            ai_rate_limits: cfg.ai.rate_limits,
             live_transcript_debug: cfg.debug.log_live_transcript,
             enable_denoiser: cfg.audio.enable_denoiser,
             // Endpoint uses VAD hangover plus silence ticks; effective trailing wait
@@ -207,8 +229,128 @@ fn evict_thread_contexts_if_needed(state: &Arc<AppState>) {
 
         state.transcript_threads.remove(&channel_id);
         state.thread_context_last_used.remove(&channel_id);
-        state.thread_ai_last_reply.remove(&channel_id);
         state.thread_summary_locks.remove(&channel_id);
+    }
+}
+
+pub(super) fn try_begin_ai_request(
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    user_id: Option<UserId>,
+) -> Result<(), AiRequestRejection> {
+    try_begin_ai_request_at(
+        &state.ai_request_rates,
+        &state.ai_rate_limits,
+        guild_id,
+        user_id,
+        Instant::now(),
+    )
+}
+
+fn try_begin_ai_request_at(
+    request_rates: &DashMap<GuildId, AiRequestRateState>,
+    limits: &AiRateLimitConfig,
+    guild_id: GuildId,
+    user_id: Option<UserId>,
+    now: Instant,
+) -> Result<(), AiRequestRejection> {
+    if limits.user_per_minute.is_none()
+        && limits.user_per_hour.is_none()
+        && limits.guild_per_hour.is_none()
+    {
+        return Ok(());
+    }
+
+    let mut rate = request_rates.entry(guild_id).or_default();
+
+    if let Some(limit) = limits.guild_per_hour {
+        prune_ai_request_starts(&mut rate.guild_starts, now, AI_REQUEST_HOURLY_WINDOW);
+        if let Some(remaining) =
+            ai_request_retry_after(&rate.guild_starts, limit, now, AI_REQUEST_HOURLY_WINDOW)
+        {
+            return Err(AiRequestRejection::GuildHour(remaining));
+        }
+    }
+
+    if let Some(user_id) = user_id {
+        if limits.user_per_minute.is_some() || limits.user_per_hour.is_some() {
+            let user_rate = rate.users.entry(user_id).or_default();
+            let retention_window = if limits.user_per_hour.is_some() {
+                AI_REQUEST_HOURLY_WINDOW
+            } else {
+                AI_REQUEST_MINUTE_WINDOW
+            };
+            prune_ai_request_starts(&mut user_rate.starts, now, retention_window);
+
+            if let Some(limit) = limits.user_per_minute {
+                if let Some(remaining) =
+                    ai_request_retry_after(&user_rate.starts, limit, now, AI_REQUEST_MINUTE_WINDOW)
+                {
+                    return Err(AiRequestRejection::UserMinute(remaining));
+                }
+            }
+            if let Some(limit) = limits.user_per_hour {
+                if let Some(remaining) =
+                    ai_request_retry_after(&user_rate.starts, limit, now, AI_REQUEST_HOURLY_WINDOW)
+                {
+                    return Err(AiRequestRejection::UserHour(remaining));
+                }
+            }
+        }
+    }
+
+    if limits.guild_per_hour.is_some() {
+        rate.guild_starts.push_back(now);
+    }
+    if let Some(user_id) = user_id {
+        if limits.user_per_minute.is_some() || limits.user_per_hour.is_some() {
+            rate.users.entry(user_id).or_default().starts.push_back(now);
+        }
+    }
+
+    Ok(())
+}
+
+fn prune_ai_request_starts(starts: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while starts
+        .front()
+        .is_some_and(|started| now.saturating_duration_since(*started) >= window)
+    {
+        starts.pop_front();
+    }
+}
+
+fn ai_request_retry_after(
+    starts: &VecDeque<Instant>,
+    limit: usize,
+    now: Instant,
+    window: Duration,
+) -> Option<Duration> {
+    let oldest_in_window = starts
+        .iter()
+        .find(|started| now.saturating_duration_since(**started) < window)?;
+    let count_in_window = starts
+        .iter()
+        .filter(|started| now.saturating_duration_since(**started) < window)
+        .count();
+    (count_in_window >= limit)
+        .then(|| window.saturating_sub(now.saturating_duration_since(*oldest_in_window)))
+}
+
+pub(super) fn ai_request_rejection_message(rejection: AiRequestRejection) -> String {
+    match rejection {
+        AiRequestRejection::UserMinute(remaining) => {
+            let seconds = remaining.as_secs().saturating_add(1);
+            format!("You've reached the AI request burst limit; try again in {seconds}s.")
+        }
+        AiRequestRejection::UserHour(remaining) => {
+            let minutes = remaining.as_secs().saturating_add(59) / 60;
+            format!("You've reached your hourly AI request limit; try again in {minutes}m.")
+        }
+        AiRequestRejection::GuildHour(remaining) => {
+            let minutes = remaining.as_secs().saturating_add(59) / 60;
+            format!("This guild has reached its hourly AI request limit; try again in {minutes}m.")
+        }
     }
 }
 
@@ -451,13 +593,17 @@ pub async fn handle_message(ctx: &Context, state: &Arc<AppState>, msg: Message) 
     if let Some(thread_ctx) = state.transcript_threads.get(&msg.channel_id) {
         touch_thread_context(state, msg.channel_id);
 
-        let now = Instant::now();
-        if let Some(last) = state.thread_ai_last_reply.get(&msg.channel_id) {
-            if now.saturating_duration_since(*last.value()) < THREAD_AI_COOLDOWN {
-                return;
-            }
+        let Some(guild_id) = msg.guild_id else {
+            return;
+        };
+        if let Err(rejection) = try_begin_ai_request(state, guild_id, Some(msg.author.id)) {
+            drop(thread_ctx);
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, ai_request_rejection_message(rejection))
+                .await;
+            return;
         }
-        state.thread_ai_last_reply.insert(msg.channel_id, now);
 
         let question = msg.content.clone();
         let transcript = thread_ctx.transcript.clone();
@@ -493,9 +639,17 @@ pub use session::maybe_finalize_on_empty_voice_channel;
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use dashmap::DashMap;
+    use serenity::all::{GuildId, UserId};
+
+    use crate::config::AiRateLimitConfig;
+
     use super::{
-        endpoint_silence_ticks, matching_prompt_values, update_prompt_history,
-        ASK_PROMPT_HISTORY_MAX_ITEMS,
+        endpoint_silence_ticks, matching_prompt_values, try_begin_ai_request_at,
+        update_prompt_history, AiRequestRejection, AI_REQUEST_HOURLY_WINDOW,
+        AI_REQUEST_MINUTE_WINDOW, ASK_PROMPT_HISTORY_MAX_ITEMS,
     };
 
     #[test]
@@ -539,5 +693,153 @@ mod tests {
             matching_prompt_values(&history, ""),
             ["When does the project ship?", "What did we decide?"]
         );
+    }
+
+    #[test]
+    fn ai_requests_enforce_a_per_user_minute_burst_limit() {
+        let rates = DashMap::new();
+        let guild_id = GuildId::new(1);
+        let user_id = UserId::new(10);
+        let started = Instant::now();
+        let limits = AiRateLimitConfig {
+            user_per_minute: Some(2),
+            user_per_hour: Some(10),
+            guild_per_hour: Some(100),
+        };
+
+        assert!(try_begin_ai_request_at(&rates, &limits, guild_id, Some(user_id), started).is_ok());
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            Some(user_id),
+            started + Duration::from_secs(1)
+        )
+        .is_ok());
+        assert_eq!(
+            try_begin_ai_request_at(
+                &rates,
+                &limits,
+                guild_id,
+                Some(user_id),
+                started + Duration::from_secs(2)
+            ),
+            Err(AiRequestRejection::UserMinute(Duration::from_secs(58)))
+        );
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            Some(user_id),
+            started + AI_REQUEST_MINUTE_WINDOW
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ai_requests_enforce_a_per_user_hourly_limit() {
+        let rates = DashMap::new();
+        let guild_id = GuildId::new(1);
+        let user_id = UserId::new(10);
+        let started = Instant::now();
+        let limits = AiRateLimitConfig {
+            user_per_minute: None,
+            user_per_hour: Some(2),
+            guild_per_hour: Some(100),
+        };
+
+        assert!(try_begin_ai_request_at(&rates, &limits, guild_id, Some(user_id), started).is_ok());
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            Some(user_id),
+            started + AI_REQUEST_MINUTE_WINDOW
+        )
+        .is_ok());
+        assert!(matches!(
+            try_begin_ai_request_at(
+                &rates,
+                &limits,
+                guild_id,
+                Some(user_id),
+                started + AI_REQUEST_MINUTE_WINDOW * 2
+            ),
+            Err(AiRequestRejection::UserHour(_))
+        ));
+    }
+
+    #[test]
+    fn ai_requests_enforce_a_shared_guild_hourly_limit() {
+        let rates = DashMap::new();
+        let guild_id = GuildId::new(1);
+        let started = Instant::now();
+        let limits = AiRateLimitConfig {
+            user_per_minute: None,
+            user_per_hour: None,
+            guild_per_hour: Some(2),
+        };
+
+        assert!(
+            try_begin_ai_request_at(&rates, &limits, guild_id, Some(UserId::new(10)), started)
+                .is_ok()
+        );
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            Some(UserId::new(11)),
+            started + Duration::from_secs(1)
+        )
+        .is_ok());
+        assert!(matches!(
+            try_begin_ai_request_at(
+                &rates,
+                &limits,
+                guild_id,
+                None,
+                started + Duration::from_secs(2)
+            ),
+            Err(AiRequestRejection::GuildHour(_))
+        ));
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            None,
+            started + AI_REQUEST_HOURLY_WINDOW
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn automatic_ai_requests_do_not_consume_user_limits() {
+        let rates = DashMap::new();
+        let guild_id = GuildId::new(1);
+        let user_id = UserId::new(10);
+        let started = Instant::now();
+        let limits = AiRateLimitConfig {
+            user_per_minute: Some(1),
+            user_per_hour: Some(1),
+            guild_per_hour: Some(10),
+        };
+
+        assert!(try_begin_ai_request_at(&rates, &limits, guild_id, None, started).is_ok());
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            None,
+            started + Duration::from_secs(1)
+        )
+        .is_ok());
+        assert!(try_begin_ai_request_at(
+            &rates,
+            &limits,
+            guild_id,
+            Some(user_id),
+            started + Duration::from_secs(2)
+        )
+        .is_ok());
     }
 }

@@ -65,7 +65,14 @@ pub async fn finalize_call_for_guild(
     let include_summary_in_markdown =
         should_generate_summary && state.post_call_summary_include_in_markdown;
     let mut auto_summary = if include_summary_in_markdown {
-        summary::maybe_generate_post_call_summary(ctx, state, &transcript, session.started_at).await
+        summary::maybe_generate_post_call_summary(
+            ctx,
+            state,
+            guild_id,
+            &transcript,
+            session.started_at,
+        )
+        .await
     } else {
         None
     };
@@ -113,6 +120,7 @@ pub async fn finalize_call_for_guild(
             auto_summary = summary::maybe_generate_post_call_summary(
                 ctx,
                 state,
+                guild_id,
                 &transcript,
                 session.started_at,
             )

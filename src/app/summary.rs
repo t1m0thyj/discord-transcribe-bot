@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serenity::all::UserId;
+use serenity::all::{GuildId, UserId};
 use serenity::prelude::Context;
 
 use super::{AppState, Utterance};
@@ -137,6 +137,7 @@ pub(super) fn format_call_title(started_at: chrono::DateTime<chrono::Utc>) -> St
 pub(super) async fn maybe_generate_post_call_summary(
     ctx: &Context,
     state: &Arc<AppState>,
+    guild_id: GuildId,
     transcript: &[Utterance],
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
@@ -145,6 +146,15 @@ pub(super) async fn maybe_generate_post_call_summary(
     }
 
     if transcript.is_empty() {
+        return None;
+    }
+
+    if let Err(rejection) = super::try_begin_ai_request(state, guild_id, None) {
+        tracing::info!(
+            guild = %guild_id,
+            ?rejection,
+            "skipped auto-summary due to AI request limit"
+        );
         return None;
     }
 
