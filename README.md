@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/t1m0thyj/discord-transcribe-bot/mai
 
 The installer extracts the binary into the current directory and removes the downloaded archive. Run `./transcribe-bot init` there, complete [configuration](#configure-and-run), then start the binary from that directory. On Windows, use `./transcribe-bot.exe`.
 
+> **Note:** On Linux, the installer restarts the bot if it is running as a systemd user service, so the updated binary takes effect.
+
 ### Build from source
 
 Install a current Rust toolchain, then build:

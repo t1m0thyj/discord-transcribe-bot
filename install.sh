@@ -70,4 +70,10 @@ fi
 chmod +x "$binary" 2>/dev/null || true
 
 printf 'Installed %s in %s\n' "$binary" "$PWD"
+if [ "$platform_os" = "linux" ] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user is-active --quiet transcribe-bot.service 2>/dev/null; then
+    systemctl --user restart transcribe-bot.service
+    exit
+fi
 printf 'To configure it, run: %s init\n' "$binary"
