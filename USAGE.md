@@ -191,7 +191,7 @@ For a single-guild installation, optionally set `[discord].autojoin_text_channel
 
 The bot stores a JSONL journal locally in `transcripts/` while the call is active and uploads the final Markdown transcript to Discord. Local journal retention is controlled by `[transcription].retention_days`.
 
-Speech recognition remains local. `/ask` and optional summaries send transcript context to the configured OpenAI-compatible API, which can be local (for example, Ollama) or hosted.
+Speech recognition remains local. `/ask` and optional summaries send up to the most recent 1 MB (1,000,000 UTF-8 bytes) of transcript context to the configured OpenAI-compatible API, which can be local (for example, Ollama) or hosted. The API or selected model may have a smaller context limit.
 
 ## Health And Recovery
 

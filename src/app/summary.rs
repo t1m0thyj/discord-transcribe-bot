@@ -262,9 +262,14 @@ fn build_transcript_lines(
 
 fn format_transcript_stamp(delta: Duration) -> String {
     let total = delta.as_secs();
-    let mm = total / 60;
-    let ss = total % 60;
-    format!("{mm}:{ss:02}")
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -316,8 +321,17 @@ mod tests {
     use crate::app::Utterance;
 
     #[test]
-    fn transcript_stamp_formats_minutes_seconds() {
+    fn transcript_stamp_switches_to_hours_after_one_hour() {
         assert_eq!(format_transcript_stamp(Duration::from_secs(65)), "1:05");
+        assert_eq!(format_transcript_stamp(Duration::from_secs(3599)), "59:59");
+        assert_eq!(
+            format_transcript_stamp(Duration::from_secs(3600)),
+            "1:00:00"
+        );
+        assert_eq!(
+            format_transcript_stamp(Duration::from_secs(17077)),
+            "4:44:37"
+        );
     }
 
     #[test]
