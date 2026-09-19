@@ -4,14 +4,16 @@ use std::time::{Duration, Instant};
 
 use serenity::all::{GuildId, UserId};
 use serenity::http::Http;
+use songbird::events::context_data::DisconnectReason;
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 
+use crate::app::healthcheck::ReceiveHealth;
 use crate::app::GuildRuntime;
 
 use super::decoder::{queue_decode_job, DecodeJob};
-use super::frontend::{ProcessedSpeechChunk, compute_rms};
+use super::frontend::{compute_rms, ProcessedSpeechChunk};
 use super::pipeline::{
-    UserAudioBuffer, should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams,
+    should_dispatch_chunk, trim_finalize_tail, AsrEngine, SsrcMap, Streams, UserAudioBuffer,
 };
 
 const UNKNOWN_SSRC_MAX_TRACKED: usize = 8;
@@ -43,12 +45,75 @@ enum IngestOutcome {
 pub struct SpeakingUpdateHandler {
     pub guild_id: GuildId,
     pub ssrc_to_user: Arc<SsrcMap>,
+    pub health: Arc<ReceiveHealth>,
+    pub generation: Arc<std::sync::atomic::AtomicUsize>,
+    pub expected_generation: usize,
+}
+
+pub struct DriverHealthHandler {
+    pub health: Arc<ReceiveHealth>,
+    pub generation: Arc<std::sync::atomic::AtomicUsize>,
+    pub expected_generation: usize,
+}
+
+#[serenity::async_trait]
+impl VoiceEventHandler for DriverHealthHandler {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != self.expected_generation {
+            return None;
+        }
+        match ctx {
+            EventContext::DriverDisconnect(disconnect) => {
+                if disconnect.reason.is_some_and(|reason| {
+                    !matches!(
+                        reason,
+                        DisconnectReason::Requested | DisconnectReason::AttemptDiscarded
+                    )
+                }) {
+                    self.health.set_driver_disconnected(true);
+                }
+            }
+            EventContext::DriverReconnect(_) | EventContext::DriverConnect(_) => {
+                self.health.set_driver_disconnected(false);
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+pub struct RtpPacketHandler {
+    pub runtime: Arc<GuildRuntime>,
+    pub generation: usize,
+}
+
+#[serenity::async_trait]
+impl VoiceEventHandler for RtpPacketHandler {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self
+            .runtime
+            .receive_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != self.generation
+        {
+            return None;
+        }
+        if let EventContext::RtpPacket(packet) = ctx {
+            self.runtime.receive_health.packet(packet.rtp().get_ssrc());
+        }
+        None
+    }
 }
 
 #[serenity::async_trait]
 impl VoiceEventHandler for SpeakingUpdateHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != self.expected_generation {
+            return None;
+        }
         if let EventContext::SpeakingStateUpdate(speaking) = ctx {
+            self.health
+                .speaking(speaking.ssrc, speaking.speaking.microphone());
             if let Some(user_id) = speaking.user_id {
                 self.ssrc_to_user
                     .insert((self.guild_id, speaking.ssrc), UserId::new(user_id.0));
@@ -61,11 +126,17 @@ impl VoiceEventHandler for SpeakingUpdateHandler {
 pub struct ClientDisconnectHandler {
     pub guild_id: GuildId,
     pub ssrc_to_user: Arc<SsrcMap>,
+    pub health: Arc<ReceiveHealth>,
+    pub generation: Arc<std::sync::atomic::AtomicUsize>,
+    pub expected_generation: usize,
 }
 
 #[serenity::async_trait]
 impl VoiceEventHandler for ClientDisconnectHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != self.expected_generation {
+            return None;
+        }
         let EventContext::ClientDisconnect(disconnect) = ctx else {
             return None;
         };
@@ -74,7 +145,9 @@ impl VoiceEventHandler for ClientDisconnectHandler {
             .ssrc_to_user
             .iter()
             .filter_map(|entry| {
-                if entry.key().0 == self.guild_id && *entry.value() == UserId::new(disconnect.user_id.0) {
+                if entry.key().0 == self.guild_id
+                    && *entry.value() == UserId::new(disconnect.user_id.0)
+                {
                     Some(*entry.key())
                 } else {
                     None
@@ -84,6 +157,7 @@ impl VoiceEventHandler for ClientDisconnectHandler {
 
         for key in keys {
             self.ssrc_to_user.remove(&key);
+            self.health.forget(key.1);
         }
 
         None
@@ -95,6 +169,7 @@ pub struct VoiceTickHandler {
     pub text_channel: serenity::all::ChannelId,
     pub voice_channel: serenity::all::ChannelId,
     pub runtime: Arc<GuildRuntime>,
+    pub generation: usize,
     pub guild_id: GuildId,
     pub ssrc_to_user: Arc<SsrcMap>,
     pub streams: Arc<Streams>,
@@ -137,7 +212,8 @@ impl UnknownSsrcAudio {
 }
 
 fn unknown_ssrc_buffers() -> &'static Mutex<HashMap<(GuildId, u32), UnknownSsrcAudio>> {
-    static UNKNOWN_SSRC_BUFFERS: OnceLock<Mutex<HashMap<(GuildId, u32), UnknownSsrcAudio>>> = OnceLock::new();
+    static UNKNOWN_SSRC_BUFFERS: OnceLock<Mutex<HashMap<(GuildId, u32), UnknownSsrcAudio>>> =
+        OnceLock::new();
     UNKNOWN_SSRC_BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -153,7 +229,9 @@ fn push_unknown_ssrc_audio(guild_id: GuildId, ssrc: u32, decoded: &[i16]) {
         return;
     }
 
-    let entry = map.entry((guild_id, ssrc)).or_insert_with(UnknownSsrcAudio::new);
+    let entry = map
+        .entry((guild_id, ssrc))
+        .or_insert_with(UnknownSsrcAudio::new);
     entry.push(decoded);
 }
 
@@ -176,6 +254,14 @@ pub fn clear_unknown_ssrc_audio_for_guild(guild_id: GuildId) {
 #[serenity::async_trait]
 impl VoiceEventHandler for VoiceTickHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if self
+            .runtime
+            .receive_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != self.generation
+        {
+            return None;
+        }
         let EventContext::VoiceTick(tick) = ctx else {
             return None;
         };
@@ -188,41 +274,33 @@ impl VoiceEventHandler for VoiceTickHandler {
         };
 
         for (ssrc, data) in &tick.speaking {
-            if data.decoded_voice.is_none() && data.packet.is_some() {
-                self.runtime
-                    .decode_failure_activity
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-
             let Some(decoded) = &data.decoded_voice else {
                 continue;
             };
 
-            let Some(user_id) = self
-                .ssrc_to_user
-                .get(&(self.guild_id, *ssrc))
-                .map(|v| *v)
-            else {
-                self.runtime
-                    .unmapped_ssrc_activity
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mapped = self.ssrc_to_user.contains_key(&(self.guild_id, *ssrc));
+            self.runtime
+                .receive_health
+                .decoded(*ssrc, mapped, data.packet.is_some());
+
+            let Some(user_id) = self.ssrc_to_user.get(&(self.guild_id, *ssrc)).map(|v| *v) else {
                 push_unknown_ssrc_audio(self.guild_id, *ssrc, decoded);
                 continue;
             };
-
-            self.runtime
-                .decoded_audio_activity
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let user_key = (self.guild_id, user_id);
 
             let mut stream = self.streams.entry(user_key).or_default();
             let mut replay = take_unknown_ssrc_audio(self.guild_id, *ssrc);
             let processed = if replay.is_empty() {
-                stream.frontend.push_stereo_pcm(decoded, self.enable_denoiser)
+                stream
+                    .frontend
+                    .push_stereo_pcm(decoded, self.enable_denoiser)
             } else {
                 replay.extend_from_slice(decoded);
-                stream.frontend.push_stereo_pcm(&replay, self.enable_denoiser)
+                stream
+                    .frontend
+                    .push_stereo_pcm(&replay, self.enable_denoiser)
             };
             let resample_errors = stream.frontend.take_resample_error_count();
             if resample_errors > 0 {
@@ -245,7 +323,12 @@ impl VoiceEventHandler for VoiceTickHandler {
                 if self
                     .runtime
                     .transcription_started_notified
-                    .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
                     .is_ok()
                 {
                     let http = Arc::clone(&self.http);
@@ -253,7 +336,10 @@ impl VoiceEventHandler for VoiceTickHandler {
                     let voice_channel = self.voice_channel;
                     tokio::spawn(async move {
                         let _ = text_channel
-                            .say(&http, format!("Started transcribing in <#{}>.", voice_channel.get()))
+                            .say(
+                                &http,
+                                format!("Started transcribing in <#{}>.", voice_channel.get()),
+                            )
                             .await;
                     });
                 }
@@ -271,9 +357,12 @@ impl VoiceEventHandler for VoiceTickHandler {
                 ingest_params,
                 Instant::now(),
             ) {
-                IngestOutcome::Rollover { start_ts, pcm, voiced_ticks, .. } => {
-                    Some((start_ts, pcm, voiced_ticks, noise_rms_ema))
-                }
+                IngestOutcome::Rollover {
+                    start_ts,
+                    pcm,
+                    voiced_ticks,
+                    ..
+                } => Some((start_ts, pcm, voiced_ticks, noise_rms_ema)),
                 _ => None,
             };
 
@@ -511,8 +600,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        IngestOutcome, IngestParams, advance_silence, append_processed_chunk,
-        choose_rollover_split_index, ProcessedSpeechChunk, UserAudioBuffer,
+        advance_silence, append_processed_chunk, choose_rollover_split_index, IngestOutcome,
+        IngestParams, ProcessedSpeechChunk, UserAudioBuffer,
     };
 
     fn params() -> IngestParams {
@@ -551,7 +640,10 @@ mod tests {
         let max_keep_without_starving = 5_000;
         let split = choose_rollover_split_index(&pcm, keep, max_keep_without_starving);
 
-        let min_split = pcm.len().saturating_sub(max_keep_without_starving).max(1_600);
+        let min_split = pcm
+            .len()
+            .saturating_sub(max_keep_without_starving)
+            .max(1_600);
         let max_split = pcm.len().saturating_sub(1_600);
         assert!(split >= min_split && split <= max_split);
     }
@@ -596,10 +688,9 @@ mod tests {
         let outcome = append_processed_chunk(&mut buffer, chunk(320, true), params(), now);
 
         let IngestOutcome::Rollover {
-            pcm,
-            voiced_ticks,
-            ..
-        } = outcome else {
+            pcm, voiced_ticks, ..
+        } = outcome
+        else {
             panic!("expected rollover");
         };
         assert_eq!(voiced_ticks + buffer.voiced_ticks, 10);
@@ -616,13 +707,22 @@ mod tests {
         };
         let now = Instant::now();
 
-        assert!(matches!(advance_silence(&mut buffer, params(), now), IngestOutcome::None));
-        assert!(matches!(advance_silence(&mut buffer, params(), now), IngestOutcome::None));
+        assert!(matches!(
+            advance_silence(&mut buffer, params(), now),
+            IngestOutcome::None
+        ));
+        assert!(matches!(
+            advance_silence(&mut buffer, params(), now),
+            IngestOutcome::None
+        ));
         assert!(matches!(
             advance_silence(&mut buffer, params(), now),
             IngestOutcome::Endpoint { .. }
         ));
-        assert!(matches!(advance_silence(&mut buffer, params(), now), IngestOutcome::None));
+        assert!(matches!(
+            advance_silence(&mut buffer, params(), now),
+            IngestOutcome::None
+        ));
     }
 
     #[test]

@@ -17,7 +17,7 @@ mod watchdog;
 
 pub use finalize::{finalize_call_for_guild, maybe_finalize_on_empty_voice_channel};
 pub use watchdog::{
-    attach_voice_handlers, startup_receive_watchdog, steady_state_receive_watchdog,
+    attach_voice_handlers, attach_voice_mapping_handlers, receive_watchdog,
     VoiceHandlerAttachContext,
 };
 
@@ -46,12 +46,22 @@ pub(super) async fn start_call_session(
         .context("songbird voice manager unavailable")?
         .clone();
 
+    if manager.get(guild_id).is_some() {
+        manager
+            .remove(guild_id)
+            .await
+            .context("failed to clear previous voice call before joining")?;
+    }
+
+    let (utterance_tx, utterance_rx) = mpsc::channel::<Utterance>(1024);
+    let runtime = Arc::new(GuildRuntime::new(utterance_tx.clone()));
+
+    let call_lock = manager.get_or_insert(guild_id);
+    attach_voice_mapping_handlers(state, guild_id, &call_lock, &runtime).await;
     let call_lock = manager
         .join(guild_id, voice_channel)
         .await
         .context("failed to join voice channel")?;
-
-    let (utterance_tx, utterance_rx) = mpsc::channel::<Utterance>(1024);
 
     let session_started_at = Utc::now();
     let local_dir = PathBuf::from("transcripts");
@@ -72,7 +82,6 @@ pub(super) async fn start_call_session(
             )
         })?;
 
-    let runtime = Arc::new(GuildRuntime::new(utterance_tx.clone()));
     state.guild_runtimes.insert(guild_id, Arc::clone(&runtime));
 
     let session = Arc::new(RwLock::new(CallSession {
@@ -103,26 +112,17 @@ pub(super) async fn start_call_session(
             text_channel,
             voice_channel,
             call_lock: Arc::clone(&call_lock),
-            runtime,
+            runtime: Arc::clone(&runtime),
         },
     )
     .await;
 
-    tokio::spawn(startup_receive_watchdog(
+    tokio::spawn(receive_watchdog(
         ctx.clone(),
         Arc::clone(state),
         guild_id,
         voice_channel,
-        text_channel,
-        0,
-    ));
-
-    tokio::spawn(steady_state_receive_watchdog(
-        ctx.clone(),
-        Arc::clone(state),
-        guild_id,
-        voice_channel,
-        text_channel,
+        runtime,
     ));
 
     Ok(())

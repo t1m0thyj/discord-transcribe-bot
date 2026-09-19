@@ -64,10 +64,49 @@ pub(super) async fn handle_status(
         .get(&guild_id)
         .map(|v| Arc::clone(v.value()));
 
-    let decoded_frames = runtime
+    let receive_counts = runtime.as_ref().map(|v| v.receive_health.snapshot());
+    let no_recent_media = elapsed.as_secs() >= 60
+        && runtime.as_ref().is_some_and(|v| {
+            v.receive_health
+                .last_packet_at()
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(60))
+        });
+    let receive_state = if runtime
         .as_ref()
-        .map(|v| v.decoded_audio_activity.load(Ordering::SeqCst))
-        .unwrap_or(0);
+        .is_some_and(|v| v.recovery_needs_rejoin.load(Ordering::SeqCst))
+    {
+        "rejoin needed"
+    } else if runtime
+        .as_ref()
+        .is_some_and(|v| v.receive_health.driver_disconnected())
+    {
+        "driver disconnected"
+    } else if runtime
+        .as_ref()
+        .is_some_and(|v| v.receive_verification_pending.load(Ordering::SeqCst))
+    {
+        "rejoined; affected audio unverified"
+    } else if no_recent_media {
+        "quiet or receive unavailable; no recent media evidence"
+    } else {
+        "monitoring"
+    };
+    let (received_packets, decoded_packets, mapped_packets, concealed_frames) = receive_counts
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .0
+                .values()
+                .fold((0u64, 0u64, 0u64, 0u64), |totals, source| {
+                    (
+                        totals.0 + source.packets,
+                        totals.1 + source.decoded_packets,
+                        totals.2 + source.mapped_packets,
+                        totals.3 + source.concealed_frames,
+                    )
+                })
+        })
+        .unwrap_or_default();
     let inflight = runtime
         .as_ref()
         .map(|v| v.transcription_inflight.load(Ordering::SeqCst))
@@ -75,10 +114,6 @@ pub(super) async fn handle_status(
     let pending_commits = runtime
         .as_ref()
         .map(|v| v.transcript_pending_commits.load(Ordering::SeqCst))
-        .unwrap_or(0);
-    let decode_failures = runtime
-        .as_ref()
-        .map(|v| v.decode_failure_activity.load(Ordering::SeqCst))
         .unwrap_or(0);
     let decode_jobs_total = runtime
         .as_ref()
@@ -108,10 +143,7 @@ pub(super) async fn handle_status(
         .as_ref()
         .map(|v| v.decode_shed_total.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let unmapped_ssrc = runtime
-        .as_ref()
-        .map(|v| v.unmapped_ssrc_activity.load(Ordering::SeqCst))
-        .unwrap_or(0);
+    let unmapped_ssrc = decoded_packets.saturating_sub(mapped_packets);
     let participants = ctx
         .cache
         .guild(guild_id)
@@ -131,11 +163,11 @@ pub(super) async fn handle_status(
     let queue_depth = decode_queue_depth();
     let queue_capacity = decode_queue_capacity();
     let decode_failure_pct = {
-        let denom = decoded_frames.saturating_add(decode_failures);
+        let denom = received_packets;
         if denom == 0 {
             0.0
         } else {
-            (decode_failures as f64 * 100.0) / denom as f64
+            (received_packets.saturating_sub(decoded_packets) as f64 * 100.0) / denom as f64
         }
     };
     let rtf = if decode_audio_total_ms == 0 {
@@ -208,9 +240,10 @@ pub(super) async fn handle_status(
     );
 
     Ok(format!(
-        "Transcription status\nVoice channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nQueue depth: {}/{} [{}]\nASR in-flight: {}\nPending commits: {}\nASR decode errors: {}\nDecode failure: {:.2}% [{}]\nRTF (decode/audio): {:.3} [{}]\nDecode wait/decode ms (avg): {:.1}/{:.1}\nDecode shed: {} ({:.2}/min) [{}]\nUnmapped SSRC: {} [{}]\nTranscript utterances: {}",
+        "Transcription status\nVoice channel: <#{}>\nActive for: {hh:02}:{mm:02}:{ss:02}\nParticipants in voice: {}\nReceive: {}\nQueue depth: {}/{} [{}]\nASR in-flight: {}\nPending commits: {}\nASR decode errors: {}\nPacket decode gap (estimate): {:.2}% [{}]\nConcealed frames: {}\nRTF (decode/audio): {:.3} [{}]\nDecode wait/decode ms (avg): {:.1}/{:.1}\nDecode shed: {} ({:.2}/min) [{}]\nDecoded without speaker map: {} [{}]\nTranscript utterances: {}",
         voice_channel.get(),
         participants,
+        receive_state,
         queue_depth,
         queue_capacity,
         queue_alert,
@@ -219,6 +252,7 @@ pub(super) async fn handle_status(
         asr_decode_errors,
         decode_failure_pct,
         failure_alert,
+        concealed_frames,
         rtf,
         rtf_alert,
         avg_queue_wait_ms,

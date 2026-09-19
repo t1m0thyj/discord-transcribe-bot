@@ -20,6 +20,7 @@ use crate::config::{AiRateLimitConfig, AppConfig};
 
 mod autojoin;
 mod commands;
+pub(crate) mod healthcheck;
 mod journal;
 mod session;
 mod summary;
@@ -28,12 +29,6 @@ pub(super) const LOG_DEFAULT_UTTERANCES: i64 = 40;
 pub(super) const LOG_MAX_DISCORD_CHARS: usize = 1800;
 pub(super) const THREAD_CONTEXT_MAX_ENTRIES: usize = 64;
 pub(super) const THREAD_HISTORY_MAX_ITEMS: usize = 24;
-pub(super) const FINALIZE_SETTLE_TIMEOUT: Duration = Duration::from_millis(900);
-pub(super) const FINALIZE_SETTLE_PASSES: usize = 4;
-pub(super) const STARTUP_RECEIVE_WATCHDOG_DELAY: Duration = Duration::from_secs(10);
-pub(super) const STARTUP_RECEIVE_RECOVERY_MAX_ATTEMPTS: u8 = 3;
-pub(super) const STEADY_STATE_WATCHDOG_CADENCE: Duration = Duration::from_secs(30);
-pub(super) const STEADY_STATE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 const AI_REQUEST_MINUTE_WINDOW: Duration = Duration::from_secs(60);
 const AI_REQUEST_HOURLY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const ASK_PROMPT_HISTORY_MAX_ITEMS: usize = 10;
@@ -97,9 +92,10 @@ pub struct GuildRuntime {
     pub decode_shed_total: AtomicUsize,
     pub dispatch_gate_total: AtomicUsize,
     pub resample_error_total: AtomicUsize,
-    pub decoded_audio_activity: AtomicUsize,
-    pub decode_failure_activity: AtomicUsize,
-    pub unmapped_ssrc_activity: AtomicUsize,
+    pub receive_health: Arc<healthcheck::ReceiveHealth>,
+    pub receive_generation: Arc<AtomicUsize>,
+    pub recovery_needs_rejoin: AtomicBool,
+    pub receive_verification_pending: AtomicBool,
     pub transcription_started_notified: AtomicBool,
     pub recovery_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -121,9 +117,10 @@ impl GuildRuntime {
             decode_shed_total: AtomicUsize::new(0),
             dispatch_gate_total: AtomicUsize::new(0),
             resample_error_total: AtomicUsize::new(0),
-            decoded_audio_activity: AtomicUsize::new(0),
-            decode_failure_activity: AtomicUsize::new(0),
-            unmapped_ssrc_activity: AtomicUsize::new(0),
+            receive_health: Arc::new(healthcheck::ReceiveHealth::default()),
+            receive_generation: Arc::new(AtomicUsize::new(0)),
+            recovery_needs_rejoin: AtomicBool::new(false),
+            receive_verification_pending: AtomicBool::new(false),
             transcription_started_notified: AtomicBool::new(false),
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
         }

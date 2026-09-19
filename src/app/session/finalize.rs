@@ -1,38 +1,90 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
-use serenity::all::{CreateAttachment, CreateMessage, GuildId, UserId, VoiceState};
+use serenity::all::{CreateAttachment, CreateMessage, GuildId, VoiceState};
 use serenity::prelude::Context;
 
-use super::super::{AppState, Utterance, FINALIZE_SETTLE_PASSES, FINALIZE_SETTLE_TIMEOUT};
+use super::super::AppState;
 use crate::app::journal::{load_persisted_transcript, prune_old_transcripts};
 use crate::app::summary;
-use crate::asr::{
-    clear_unknown_ssrc_audio_for_guild, should_dispatch_chunk, transcribe_mono_pcm,
-    trim_finalize_tail,
-};
+use crate::asr::clear_unknown_ssrc_audio_for_guild;
 
 pub async fn finalize_call_for_guild(
     ctx: &Context,
     state: &Arc<AppState>,
     guild_id: GuildId,
 ) -> anyhow::Result<()> {
-    let Some((_gid, session_lock)) = state.active_calls.remove(&guild_id) else {
-        return Ok(());
-    };
+    finalize_call_for_guild_if_current(ctx, state, guild_id, None).await
+}
+
+async fn finalize_call_for_guild_if_current(
+    ctx: &Context,
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    expected_session: Option<&Arc<tokio::sync::RwLock<super::super::CallSession>>>,
+) -> anyhow::Result<()> {
+    let session_start_lock = state
+        .session_start_locks
+        .entry(guild_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _session_start_guard = session_start_lock.lock().await;
+
+    if let Some(expected) = expected_session {
+        if !state
+            .active_calls
+            .get(&guild_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), expected))
+        {
+            return Ok(());
+        }
+        let target_channel = expected.read().await.voice_channel;
+        let bot_id = ctx.cache.current_user().id;
+        let Some(guild) = ctx.cache.guild(guild_id) else {
+            return Ok(());
+        };
+        if guild
+            .voice_states
+            .iter()
+            .any(|(uid, vs)| vs.channel_id == Some(target_channel) && *uid != bot_id)
+        {
+            return Ok(());
+        }
+    }
 
     let manager = songbird::get(ctx)
         .await
         .context("songbird voice manager unavailable")?
         .clone();
-    let _ = manager.remove(guild_id).await;
+    match tokio::time::timeout(Duration::from_secs(25), manager.remove(guild_id)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if manager.get(guild_id).is_some() => return Err(error.into()),
+        Ok(Err(error)) => {
+            tracing::warn!(guild = %guild_id, "voice remove failed after call disappeared: {error:#}")
+        }
+        Err(_) if manager.get(guild_id).is_some() => {
+            anyhow::bail!("voice remove during finalize timed out")
+        }
+        Err(_) => {
+            tracing::warn!(guild = %guild_id, "voice remove timed out after call disappeared")
+        }
+    }
 
-    settle_and_flush_guild_audio(state, guild_id).await;
-    wait_for_transcription_drain(state, guild_id).await;
-    wait_for_transcript_commit_drain(state, guild_id).await;
+    let Some((_gid, session_lock)) = state.active_calls.remove(&guild_id) else {
+        return Ok(());
+    };
+
+    let runtime = state
+        .guild_runtimes
+        .get(&guild_id)
+        .map(|entry| Arc::clone(entry.value()));
+    if let Some(runtime) = &runtime {
+        runtime.receive_generation.fetch_add(1, Ordering::SeqCst);
+        super::watchdog::detach_and_transcribe_buffers(state, guild_id, runtime);
+    }
 
     for key in state
         .ssrc_to_user
@@ -53,6 +105,24 @@ pub async fn finalize_call_for_guild(
         .collect::<Vec<_>>()
     {
         state.streams.remove(&key);
+    }
+
+    state.guild_runtimes.remove(&guild_id);
+    drop(_session_start_guard);
+
+    // Export work belongs to the detached session. A new /join may now proceed.
+    if let Some(runtime) = &runtime {
+        let drained = tokio::time::timeout(Duration::from_secs(30), async {
+            while runtime.transcription_inflight.load(Ordering::SeqCst) > 0
+                || runtime.transcript_pending_commits.load(Ordering::SeqCst) > 0
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(guild = %guild_id, "timed out waiting for old-session transcription; exporting partial transcript");
+        }
     }
 
     let session = session_lock.read().await;
@@ -151,8 +221,6 @@ pub async fn finalize_call_for_guild(
         }
     });
 
-    state.guild_runtimes.remove(&guild_id);
-
     Ok(())
 }
 
@@ -208,234 +276,7 @@ pub async fn maybe_finalize_on_empty_voice_channel(
         return Ok(());
     }
 
-    finalize_call_for_guild(ctx, state, guild_id).await?;
+    finalize_call_for_guild_if_current(ctx, state, guild_id, Some(&session_lock)).await?;
 
     Ok(())
-}
-
-async fn settle_and_flush_guild_audio(state: &Arc<AppState>, guild_id: GuildId) {
-    let Some(runtime) = state
-        .guild_runtimes
-        .get(&guild_id)
-        .map(|v| Arc::clone(v.value()))
-    else {
-        return;
-    };
-
-    for _ in 0..FINALIZE_SETTLE_PASSES {
-        let _ =
-            wait_for_capture_quiesce_with_timeout(state, guild_id, FINALIZE_SETTLE_TIMEOUT).await;
-
-        let pending = flush_pending_buffers_for_export(state, guild_id).await;
-        if !pending.is_empty() {
-            commit_flushed_utterances(state, guild_id, pending).await;
-        }
-
-        let inflight = runtime.transcription_inflight.load(Ordering::SeqCst);
-        let pending_commits = runtime.transcript_pending_commits.load(Ordering::SeqCst);
-        let buffered_audio = state
-            .streams
-            .iter()
-            .any(|e| e.key().0 == guild_id && !e.value().buffer.pcm.is_empty());
-
-        if inflight == 0 && pending_commits == 0 && !buffered_audio {
-            break;
-        }
-    }
-}
-
-async fn wait_for_transcription_drain(state: &Arc<AppState>, guild_id: GuildId) {
-    let Some(runtime) = state
-        .guild_runtimes
-        .get(&guild_id)
-        .map(|v| Arc::clone(v.value()))
-    else {
-        return;
-    };
-
-    let drained = tokio::time::timeout(Duration::from_secs(30), async {
-        while runtime.transcription_inflight.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-
-    if drained.is_err() {
-        tracing::warn!(
-            guild = %guild_id,
-            "timed out waiting for transcription drain; continuing finalize with partial state"
-        );
-    }
-}
-
-async fn wait_for_capture_quiesce_with_timeout(
-    state: &Arc<AppState>,
-    guild_id: GuildId,
-    timeout: Duration,
-) -> bool {
-    let start = Instant::now();
-
-    loop {
-        let Some(runtime) = state
-            .guild_runtimes
-            .get(&guild_id)
-            .map(|v| Arc::clone(v.value()))
-        else {
-            return true;
-        };
-
-        let inflight = runtime.transcription_inflight.load(Ordering::SeqCst);
-        let pending_commits = runtime.transcript_pending_commits.load(Ordering::SeqCst);
-
-        if inflight == 0 && pending_commits == 0 {
-            return true;
-        }
-
-        if start.elapsed() >= timeout {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn wait_for_transcript_commit_drain(state: &Arc<AppState>, guild_id: GuildId) {
-    let Some(runtime) = state
-        .guild_runtimes
-        .get(&guild_id)
-        .map(|v| Arc::clone(v.value()))
-    else {
-        return;
-    };
-
-    let drained = tokio::time::timeout(Duration::from_secs(30), async {
-        while runtime.transcript_pending_commits.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-
-    if drained.is_err() {
-        tracing::warn!(
-            guild = %guild_id,
-            "timed out waiting for transcript commit drain; continuing finalize with partial state"
-        );
-    }
-}
-
-async fn commit_flushed_utterances(
-    state: &Arc<AppState>,
-    guild_id: GuildId,
-    pending: Vec<Utterance>,
-) {
-    let Some(runtime) = state
-        .guild_runtimes
-        .get(&guild_id)
-        .map(|v| Arc::clone(v.value()))
-    else {
-        tracing::warn!(
-            guild = %guild_id,
-            flushed = pending.len(),
-            "missing guild runtime; dropped flushed tail utterances during finalize"
-        );
-        return;
-    };
-
-    for utterance in pending {
-        runtime
-            .transcript_pending_commits
-            .fetch_add(1, Ordering::SeqCst);
-        if runtime.utterance_tx.send(utterance).await.is_err() {
-            runtime
-                .transcript_pending_commits
-                .fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(
-                guild = %guild_id,
-                "failed to enqueue flushed tail utterance for journal commit"
-            );
-            break;
-        }
-    }
-}
-
-async fn flush_pending_buffers_for_export(
-    state: &Arc<AppState>,
-    guild_id: GuildId,
-) -> Vec<Utterance> {
-    let user_keys: Vec<(GuildId, UserId)> = state
-        .streams
-        .iter()
-        .map(|e| *e.key())
-        .filter(|(g, _)| *g == guild_id)
-        .collect();
-    let mut out = Vec::new();
-
-    for user_key in user_keys {
-        let user_id = user_key.1;
-        let mut start_ts = None;
-        let mut pcm = Vec::new();
-        let mut voiced_ticks = 0u32;
-        let mut noise_rms_ema = 0.0f32;
-
-        if let Some(mut stream) = state.streams.get_mut(&user_key) {
-            noise_rms_ema = stream.frontend.noise_rms_ema();
-            let entry = &mut stream.buffer;
-
-            if entry.pcm.is_empty() {
-                continue;
-            }
-
-            start_ts = Some(entry.utterance_start.take().unwrap_or_else(Instant::now));
-            pcm = std::mem::take(&mut entry.pcm);
-            voiced_ticks = std::mem::take(&mut entry.voiced_ticks);
-            trim_finalize_tail(&mut pcm, entry.silent_ticks);
-            entry.silent_ticks = 0;
-        }
-
-        let Some(start_ts) = start_ts else {
-            continue;
-        };
-
-        if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
-            if let Some(runtime) = state.guild_runtimes.get(&guild_id) {
-                runtime.dispatch_gate_total.fetch_add(1, Ordering::SeqCst);
-            }
-            tracing::debug!(
-                guild = %guild_id,
-                user = %user_id,
-                stage = "finalize_flush",
-                reason = rejection.reason,
-                voiced_ticks = rejection.voiced_ticks,
-                rms = rejection.rms,
-                floor = rejection.floor,
-                "dispatch gate rejected utterance"
-            );
-            continue;
-        }
-
-        match transcribe_finalized_mono_pcm(state, pcm).await {
-            Ok(Some(text)) => out.push(Utterance {
-                user_id,
-                start_ts,
-                text,
-            }),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    guild = %guild_id,
-                    user = %user_id,
-                    "ASR decode failed for final buffered audio; continuing export: {error:#}"
-                );
-            }
-        }
-    }
-
-    out
-}
-
-async fn transcribe_finalized_mono_pcm(
-    state: &Arc<AppState>,
-    pcm: Vec<f32>,
-) -> anyhow::Result<Option<String>> {
-    transcribe_mono_pcm(Arc::clone(&state.asr), pcm).await
 }
