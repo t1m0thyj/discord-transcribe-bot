@@ -52,22 +52,12 @@ impl DecodeDispatcher {
     }
 
     fn lock_queue(&self) -> MutexGuard<'_, VecDeque<DecodeJob>> {
-        recover_mutex_lock(&self.queue, "decode queue")
+        self.queue.lock().expect("decode queue mutex poisoned")
     }
-}
-
-fn recover_mutex_lock<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        tracing::error!("{name} mutex was poisoned; recovering state");
-        poisoned.into_inner()
-    })
 }
 
 fn push_bounded<T>(queue: &mut VecDeque<T>, item: T, capacity: usize) -> Option<T> {
-    if capacity == 0 {
-        return Some(item);
-    }
-
+    debug_assert!(capacity > 0);
     let dropped = if queue.len() >= capacity {
         queue.pop_front()
     } else {
@@ -131,7 +121,7 @@ async fn process_decode_job(job: DecodeJob) {
     let queue_wait_ms = job.enqueued_at.elapsed().as_millis() as usize;
     let audio_ms = (job.pcm.len().saturating_mul(1000)) / 16_000;
     let decode_started = Instant::now();
-    let decode_result = transcribe_utterance_blocking(&job.asr, job.pcm).await;
+    let decode_result = transcribe_mono_pcm(Arc::clone(&job.asr), job.pcm).await;
     let decode_ms = decode_started.elapsed().as_millis() as usize;
 
     job.runtime.decode_jobs_total.fetch_add(1, Ordering::SeqCst);
@@ -144,13 +134,6 @@ async fn process_decode_job(job: DecodeJob) {
     job.runtime
         .decode_queue_wait_total_ms
         .fetch_add(queue_wait_ms, Ordering::SeqCst);
-    job.runtime
-        .decode_last_ms
-        .store(decode_ms, Ordering::SeqCst);
-    job.runtime
-        .decode_queue_wait_last_ms
-        .store(queue_wait_ms, Ordering::SeqCst);
-
     if let Some(text) = match decode_result {
         Ok(text) => text,
         Err(error) => {
@@ -209,20 +192,11 @@ async fn process_decode_job(job: DecodeJob) {
         .fetch_sub(1, Ordering::SeqCst);
 }
 
-async fn transcribe_utterance_blocking(
-    asr: &Arc<AsrEngine>,
-    pcm_mono: Vec<f32>,
-) -> anyhow::Result<Option<String>> {
-    transcribe_mono_pcm(Arc::clone(asr), pcm_mono).await
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::Mutex;
 
-    use super::{push_bounded, recover_mutex_lock};
+    use super::push_bounded;
 
     #[test]
     fn bounded_queue_keeps_fifo_order_until_full() {
@@ -237,22 +211,5 @@ mod tests {
         let mut queue = VecDeque::from([1, 2]);
         assert_eq!(push_bounded(&mut queue, 3, 2), Some(1));
         assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec![2, 3]);
-    }
-
-    #[test]
-    fn zero_capacity_sheds_new_item_without_mutating_queue() {
-        let mut queue = VecDeque::new();
-        assert_eq!(push_bounded(&mut queue, 1, 0), Some(1));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn poisoned_decode_queue_lock_recovers_existing_jobs() {
-        let queue = Mutex::new(VecDeque::from([1]));
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let _lock = queue.lock().expect("lock before induced panic");
-            panic!("induce poison");
-        }));
-        assert_eq!(recover_mutex_lock(&queue, "test queue").pop_front(), Some(1));
     }
 }

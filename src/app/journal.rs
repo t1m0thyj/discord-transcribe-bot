@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn journal_loader_skips_malformed_lines_and_saturates_negative_offsets() {
+    async fn journal_loader_skips_malformed_lines_and_preserves_valid_entries() {
         let dir = temp_dir("journal-malformed");
         let path = dir.path().join("transcript.jsonl");
         fs::write(
@@ -286,5 +286,7 @@ mod tests {
         assert_eq!(loaded[0].user_id, UserId::new(7));
         assert_eq!(loaded[0].start_ts, started_mono);
         assert_eq!(loaded[1].user_id, UserId::new(8));
+        assert_eq!(loaded[1].start_ts, started_mono + Duration::from_millis(20));
+        assert_eq!(loaded[1].text, "second");
     }
 }

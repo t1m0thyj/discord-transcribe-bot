@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use serenity::all::{CreateAttachment, CreateMessage, GuildId, VoiceState};
 use serenity::prelude::Context;
 
-use super::super::AppState;
+use super::super::{AppState, GuildRuntime};
 use crate::app::journal::{load_persisted_transcript, prune_old_transcripts};
 use crate::app::summary;
 use crate::asr::clear_unknown_ssrc_audio_for_guild;
@@ -17,7 +17,29 @@ pub async fn finalize_call_for_guild(
     state: &Arc<AppState>,
     guild_id: GuildId,
 ) -> anyhow::Result<()> {
-    finalize_call_for_guild_if_current(ctx, state, guild_id, None).await
+    finalize_call_for_guild_if_current(ctx, state, guild_id, None, None, false, None).await
+}
+
+pub(super) async fn finalize_call_for_receive_failure(
+    ctx: &Context,
+    state: &Arc<AppState>,
+    guild_id: GuildId,
+    expected_runtime: &Arc<GuildRuntime>,
+    attempts: u32,
+) -> anyhow::Result<()> {
+    let notice = format!(
+        "Voice receive could not be recovered after {attempts} attempts, so transcription stopped. The transcript captured so far is being finalized."
+    );
+    finalize_call_for_guild_if_current(
+        ctx,
+        state,
+        guild_id,
+        None,
+        Some(expected_runtime),
+        true,
+        Some(notice),
+    )
+    .await
 }
 
 async fn finalize_call_for_guild_if_current(
@@ -25,6 +47,9 @@ async fn finalize_call_for_guild_if_current(
     state: &Arc<AppState>,
     guild_id: GuildId,
     expected_session: Option<&Arc<tokio::sync::RwLock<super::super::CallSession>>>,
+    expected_runtime: Option<&Arc<GuildRuntime>>,
+    best_effort_voice_remove: bool,
+    end_notice: Option<String>,
 ) -> anyhow::Result<()> {
     let session_start_lock = state
         .session_start_locks
@@ -32,6 +57,17 @@ async fn finalize_call_for_guild_if_current(
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _session_start_guard = session_start_lock.lock().await;
+
+    if let Some(expected) = expected_runtime {
+        if !state
+            .guild_runtimes
+            .get(&guild_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), expected))
+            || !state.active_calls.contains_key(&guild_id)
+        {
+            return Ok(());
+        }
+    }
 
     if let Some(expected) = expected_session {
         if !state
@@ -61,12 +97,22 @@ async fn finalize_call_for_guild_if_current(
         .clone();
     match tokio::time::timeout(Duration::from_secs(25), manager.remove(guild_id)).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) if manager.get(guild_id).is_some() => return Err(error.into()),
+        Ok(Err(error)) if manager.get(guild_id).is_some() && !best_effort_voice_remove => {
+            return Err(error.into());
+        }
+        Ok(Err(error)) if manager.get(guild_id).is_some() => {
+            tracing::warn!(guild = %guild_id,
+                "voice remove failed while ending unrecoverable session; detaching transcription state: {error:#}");
+        }
         Ok(Err(error)) => {
             tracing::warn!(guild = %guild_id, "voice remove failed after call disappeared: {error:#}")
         }
-        Err(_) if manager.get(guild_id).is_some() => {
+        Err(_) if manager.get(guild_id).is_some() && !best_effort_voice_remove => {
             anyhow::bail!("voice remove during finalize timed out")
+        }
+        Err(_) if manager.get(guild_id).is_some() => {
+            tracing::warn!(guild = %guild_id,
+                "voice remove timed out while ending unrecoverable session; detaching transcription state");
         }
         Err(_) => {
             tracing::warn!(guild = %guild_id, "voice remove timed out after call disappeared")
@@ -109,6 +155,14 @@ async fn finalize_call_for_guild_if_current(
 
     state.guild_runtimes.remove(&guild_id);
     drop(_session_start_guard);
+
+    if let Some(notice) = end_notice {
+        let text_channel = session_lock.read().await.text_channel;
+        if let Err(error) = text_channel.say(&ctx.http, notice).await {
+            tracing::warn!(guild = %guild_id,
+                "failed to post unrecoverable voice receive notice: {error:#}");
+        }
+    }
 
     // Export work belongs to the detached session. A new /join may now proceed.
     if let Some(runtime) = &runtime {
@@ -163,8 +217,7 @@ async fn finalize_call_for_guild_if_current(
 
     let local_dir = PathBuf::from("transcripts");
 
-    let attachment =
-        CreateAttachment::bytes(transcript_text.clone().into_bytes(), filename.clone());
+    let attachment = CreateAttachment::bytes(transcript_text.clone().into_bytes(), filename);
     let msg = session
         .text_channel
         .send_files(
@@ -208,7 +261,7 @@ async fn finalize_call_for_guild_if_current(
 
     super::super::upsert_thread_context(state, thread.id, transcript_text);
 
-    let prune_dir = local_dir.clone();
+    let prune_dir = local_dir;
     let retention_days = state.transcript_retention_days.max(1);
     tokio::spawn(async move {
         let deleted = prune_old_transcripts(
@@ -276,7 +329,16 @@ pub async fn maybe_finalize_on_empty_voice_channel(
         return Ok(());
     }
 
-    finalize_call_for_guild_if_current(ctx, state, guild_id, Some(&session_lock)).await?;
+    finalize_call_for_guild_if_current(
+        ctx,
+        state,
+        guild_id,
+        Some(&session_lock),
+        None,
+        false,
+        None,
+    )
+    .await?;
 
     Ok(())
 }

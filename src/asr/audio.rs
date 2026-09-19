@@ -204,11 +204,6 @@ impl UnknownSsrcAudio {
             self.samples.drain(..overflow);
         }
     }
-
-    fn drain_vec(&mut self) -> Vec<i16> {
-        self.last_update = Instant::now();
-        self.samples.drain(..).collect()
-    }
 }
 
 fn unknown_ssrc_buffers() -> &'static Mutex<HashMap<(GuildId, u32), UnknownSsrcAudio>> {
@@ -240,7 +235,7 @@ fn take_unknown_ssrc_audio(guild_id: GuildId, ssrc: u32) -> Vec<i16> {
         .lock()
         .expect("unknown ssrc buffer mutex poisoned");
     map.remove(&(guild_id, ssrc))
-        .map(|mut buf| buf.drain_vec())
+        .map(|buf| buf.samples.into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -302,12 +297,6 @@ impl VoiceEventHandler for VoiceTickHandler {
                     .frontend
                     .push_stereo_pcm(&replay, self.enable_denoiser)
             };
-            let resample_errors = stream.frontend.take_resample_error_count();
-            if resample_errors > 0 {
-                self.runtime
-                    .resample_error_total
-                    .fetch_add(resample_errors, std::sync::atomic::Ordering::SeqCst);
-            }
             if processed.speech_active {
                 currently_speaking.insert(user_id);
             }
@@ -319,8 +308,8 @@ impl VoiceEventHandler for VoiceTickHandler {
                 continue;
             }
 
-            if processed.speech_active {
-                if self
+            if processed.speech_active
+                && self
                     .runtime
                     .transcription_started_notified
                     .compare_exchange(
@@ -330,19 +319,18 @@ impl VoiceEventHandler for VoiceTickHandler {
                         std::sync::atomic::Ordering::SeqCst,
                     )
                     .is_ok()
-                {
-                    let http = Arc::clone(&self.http);
-                    let text_channel = self.text_channel;
-                    let voice_channel = self.voice_channel;
-                    tokio::spawn(async move {
-                        let _ = text_channel
-                            .say(
-                                &http,
-                                format!("Started transcribing in <#{}>.", voice_channel.get()),
-                            )
-                            .await;
-                    });
-                }
+            {
+                let http = Arc::clone(&self.http);
+                let text_channel = self.text_channel;
+                let voice_channel = self.voice_channel;
+                tokio::spawn(async move {
+                    let _ = text_channel
+                        .say(
+                            &http,
+                            format!("Started transcribing in <#{}>.", voice_channel.get()),
+                        )
+                        .await;
+                });
             }
 
             let cleaned = processed.pcm_16k;
@@ -376,9 +364,6 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_rollover_final {
                 if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
-                    self.runtime
-                        .dispatch_gate_total
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tracing::debug!(
                         guild = %self.guild_id,
                         user = %user_id,
@@ -435,9 +420,6 @@ impl VoiceEventHandler for VoiceTickHandler {
 
             if let Some((start_ts, pcm, voiced_ticks, noise_rms_ema)) = maybe_job {
                 if let Err(rejection) = should_dispatch_chunk(&pcm, voiced_ticks, noise_rms_ema) {
-                    self.runtime
-                        .dispatch_gate_total
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tracing::debug!(
                         guild = %self.guild_id,
                         user = %user_id,
@@ -656,7 +638,7 @@ mod tests {
         }
 
         let split = choose_rollover_split_index(&pcm, 3_000, 5_000);
-        assert!(split >= 5_400 && split <= 6_600);
+        assert!((5_400..=6_600).contains(&split));
     }
 
     #[test]

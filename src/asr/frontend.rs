@@ -25,7 +25,6 @@ pub struct IngestFrontend {
     last_snr_db: f32,
     resampler_48k_to_16k: FftFixedInOut<f32>,
     resample_pending_48k: Vec<f32>,
-    resample_error_count: usize,
     preroll_16k: VecDeque<f32>,
     vad_hangover_frames: u8,
     was_speech_last_tick: bool,
@@ -55,7 +54,6 @@ impl IngestFrontend {
             resampler_48k_to_16k: FftFixedInOut::new(48_000, 16_000, 960, 1)
                 .expect("valid fixed 48k->16k resampler config"),
             resample_pending_48k: Vec::new(),
-            resample_error_count: 0,
             preroll_16k: VecDeque::with_capacity(VAD_PREROLL_SAMPLES_16K),
             vad_hangover_frames: 0,
             was_speech_last_tick: false,
@@ -66,7 +64,11 @@ impl IngestFrontend {
         }
     }
 
-    pub fn push_stereo_pcm(&mut self, input: &[i16], enable_denoiser: bool) -> ProcessedSpeechChunk {
+    pub fn push_stereo_pcm(
+        &mut self,
+        input: &[i16],
+        enable_denoiser: bool,
+    ) -> ProcessedSpeechChunk {
         let mut mono = downmix_stereo_to_mono_unit_scale(input);
         if mono.is_empty() {
             return ProcessedSpeechChunk {
@@ -95,7 +97,8 @@ impl IngestFrontend {
 
         if speech_active {
             if !was_speech_last_tick && !self.preroll_16k.is_empty() {
-                let mut with_preroll = Vec::with_capacity(self.preroll_16k.len() + emitted_pcm_16k.len());
+                let mut with_preroll =
+                    Vec::with_capacity(self.preroll_16k.len() + emitted_pcm_16k.len());
                 with_preroll.extend(self.preroll_16k.iter().copied());
                 with_preroll.extend(emitted_pcm_16k);
                 emitted_pcm_16k = with_preroll;
@@ -153,7 +156,11 @@ impl IngestFrontend {
     }
 
     fn update_noise_and_snr(&mut self, rms: f32) {
-        let noise_update = if rms <= self.noise_rms_ema * 1.5 { 0.08 } else { 0.005 };
+        let noise_update = if rms <= self.noise_rms_ema * 1.5 {
+            0.08
+        } else {
+            0.005
+        };
         self.noise_rms_ema = self.noise_rms_ema * (1.0 - noise_update) + rms * noise_update;
         let noise = self.noise_rms_ema.max(1e-4);
         self.last_snr_db = 20.0 * ((rms + 1e-4) / noise).log10();
@@ -218,8 +225,7 @@ impl IngestFrontend {
         let out_frames = self.resampler_48k_to_16k.output_frames_next();
 
         let mut out = Vec::with_capacity(
-            (self.resample_pending_48k.len() / in_frames)
-                .saturating_mul(out_frames),
+            (self.resample_pending_48k.len() / in_frames).saturating_mul(out_frames),
         );
         self.resample_in_buf.resize(in_frames, 0.0);
         self.resample_out_buf.resize(out_frames, 0.0);
@@ -237,7 +243,6 @@ impl IngestFrontend {
                 )
                 .is_err()
             {
-                self.resample_error_count = self.resample_error_count.saturating_add(1);
                 continue;
             }
             out.extend_from_slice(&self.resample_out_buf);
@@ -264,10 +269,6 @@ impl IngestFrontend {
             .into_iter()
             .map(|sample| sample / i16::MAX as f32)
             .collect()
-    }
-
-    pub fn take_resample_error_count(&mut self) -> usize {
-        std::mem::take(&mut self.resample_error_count)
     }
 }
 
@@ -310,10 +311,9 @@ mod tests {
     use std::f32::consts::PI;
 
     use super::{
-        DENOISER_BYPASS_HYSTERESIS_DB, DENOISER_BYPASS_SNR_DB, EARSHOT_FRAME_SIZE,
-        IngestFrontend, RNNOISE_FRAME_SIZE, VAD_PREROLL_SAMPLES_16K, compute_rms,
-        downmix_stereo_to_mono_i16_scale,
-        downmix_stereo_to_mono_unit_scale,
+        compute_rms, downmix_stereo_to_mono_i16_scale, downmix_stereo_to_mono_unit_scale,
+        IngestFrontend, DENOISER_BYPASS_HYSTERESIS_DB, DENOISER_BYPASS_SNR_DB, EARSHOT_FRAME_SIZE,
+        RNNOISE_FRAME_SIZE, VAD_PREROLL_SAMPLES_16K,
     };
 
     #[test]
@@ -321,6 +321,11 @@ mod tests {
         let input = [100i16, 300, -400, 200];
         let mono = downmix_stereo_to_mono_i16_scale(&input);
         assert_eq!(mono, vec![200.0, -100.0]);
+
+        assert_eq!(
+            downmix_stereo_to_mono_i16_scale(&[100, 300, 999]),
+            vec![200.0]
+        );
     }
 
     #[test]
@@ -352,14 +357,11 @@ mod tests {
     }
 
     #[test]
-    fn push_stereo_pcm_handles_empty_and_odd_length_input() {
+    fn push_stereo_pcm_empty_input_produces_no_audio() {
         let mut state = IngestFrontend::new();
         let empty = state.push_stereo_pcm(&[], false);
         assert!(empty.pcm_16k.is_empty());
         assert!(!empty.speech_active);
-
-        let odd = state.push_stereo_pcm(&[1, 2, 3], false);
-        assert!(odd.pcm_16k.len() <= 1);
     }
 
     #[test]

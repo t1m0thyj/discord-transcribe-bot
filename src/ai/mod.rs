@@ -6,8 +6,8 @@ mod openai;
 mod stream;
 
 const AI_TRANSCRIPT_MAX_BYTES: usize = 1_000_000;
-const AI_TURN_TEXT_MAX_CHARS: usize = 4_000;
-const AI_QUESTION_MAX_CHARS: usize = 4_000;
+const AI_TURN_TEXT_MAX_CHARS: usize = 100_000;
+const AI_QUESTION_MAX_CHARS: usize = 100_000;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
 #[derive(Clone, Debug)]
@@ -289,6 +289,25 @@ mod tests {
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[2].role, "user");
         assert!(turns[3].text.contains("=== QUESTION START ==="));
+    }
+
+    #[test]
+    fn ask_prompt_caps_questions_and_prior_turns_at_one_hundred_thousand_characters() {
+        let oversized_turn = format!("discarded{}", "t".repeat(100_000));
+        let oversized_question = format!("discarded{}", "q".repeat(100_000));
+        let history = vec![("user".to_string(), oversized_turn)];
+
+        let turns = build_ask_turns("transcript", &oversized_question, Some(&history));
+
+        assert_eq!(turns[1].text.chars().count(), 100_000);
+        assert!(turns[1].text.chars().all(|character| character == 't'));
+        let question = turns[2]
+            .text
+            .strip_prefix("=== QUESTION START ===\n")
+            .and_then(|text| text.strip_suffix("\n=== QUESTION END ==="))
+            .expect("question boundary markers");
+        assert_eq!(question.chars().count(), 100_000);
+        assert!(question.chars().all(|character| character == 'q'));
     }
 
     #[test]

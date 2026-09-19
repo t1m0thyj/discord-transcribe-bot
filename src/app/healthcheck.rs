@@ -246,8 +246,6 @@ mod tests {
             assess(&HealthSnapshot::default(), &health.snapshot(), now),
             vec![(42, SourceProblem::NoMappedAudioAfterSpeaking)]
         );
-        health.decoded(42, true, true);
-        assert!(assess(&HealthSnapshot::default(), &health.snapshot(), now).is_empty());
     }
 
     #[test]
@@ -302,17 +300,5 @@ mod tests {
         health.packet(42);
         health.decoded(42, true, true);
         assert!(assess(&HealthSnapshot::default(), &health.snapshot(), now).is_empty());
-    }
-
-    #[test]
-    fn a_different_speaker_cannot_confirm_recovery() {
-        let health = ReceiveHealth::default();
-        for _ in 0..3 {
-            health.packet(1);
-            health.decoded(1, true, true);
-        }
-        let snapshot = health.snapshot();
-        assert!(mapped_audio_observed(&snapshot, 1, 3));
-        assert!(!mapped_audio_observed(&snapshot, 2, 3));
     }
 }

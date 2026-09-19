@@ -87,17 +87,12 @@ pub struct GuildRuntime {
     pub decode_audio_total_ms: AtomicUsize,
     pub decode_total_ms: AtomicUsize,
     pub decode_queue_wait_total_ms: AtomicUsize,
-    pub decode_last_ms: AtomicUsize,
-    pub decode_queue_wait_last_ms: AtomicUsize,
     pub decode_shed_total: AtomicUsize,
-    pub dispatch_gate_total: AtomicUsize,
-    pub resample_error_total: AtomicUsize,
     pub receive_health: Arc<healthcheck::ReceiveHealth>,
     pub receive_generation: Arc<AtomicUsize>,
     pub recovery_needs_rejoin: AtomicBool,
     pub receive_verification_pending: AtomicBool,
     pub transcription_started_notified: AtomicBool,
-    pub recovery_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl GuildRuntime {
@@ -112,17 +107,12 @@ impl GuildRuntime {
             decode_audio_total_ms: AtomicUsize::new(0),
             decode_total_ms: AtomicUsize::new(0),
             decode_queue_wait_total_ms: AtomicUsize::new(0),
-            decode_last_ms: AtomicUsize::new(0),
-            decode_queue_wait_last_ms: AtomicUsize::new(0),
             decode_shed_total: AtomicUsize::new(0),
-            dispatch_gate_total: AtomicUsize::new(0),
-            resample_error_total: AtomicUsize::new(0),
             receive_health: Arc::new(healthcheck::ReceiveHealth::default()),
             receive_generation: Arc::new(AtomicUsize::new(0)),
             recovery_needs_rejoin: AtomicBool::new(false),
             receive_verification_pending: AtomicBool::new(false),
             transcription_started_notified: AtomicBool::new(false),
-            recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -536,7 +526,7 @@ fn update_prompt_history(history: &mut Vec<String>, prompt: String) {
 fn autocomplete_prompt_choices(history: &[String], input: &str) -> Vec<AutocompleteChoice> {
     matching_prompt_values(history, input)
         .into_iter()
-        .map(|prompt| AutocompleteChoice::from(prompt))
+        .map(AutocompleteChoice::from)
         .collect()
 }
 

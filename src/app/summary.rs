@@ -90,7 +90,7 @@ fn format_export_markdown_with_names(
     summary: Option<&str>,
     include_summary_in_markdown: bool,
 ) -> String {
-    let attendees = attendees_in_order(transcript, &by_user);
+    let attendees = attendees_in_order(transcript, by_user);
     let duration = format_duration(call_duration);
 
     let mut out = Vec::new();
@@ -122,7 +122,7 @@ fn format_export_markdown_with_names(
     out.push(String::new());
     out.extend(build_transcript_lines(
         transcript,
-        &by_user,
+        by_user,
         transcript.first().map(|utterance| utterance.start_ts),
     ));
     out.push(String::new());

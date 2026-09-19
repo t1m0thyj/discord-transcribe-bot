@@ -4320,7 +4320,6 @@ name = "transcribe-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "chrono",
  "dashmap 6.2.1",
  "dotenvy",

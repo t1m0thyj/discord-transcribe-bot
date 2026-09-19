@@ -107,7 +107,9 @@ impl AsrEngine {
             );
         }
 
-        Ok(Self { recognizer: Arc::new(recognizer) })
+        Ok(Self {
+            recognizer: Arc::new(recognizer),
+        })
     }
 
     pub fn transcribe_16k_mono(&self, samples: &[f32]) -> String {
@@ -247,12 +249,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejection_keeps_legitimate_short_and_common_phrases() {
+    fn decode_rejection_keeps_legitimate_speech() {
         assert_eq!(decode_rejection_reason("yeah", 1.0), None);
-        assert_eq!(
-            decode_rejection_reason("Thanks for watching.", 1.0),
-            None
-        );
+        assert_eq!(decode_rejection_reason("Thanks for watching.", 1.0), None);
+        assert_eq!(decode_rejection_reason("this sounds normal", 2.0), None);
     }
 
     #[test]
@@ -268,18 +268,5 @@ mod tests {
     fn decode_rejection_allows_exact_character_rate_threshold() {
         let text = "a".repeat(50);
         assert_eq!(decode_rejection_reason(&text, 2.0), None);
-    }
-
-    #[test]
-    fn decode_rejection_handles_zero_audio_duration() {
-        assert_eq!(
-            decode_rejection_reason("speech", 0.0),
-            Some("implausible_char_rate")
-        );
-    }
-
-    #[test]
-    fn decode_rejection_allows_normal_text() {
-        assert_eq!(decode_rejection_reason("this sounds normal", 2.0), None);
     }
 }

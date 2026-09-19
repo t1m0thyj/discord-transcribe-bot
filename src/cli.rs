@@ -374,12 +374,13 @@ mod tests {
 
     #[test]
     fn repository_id_requires_two_safe_components() {
+        let (owner, repository) =
+            parse_repo_id("sherpa-onnx/sherpa-onnx-moonshine-base-en-int8").unwrap();
+        assert_eq!(owner, "sherpa-onnx");
+        assert_eq!(repository, "sherpa-onnx-moonshine-base-en-int8");
         assert_eq!(
-            parse_repo_id("sherpa-onnx/sherpa-onnx-moonshine-base-en-int8").unwrap(),
-            (
-                "sherpa-onnx".to_string(),
-                "sherpa-onnx-moonshine-base-en-int8".to_string()
-            )
+            model_destination(&repository),
+            PathBuf::from("models").join("sherpa-onnx-moonshine-base-en-int8")
         );
         for invalid in [
             "",
@@ -395,14 +396,6 @@ mod tests {
                 "{invalid} should be rejected"
             );
         }
-    }
-
-    #[test]
-    fn destination_uses_repository_basename() {
-        assert_eq!(
-            model_destination("sherpa-onnx-moonshine-base-en-int8"),
-            PathBuf::from("models").join("sherpa-onnx-moonshine-base-en-int8")
-        );
     }
 
     #[test]
